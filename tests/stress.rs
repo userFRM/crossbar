@@ -264,3 +264,70 @@ async fn stress_memory_rapid_1000() {
         assert_eq!(resp.status, 200, "request {i} failed");
     }
 }
+
+// ═══════════════════════════════════════════════════════
+// 50 concurrent SHM requests
+// ═══════════════════════════════════════════════════════
+
+#[cfg(feature = "shm")]
+fn shm_name(name: &str) -> String {
+    format!("stress-{name}-{}", std::process::id())
+}
+
+#[cfg(feature = "shm")]
+fn cleanup_shm(name: &str) {
+    let path = format!("/dev/shm/crossbar-{name}");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[cfg(feature = "shm")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stress_shm_50_concurrent() {
+    let name = shm_name("shm_50");
+    let _handle = ShmServer::spawn(&name, echo_router()).await.unwrap();
+
+    let client = Arc::new(
+        ShmClient::connect_with_timeout(&name, std::time::Duration::from_secs(60))
+            .await
+            .unwrap(),
+    );
+
+    let mut handles = Vec::new();
+    for i in 0..50 {
+        let client = Arc::clone(&client);
+        handles.push(tokio::spawn(async move {
+            let resp = client.post("/echo", format!("shm-{i}")).await.unwrap();
+            assert_eq!(resp.status, 200);
+            assert_eq!(resp.body_str(), format!("shm-{i}"));
+        }));
+    }
+
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    cleanup_shm(&name);
+}
+
+// ═══════════════════════════════════════════════════════
+// Rapid sequential SHM requests (1000)
+// ═══════════════════════════════════════════════════════
+
+#[cfg(feature = "shm")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stress_rapid_sequential_shm_1000() {
+    let name = shm_name("shm_rapid");
+    let _handle = ShmServer::spawn(&name, echo_router()).await.unwrap();
+
+    let client = ShmClient::connect_with_timeout(&name, std::time::Duration::from_secs(60))
+        .await
+        .unwrap();
+
+    for i in 0..1000 {
+        let resp = client.get("/health").await.unwrap();
+        assert_eq!(resp.status, 200, "request {i} failed");
+        assert_eq!(resp.body_str(), "ok");
+    }
+
+    cleanup_shm(&name);
+}

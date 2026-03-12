@@ -1,8 +1,8 @@
 //! # Crossbar
 //!
 //! **Transport-polymorphic URI router** — define your handlers once and serve
-//! them over in-process memory, a tokio channel, a Unix Domain Socket, or
-//! plain TCP, all with the same API.
+//! them over in-process memory, a tokio channel, shared memory, a Unix Domain
+//! Socket, or plain TCP, all with the same API.
 //!
 //! Crossbar is designed for low-latency, high-throughput Rust applications
 //! (trading systems, game servers, inter-process bridges) that need to swap
@@ -42,6 +42,12 @@
 //!     let resp = chan.get("/health").await?;
 //!     assert_eq!(resp.status, 200);
 //!
+//!     // ── shared memory (shm feature, ~2-5 µs) ────────
+//!     // Enable with: cargo add crossbar --features shm
+//!     // ShmServer::bind("myapp", router.clone()).await?;
+//!     // let shm = ShmClient::connect("myapp").await?;
+//!     // let resp = shm.get("/health").await?;
+//!
 //!     // ── TCP ──────────────────────────────────────────
 //!     let addr = "127.0.0.1:18800";
 //!     {
@@ -77,6 +83,13 @@
 //! so adding a new transport is just a matter of providing an
 //! `AsyncRead + AsyncWrite` pair.
 //!
+//! ## Shared Memory
+//!
+//! [`ShmServer`](transport::ShmServer) and [`ShmClient`](transport::ShmClient)
+//! are gated behind the `shm` Cargo feature. Enable with
+//! `cargo add crossbar --features shm`. On Linux, the shared memory region
+//! lives at `/dev/shm/crossbar-{name}`.
+//!
 //! ## Unix Domain Socket
 //!
 //! [`UdsServer`](transport::UdsServer) and [`UdsClient`](transport::UdsClient)
@@ -85,7 +98,7 @@
 //! [`TcpServer`](transport::TcpServer) or the in-process transports.
 
 #![warn(missing_docs)]
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 pub mod error;
 pub mod handler;

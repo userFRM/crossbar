@@ -8,12 +8,18 @@ edition = "2021"
 description = "Transport-polymorphic URI router. Define once, serve over memory, UDS, or TCP."
 license = "MIT OR Apache-2.0"
 
+[features]
+default = []
+shm = ["memmap2", "libc"]
+
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
 bytes = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 crossbar-macros = { path = "crossbar-macros" }
+memmap2 = { version = "0.9", optional = true }
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }

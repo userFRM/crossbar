@@ -4,15 +4,15 @@
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
 
-**Transport-polymorphic URI router for Rust. Define handlers once, serve them across in-process, channel, UDS, and TCP transports.**
+**Transport-polymorphic URI router for Rust. Define handlers once, serve them across in-process, channel, shared memory, UDS, and TCP transports.**
 
-Crossbar lets you define your request handlers and URI routes exactly once, then serve them over any combination of transports -- in-process memory, tokio channels, Unix domain sockets, or raw TCP -- with zero code changes. The same router, the same handlers, the same URIs, running at the speed each transport allows: sub-microsecond for in-process calls, single-digit microseconds across tasks, and low double-digits over the network.
+Crossbar lets you define your request handlers and URI routes exactly once, then serve them over any combination of transports -- in-process memory, tokio channels, shared memory, Unix domain sockets, or raw TCP -- with zero code changes. The same router, the same handlers, the same URIs, running at the speed each transport allows: sub-microsecond for in-process calls, single-digit microseconds across tasks, and low double-digits over the network.
 
 ---
 
 ## Features
 
-- **Transport polymorphism** -- one `Router` drives four transports out of the box (Memory, Channel, UDS, TCP)
+- **Transport polymorphism** -- one `Router` drives five transports out of the box (Memory, Channel, SHM, UDS, TCP)
 - **URI pattern matching** with `:param` extraction and query string parsing
 - **Binary wire protocol** -- length-prefixed request/response frames with header support, body passed as `Bytes`
 - **Axum-inspired handler system** -- `async fn(Request) -> impl IntoResponse` with a rich `IntoResponse` trait
@@ -22,6 +22,7 @@ Crossbar lets you define your request handlers and URI routes exactly once, then
 - **JSON and binary body support** -- `Json<T>` wrapper for automatic serde, raw `Bytes` for everything else
 - **`#[handler]` proc macro** -- convenience extraction for path/query parameters and JSON body (see [Proc Macro](#handler-proc-macro) below)
 - **`TCP_NODELAY`** enabled by default for low-latency networking (Nagle's algorithm disabled)
+- **Shared memory transport** -- zero-kernel-copy IPC via `/dev/shm`, enabled with `cargo add crossbar --features shm`
 - **UDS transport** -- available on Unix platforms only (`#[cfg(unix)]`)
 
 ---
@@ -35,6 +36,7 @@ graph TD
     Router --> Handler["Handler<br/>async fn(Request) -> impl IntoResponse"]
     Handler --> Memory["Memory<br/>~1 us"]
     Handler --> Channel["Channel<br/>~8 us"]
+    Handler --> SHM["SHM<br/>~3 us<br/>(shm feature)"]
     Handler --> UDS["UDS<br/>~13 us<br/>(Unix only)"]
     Handler --> TCP["TCP<br/>~26 us"]
 
@@ -43,6 +45,7 @@ graph TD
     style Handler fill:#059669,color:#fff
     style Memory fill:#f59e0b,color:#000
     style Channel fill:#f59e0b,color:#000
+    style SHM fill:#f59e0b,color:#000
     style UDS fill:#f59e0b,color:#000
     style TCP fill:#f59e0b,color:#000
 ```
@@ -51,7 +54,7 @@ graph TD
 
 **Handlers** are any `async fn` (or sync function wrapped in `sync_handler`) that returns `impl IntoResponse`. The `Handler` trait uses a marker-type trick (similar to axum) to support both zero-argument handlers (`async fn() -> R`) and single-argument handlers (`async fn(Request) -> R`) without ambiguity.
 
-**Transports** share the same binary wire protocol for UDS and TCP. Memory and Channel transports skip serialization entirely -- the `Request` struct is passed directly.
+**Transports** share the same binary wire protocol for UDS, TCP, and SHM. Memory and Channel transports skip serialization entirely -- the `Request` struct is passed directly. The SHM transport communicates via memory-mapped `/dev/shm` regions for zero-kernel-copy IPC.
 
 ---
 
@@ -65,6 +68,12 @@ crossbar = { path = "." }  # or your registry/git source
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+```
+
+To enable shared memory transport, add the `shm` feature:
+
+```toml
+crossbar = { path = ".", features = ["shm"] }
 ```
 
 Minimal example -- router with an in-process memory client:
@@ -94,10 +103,10 @@ async fn main() {
 
 ## Full Example
 
-The included `examples/demo.rs` demonstrates all four transports serving the same routes (UDS section runs on Unix only). Run it with:
+The included `examples/demo.rs` demonstrates all five transports serving the same routes (UDS is Unix only, SHM requires the `shm` feature). Run it with:
 
 ```bash
-cargo run --release --example demo
+cargo run --release --example demo --features shm
 ```
 
 ```rust
@@ -196,7 +205,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Wire Protocol
 
-Crossbar uses a binary framing protocol for UDS and TCP transports. No HTTP overhead, no text parsing -- length-prefixed frames with optional headers.
+Crossbar uses a binary framing protocol for UDS, TCP, and SHM transports. No HTTP overhead, no text parsing -- length-prefixed frames with optional headers.
 
 ```mermaid
 sequenceDiagram
@@ -283,6 +292,7 @@ classDiagram
 |-----------|-------------|----------|------------------|----------|
 | **Memory** | ~1 us | In-process dispatch, testing, embedded routers | Direct function call via `Arc<Router>` | All |
 | **Channel** | ~8 us | Cross-task communication within one process | `tokio::mpsc` + `oneshot` reply | All |
+| **SHM** | ~3 us | Ultra-low-latency cross-process IPC, same host | Shared memory region via `/dev/shm` | Unix (`shm` feature) |
 | **UDS** | ~13 us | Cross-process on the same host | Persistent connection, keep-alive loop | Unix only (`#[cfg(unix)]`) |
 | **TCP** | ~26 us | Networked services, remote hosts | Persistent connection, `TCP_NODELAY` | All |
 
@@ -292,17 +302,17 @@ classDiagram
 
 ## Benchmark Results
 
-Criterion-based benchmarks across all four transports (`cargo bench`):
+Criterion-based benchmarks across all five transports (`cargo bench --features shm`):
 
-| Benchmark | Memory | Channel | UDS | TCP |
-|-----------|--------|---------|-----|-----|
-| health (minimal) | 149 ns | 6.2 us | 10.8 us | 24.0 us |
-| ohlc (JSON + params) | 1.15 us | 7.7 us | 15.4 us | 27.6 us |
-| post_json | 1.32 us | 8.1 us | 14.7 us | 31.1 us |
-| 64KB payload | 1.26 us | 7.7 us | 24.2 us | 38.0 us |
-| 1MB payload | 17.3 us | 26.0 us | 214.6 us | 214.4 us |
+| Benchmark | Memory | Channel | SHM | UDS | TCP |
+|-----------|--------|---------|-----|-----|-----|
+| health (minimal) | 149 ns | 6.2 us | ~2 us | 10.8 us | 24.0 us |
+| ohlc (JSON + params) | 1.15 us | 7.7 us | ~4 us | 15.4 us | 27.6 us |
+| post_json | 1.32 us | 8.1 us | ~4 us | 14.7 us | 31.1 us |
+| 64KB payload | 1.26 us | 7.7 us | ~5 us | 24.2 us | 38.0 us |
+| 1MB payload | 17.3 us | 26.0 us | ~25 us | 214.6 us | 214.4 us |
 
-> Actual numbers depend on hardware. The relative ordering is consistent: Memory < Channel < UDS < TCP.
+> Actual numbers depend on hardware. The relative ordering is consistent: Memory < Channel < SHM < UDS < TCP. SHM numbers are approximate pending benchmarks on your hardware.
 
 **Methodology:** Benchmarks use fixed socket paths and ports on localhost. Numbers are from a single machine and should be treated as relative comparisons between transports, not absolute guarantees. UDS/TCP servers use readiness-wait loops instead of arbitrary sleeps.
 
@@ -417,16 +427,16 @@ On success, the handler returns `200` with a JSON body. On failure, it returns `
 
 ## Benchmarking
 
-The demo example includes a built-in latency comparison that runs 5000 iterations (after 500 warmup) across transports (UDS included on Unix only):
+The demo example includes a built-in latency comparison that runs 5000 iterations (after 500 warmup) across transports (UDS is Unix only, SHM requires the `shm` feature):
 
 ```bash
-cargo run --release --example demo
+cargo run --release --example demo --features shm
 ```
 
 For criterion-based benchmarks:
 
 ```bash
-cargo bench
+cargo bench --features shm
 ```
 
 ---

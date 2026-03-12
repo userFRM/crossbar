@@ -2,7 +2,7 @@ use crossbar::prelude::*;
 use serde::{Deserialize, Serialize};
 
 // ── Handlers ────────────────────────────────────────────
-// Same handlers serve over ALL transports — memory, channel, UDS, TCP.
+// Same handlers serve over ALL transports — memory, channel, SHM, UDS, TCP.
 
 async fn health() -> &'static str {
     "ok"
@@ -128,7 +128,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         truncate(r.body_str(), 60)
     );
 
-    // ── 3. UDS (Unix only) ──────────────────────────────
+    // ── 3. SHM (shared memory, Linux/Unix) ──────────────
+    #[cfg(feature = "shm")]
+    let shm = {
+        let shm_name = "demo";
+        println!("\n  ━━━ Shared Memory (/dev/shm) ━━━");
+        {
+            let r = router.clone();
+            tokio::spawn(async move {
+                ShmServer::bind(shm_name, r).await.unwrap();
+            });
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let shm = ShmClient::connect(shm_name).await?;
+        let r = shm.get("/health").await?;
+        println!("    GET  /health -> {} {}", r.status, r.body_str());
+
+        let r = shm.get("/v3/stock/snapshot/ohlc/NVDA?venue=nqb").await?;
+        println!(
+            "    GET  /v3/stock/snapshot/ohlc/NVDA -> {} {}",
+            r.status,
+            truncate(r.body_str(), 60)
+        );
+
+        let r = shm.post("/v3/stock/order", order_body.clone()).await?;
+        println!(
+            "    POST /v3/stock/order -> {} {}",
+            r.status,
+            truncate(r.body_str(), 60)
+        );
+
+        shm
+    };
+
+    // ── 4. UDS (Unix only) ──────────────────────────────
     #[cfg(unix)]
     let uds = {
         let uds_path = "/tmp/crossbar-demo.sock";
@@ -156,7 +190,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         uds
     };
 
-    // ── 4. TCP ──────────────────────────────────────────
+    // ── 5. TCP ──────────────────────────────────────────
     let tcp_addr = "127.0.0.1:19876";
     println!("\n  ━━━ TCP ({tcp_addr}, TCP_NODELAY) ━━━");
     {
@@ -190,6 +224,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for _ in 0..n_warmup {
         mem.get(uri).await;
         chan.get(uri).await.unwrap();
+        #[cfg(feature = "shm")]
+        shm.get(uri).await.unwrap();
         #[cfg(unix)]
         uds.get(uri).await.unwrap();
         tcp.get(uri).await.unwrap();
@@ -200,6 +236,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Measure channel
     let stats_chan = bench_transport(n_measure, || async { chan.get(uri).await.unwrap() }).await;
+
+    // Measure SHM
+    #[cfg(feature = "shm")]
+    let stats_shm = bench_transport(n_measure, || async { shm.get(uri).await.unwrap() }).await;
 
     // Measure UDS (Unix only)
     #[cfg(unix)]
@@ -216,15 +256,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("    {}", "─".repeat(54));
     print_stats("Memory", &stats_mem);
     print_stats("Channel", &stats_chan);
+    #[cfg(feature = "shm")]
+    print_stats("SHM", &stats_shm);
     #[cfg(unix)]
     print_stats("UDS", &stats_uds);
     print_stats("TCP", &stats_tcp);
 
     println!();
-    println!("    One router. Four transports. Same URIs. Same handlers.");
+    println!("    One router. Five transports. Same URIs. Same handlers.");
     println!();
 
     // Cleanup
+    #[cfg(feature = "shm")]
+    let _ = std::fs::remove_file("/dev/shm/crossbar-demo");
     #[cfg(unix)]
     let _ = std::fs::remove_file("/tmp/crossbar-demo.sock");
 

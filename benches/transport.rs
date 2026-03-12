@@ -224,7 +224,87 @@ fn bench_channel(c: &mut Criterion) {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// 4. UDS — Unix Domain Socket (Unix only)
+// 4. SHM — Shared Memory (shm feature)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// Wait for a SHM server to become ready by retrying connections.
+#[cfg(feature = "shm")]
+fn wait_for_shm(rt: &tokio::runtime::Runtime, name: &str) {
+    for _ in 0..50 {
+        if rt
+            .block_on(async { ShmClient::connect(name).await })
+            .is_ok()
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("SHM server '{name}' did not become ready");
+}
+
+#[cfg(feature = "shm")]
+fn bench_shm(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let shm_name = "crossbar-bench";
+    let body = order_json_body();
+
+    rt.spawn({
+        let router = make_router();
+        async move { ShmServer::bind(shm_name, router).await.unwrap() }
+    });
+    wait_for_shm(&rt, shm_name);
+
+    let client = Arc::new(rt.block_on(ShmClient::connect(shm_name)).unwrap());
+
+    let mut group = c.benchmark_group("shm");
+    group.measurement_time(Duration::from_secs(1));
+
+    group.bench_function("health", |b| {
+        let client = client.clone();
+        b.to_async(&rt)
+            .iter(|| async { black_box(client.get("/health").await.unwrap()) })
+    });
+
+    group.bench_function("ohlc", |b| {
+        let client = client.clone();
+        b.to_async(&rt).iter(|| async {
+            black_box(
+                client
+                    .get("/v3/stock/snapshot/ohlc/AAPL?venue=nqb")
+                    .await
+                    .unwrap(),
+            )
+        })
+    });
+
+    group.bench_function("post_json", |b| {
+        let client = client.clone();
+        let body = body.clone();
+        b.to_async(&rt).iter(|| {
+            let body = body.clone();
+            async { black_box(client.post("/v3/stock/order", body).await.unwrap()) }
+        })
+    });
+
+    group.bench_function("large_64kb", |b| {
+        let client = client.clone();
+        b.to_async(&rt)
+            .iter(|| async { black_box(client.get("/large/64k").await.unwrap()) })
+    });
+
+    group.bench_function("large_1mb", |b| {
+        let client = client.clone();
+        b.to_async(&rt)
+            .iter(|| async { black_box(client.get("/large/1m").await.unwrap()) })
+    });
+
+    group.finish();
+
+    let _ = std::fs::remove_file("/dev/shm/crossbar-crossbar-bench");
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 5. UDS — Unix Domain Socket (Unix only)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 #[cfg(unix)]
@@ -291,7 +371,7 @@ fn bench_uds(c: &mut Criterion) {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// 5. TCP — with NODELAY
+// 6. TCP — with NODELAY
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 fn bench_tcp(c: &mut Criterion) {
@@ -354,7 +434,7 @@ fn bench_tcp(c: &mut Criterion) {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// 6. Throughput — bytes/sec measurements for large payloads
+// 7. Throughput — bytes/sec measurements for large payloads
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 fn bench_throughput(c: &mut Criterion) {
@@ -362,6 +442,18 @@ fn bench_throughput(c: &mut Criterion) {
 
     // Memory client
     let mem = MemoryClient::new(make_router());
+
+    // SHM client (separate name from the shm group)
+    #[cfg(feature = "shm")]
+    let shm = {
+        let shm_name = "crossbar-bench-tp";
+        rt.spawn({
+            let router = make_router();
+            async move { ShmServer::bind(shm_name, router).await.unwrap() }
+        });
+        wait_for_shm(&rt, shm_name);
+        Arc::new(rt.block_on(ShmClient::connect(shm_name)).unwrap())
+    };
 
     // UDS client (separate socket from the uds group) -- Unix only
     #[cfg(unix)]
@@ -399,6 +491,13 @@ fn bench_throughput(c: &mut Criterion) {
                 .iter(|| async { black_box(mem.get("/large/64k").await) })
         });
 
+        #[cfg(feature = "shm")]
+        group.bench_function("shm", |b| {
+            let shm = shm.clone();
+            b.to_async(&rt)
+                .iter(|| async { black_box(shm.get("/large/64k").await.unwrap()) })
+        });
+
         #[cfg(unix)]
         group.bench_function("uds", |b| {
             let uds = uds.clone();
@@ -427,6 +526,13 @@ fn bench_throughput(c: &mut Criterion) {
                 .iter(|| async { black_box(mem.get("/large/1m").await) })
         });
 
+        #[cfg(feature = "shm")]
+        group.bench_function("shm", |b| {
+            let shm = shm.clone();
+            b.to_async(&rt)
+                .iter(|| async { black_box(shm.get("/large/1m").await.unwrap()) })
+        });
+
         #[cfg(unix)]
         group.bench_function("uds", |b| {
             let uds = uds.clone();
@@ -444,6 +550,8 @@ fn bench_throughput(c: &mut Criterion) {
     }
 
     // Cleanup
+    #[cfg(feature = "shm")]
+    let _ = std::fs::remove_file("/dev/shm/crossbar-crossbar-bench-tp");
     #[cfg(unix)]
     let _ = std::fs::remove_file("/tmp/crossbar-bench-tp.sock");
 }
@@ -459,11 +567,20 @@ criterion_group!(
     bench_throughput,
 );
 
+#[cfg(feature = "shm")]
+criterion_group!(benches_shm, bench_shm,);
+
 #[cfg(unix)]
 criterion_group!(benches_unix, bench_uds,);
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "shm"))]
+criterion_main!(benches_common, benches_shm, benches_unix);
+
+#[cfg(all(unix, not(feature = "shm")))]
 criterion_main!(benches_common, benches_unix);
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), feature = "shm"))]
+criterion_main!(benches_common, benches_shm);
+
+#[cfg(all(not(unix), not(feature = "shm")))]
 criterion_main!(benches_common);

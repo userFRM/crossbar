@@ -567,6 +567,196 @@ async fn tcp_json_roundtrip() {
 }
 
 // ═══════════════════════════════════════════════════════
+// ShmClient/Server
+// ═══════════════════════════════════════════════════════
+
+#[cfg(feature = "shm")]
+fn shm_name(name: &str) -> String {
+    format!("test-{name}-{}", std::process::id())
+}
+
+#[cfg(feature = "shm")]
+fn cleanup_shm(name: &str) {
+    let path = format!("/dev/shm/crossbar-{name}");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[cfg(feature = "shm")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shm_get() {
+    let name = shm_name("shm_get");
+    let _handle = ShmServer::spawn(&name, test_router()).await.unwrap();
+
+    let client = ShmClient::connect(&name).await.unwrap();
+    let resp = client.get("/health").await.unwrap();
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body_str(), "ok");
+
+    cleanup_shm(&name);
+}
+
+#[cfg(feature = "shm")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shm_post() {
+    let name = shm_name("shm_post");
+    let _handle = ShmServer::spawn(&name, test_router()).await.unwrap();
+
+    let client = ShmClient::connect(&name).await.unwrap();
+    let resp = client.post("/echo", "shm body").await.unwrap();
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body_str(), "shm body");
+
+    cleanup_shm(&name);
+}
+
+#[cfg(feature = "shm")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shm_404() {
+    let name = shm_name("shm_404");
+    let _handle = ShmServer::spawn(&name, test_router()).await.unwrap();
+
+    let client = ShmClient::connect(&name).await.unwrap();
+    let resp = client.get("/nonexistent").await.unwrap();
+    assert_eq!(resp.status, 404);
+
+    cleanup_shm(&name);
+}
+
+#[cfg(feature = "shm")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shm_empty_body() {
+    let name = shm_name("shm_empty");
+    let _handle = ShmServer::spawn(&name, test_router()).await.unwrap();
+
+    let client = ShmClient::connect(&name).await.unwrap();
+    let resp = client.post("/echo", "").await.unwrap();
+    assert_eq!(resp.status, 200);
+    assert!(resp.body.is_empty());
+
+    cleanup_shm(&name);
+}
+
+#[cfg(feature = "shm")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shm_binary_roundtrip() {
+    let name = shm_name("shm_binary");
+    let _handle = ShmServer::spawn(&name, test_router()).await.unwrap();
+
+    let binary: Vec<u8> = (0..=255).collect();
+    let client = ShmClient::connect(&name).await.unwrap();
+    let resp = client.post("/echo", binary.clone()).await.unwrap();
+    assert_eq!(resp.body.as_ref(), binary.as_slice());
+
+    cleanup_shm(&name);
+}
+
+#[cfg(feature = "shm")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shm_json_roundtrip() {
+    #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+    struct Payload {
+        value: String,
+    }
+
+    let router = Router::new().route(
+        "/rpc",
+        post(|req: Request| async move {
+            let p: Payload = req.json_body().unwrap();
+            Json(Payload {
+                value: format!("echo:{}", p.value),
+            })
+        }),
+    );
+
+    let name = shm_name("shm_json");
+    let _handle = ShmServer::spawn(&name, router).await.unwrap();
+
+    let client = ShmClient::connect(&name).await.unwrap();
+    let body = serde_json::to_vec(&Payload {
+        value: "test".into(),
+    })
+    .unwrap();
+    let resp = client.post("/rpc", body).await.unwrap();
+    let out: Payload = serde_json::from_slice(&resp.body).unwrap();
+    assert_eq!(out.value, "echo:test");
+
+    cleanup_shm(&name);
+}
+
+#[cfg(feature = "shm")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shm_headers_roundtrip() {
+    let router = Router::new().route(
+        "/headers",
+        get(|req: Request| async move {
+            let mut resp = Response::ok().with_body("headers-ok");
+            for (k, v) in &req.headers {
+                resp = resp.with_header(format!("x-echo-{k}"), v.clone());
+            }
+            resp = resp.with_header("x-server", "crossbar");
+            resp
+        }),
+    );
+
+    let name = shm_name("shm_headers");
+    let _handle = ShmServer::spawn(&name, router).await.unwrap();
+
+    let client = ShmClient::connect(&name).await.unwrap();
+    let mut req = Request::new(Method::Get, "/headers");
+    req.headers
+        .insert("x-request-id".to_string(), "abc123".to_string());
+    req.headers
+        .insert("content-type".to_string(), "text/plain".to_string());
+    let resp = client.request(req).await.unwrap();
+
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body_str(), "headers-ok");
+    assert_eq!(
+        resp.headers.get("x-server").map(String::as_str),
+        Some("crossbar")
+    );
+    assert_eq!(
+        resp.headers.get("x-echo-x-request-id").map(String::as_str),
+        Some("abc123")
+    );
+    assert_eq!(
+        resp.headers.get("x-echo-content-type").map(String::as_str),
+        Some("text/plain")
+    );
+
+    cleanup_shm(&name);
+}
+
+#[cfg(feature = "shm")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shm_concurrent_requests() {
+    let name = shm_name("shm_concurrent");
+    let _handle = ShmServer::spawn(&name, test_router()).await.unwrap();
+
+    let client = std::sync::Arc::new(
+        ShmClient::connect_with_timeout(&name, std::time::Duration::from_secs(30))
+            .await
+            .unwrap(),
+    );
+
+    let mut handles = Vec::new();
+    for i in 0..50 {
+        let client = std::sync::Arc::clone(&client);
+        handles.push(tokio::spawn(async move {
+            let resp = client.get("/health").await.unwrap();
+            assert_eq!(resp.status, 200, "concurrent request {i} failed");
+            assert_eq!(resp.body_str(), "ok");
+        }));
+    }
+
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    cleanup_shm(&name);
+}
+
+// ═══════════════════════════════════════════════════════
 // Cross-transport consistency
 // ═══════════════════════════════════════════════════════
 
@@ -659,6 +849,47 @@ async fn all_transports_post_identical() {
     }
 
     let _ = std::fs::remove_file(&uds_p);
+}
+
+/// Verify that the shm transport returns the exact same response as MemoryClient.
+#[cfg(feature = "shm")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shm_matches_memory_responses() {
+    let router = test_router();
+
+    // Memory baseline
+    let mem_client = MemoryClient::new(router.clone());
+    let mem_get = mem_client.get("/health").await;
+    let mem_post = mem_client.post("/echo", "identical-payload").await;
+    let mem_json = mem_client.get("/json").await;
+    let mem_404 = mem_client.get("/nonexistent").await;
+
+    // Shm
+    let name = shm_name("shm_cross");
+    let _handle = ShmServer::spawn(&name, router).await.unwrap();
+    let shm_client = ShmClient::connect(&name).await.unwrap();
+
+    let shm_get = shm_client.get("/health").await.unwrap();
+    let shm_post = shm_client.post("/echo", "identical-payload").await.unwrap();
+    let shm_json = shm_client.get("/json").await.unwrap();
+    let shm_404 = shm_client.get("/nonexistent").await.unwrap();
+
+    // GET /health
+    assert_eq!(mem_get.status, shm_get.status);
+    assert_eq!(mem_get.body_str(), shm_get.body_str());
+
+    // POST /echo
+    assert_eq!(mem_post.status, shm_post.status);
+    assert_eq!(mem_post.body_str(), shm_post.body_str());
+
+    // GET /json
+    assert_eq!(mem_json.status, shm_json.status);
+    assert_eq!(mem_json.body.as_ref(), shm_json.body.as_ref());
+
+    // GET /nonexistent -> 404
+    assert_eq!(mem_404.status, shm_404.status);
+
+    cleanup_shm(&name);
 }
 
 // ═══════════════════════════════════════════════════════
