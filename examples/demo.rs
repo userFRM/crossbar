@@ -129,7 +129,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // ── 3. SHM (shared memory, Linux/Unix) ──────────────
-    #[cfg(feature = "shm")]
+    #[cfg(all(unix, feature = "shm"))]
     let shm = {
         let shm_name = "demo";
         println!("\n  ━━━ Shared Memory (/dev/shm) ━━━");
@@ -224,7 +224,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for _ in 0..n_warmup {
         mem.get(uri).await;
         chan.get(uri).await.unwrap();
-        #[cfg(feature = "shm")]
+        #[cfg(all(unix, feature = "shm"))]
         shm.get(uri).await.unwrap();
         #[cfg(unix)]
         uds.get(uri).await.unwrap();
@@ -238,7 +238,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stats_chan = bench_transport(n_measure, || async { chan.get(uri).await.unwrap() }).await;
 
     // Measure SHM
-    #[cfg(feature = "shm")]
+    #[cfg(all(unix, feature = "shm"))]
     let stats_shm = bench_transport(n_measure, || async { shm.get(uri).await.unwrap() }).await;
 
     // Measure UDS (Unix only)
@@ -256,7 +256,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("    {}", "─".repeat(54));
     print_stats("Memory", &stats_mem);
     print_stats("Channel", &stats_chan);
-    #[cfg(feature = "shm")]
+    #[cfg(all(unix, feature = "shm"))]
     print_stats("SHM", &stats_shm);
     #[cfg(unix)]
     print_stats("UDS", &stats_uds);
@@ -267,7 +267,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     // Cleanup
-    #[cfg(feature = "shm")]
+    #[cfg(all(unix, feature = "shm"))]
     let _ = std::fs::remove_file("/dev/shm/crossbar-demo");
     #[cfg(unix)]
     let _ = std::fs::remove_file("/tmp/crossbar-demo.sock");

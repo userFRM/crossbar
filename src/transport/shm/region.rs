@@ -336,8 +336,13 @@ impl ShmRegion {
     }
 
     /// Reads a request from a slot's data region.
+    ///
+    /// Validates that all length fields fit within [`slot_data_capacity`] before
+    /// creating any slices, preventing out-of-bounds reads from corrupted or
+    /// malicious shared memory data.
     pub fn read_request_from_slot(&self, idx: u32) -> Result<Request, CrossbarError> {
         let base = self.slot_base(idx);
+        let capacity = self.slot_data_capacity as usize;
 
         unsafe {
             let method_byte = *base.add(0x18);
@@ -352,6 +357,19 @@ impl ShmRegion {
 
             std::ptr::copy_nonoverlapping(base.add(0x24), buf4.as_mut_ptr(), 4);
             let headers_data_len = u32::from_le_bytes(buf4) as usize;
+
+            // Bounds check: total payload must fit within the slot data region.
+            let total = uri_len
+                .checked_add(headers_data_len)
+                .and_then(|v| v.checked_add(body_len));
+            match total {
+                Some(t) if t <= capacity => {}
+                _ => {
+                    return Err(CrossbarError::ShmInvalidRegion(format!(
+                        "request payload lengths ({uri_len}+{headers_data_len}+{body_len}) exceed slot capacity ({capacity})"
+                    )));
+                }
+            }
 
             let data = base.add(SLOT_HEADER_SIZE);
             let mut off = 0;
@@ -382,16 +400,32 @@ impl ShmRegion {
     }
 
     /// Writes a response into a slot's data region.
+    ///
+    /// If the response exceeds [`slot_data_capacity`], it is replaced with a
+    /// 500 error containing the truncation message. This prevents out-of-bounds
+    /// writes from handler responses that are larger than the slot can hold.
     pub fn write_response_to_slot(&self, idx: u32, resp: &Response) {
         let base = self.slot_base(idx);
+        let capacity = self.slot_data_capacity as usize;
         let headers_data = crate::transport::serialize_headers(&resp.headers);
+        let total = headers_data.len() + resp.body.len();
+
+        // If the response doesn't fit, write a 500 error instead.
+        let (status, headers_data, body) = if total > capacity {
+            let err_body = b"response too large for shm slot";
+            let empty_headers =
+                crate::transport::serialize_headers(&std::collections::HashMap::new());
+            (500u16, empty_headers, &err_body[..])
+        } else {
+            (resp.status, headers_data, resp.body.as_ref())
+        };
 
         unsafe {
             // response_status (2 bytes at 0x28)
-            std::ptr::copy_nonoverlapping(resp.status.to_le_bytes().as_ptr(), base.add(0x28), 2);
+            std::ptr::copy_nonoverlapping(status.to_le_bytes().as_ptr(), base.add(0x28), 2);
             // response_body_len
             std::ptr::copy_nonoverlapping(
-                (resp.body.len() as u32).to_le_bytes().as_ptr(),
+                (body.len() as u32).to_le_bytes().as_ptr(),
                 base.add(0x2C),
                 4,
             );
@@ -407,13 +441,17 @@ impl ShmRegion {
             let mut off = 0;
             std::ptr::copy_nonoverlapping(headers_data.as_ptr(), data.add(off), headers_data.len());
             off += headers_data.len();
-            std::ptr::copy_nonoverlapping(resp.body.as_ptr(), data.add(off), resp.body.len());
+            std::ptr::copy_nonoverlapping(body.as_ptr(), data.add(off), body.len());
         }
     }
 
     /// Reads a response from a slot's data region.
+    ///
+    /// Validates that all length fields fit within [`slot_data_capacity`] before
+    /// creating any slices.
     pub fn read_response_from_slot(&self, idx: u32) -> Result<Response, CrossbarError> {
         let base = self.slot_base(idx);
+        let capacity = self.slot_data_capacity as usize;
 
         unsafe {
             let mut buf2 = [0u8; 2];
@@ -426,6 +464,17 @@ impl ShmRegion {
 
             std::ptr::copy_nonoverlapping(base.add(0x30), buf4.as_mut_ptr(), 4);
             let headers_data_len = u32::from_le_bytes(buf4) as usize;
+
+            // Bounds check: total payload must fit within the slot data region.
+            let total = headers_data_len.checked_add(body_len);
+            match total {
+                Some(t) if t <= capacity => {}
+                _ => {
+                    return Err(CrossbarError::ShmInvalidRegion(format!(
+                        "response payload lengths ({headers_data_len}+{body_len}) exceed slot capacity ({capacity})"
+                    )));
+                }
+            }
 
             let data = base.add(SLOT_HEADER_SIZE);
             let mut off = 0;
@@ -500,6 +549,10 @@ impl ShmRegion {
 
     /// Scans for stale slots (stuck in non-FREE state with old timestamps)
     /// and resets them to FREE.
+    ///
+    /// Uses CAS to avoid racing with legitimate state transitions — if a slot
+    /// changed state between the load and recovery attempt, the CAS fails and
+    /// the slot is left alone.
     pub fn recover_stale_slots(&self, stale_timeout: Duration) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -512,8 +565,11 @@ impl ShmRegion {
             if current != FREE {
                 let ts = self.slot_timestamp(i);
                 if now.saturating_sub(ts) > stale_timeout.as_millis() as u64 {
-                    // Force reset to FREE
-                    state.store(FREE, Ordering::Release);
+                    // CAS instead of store: if the state changed since we
+                    // loaded it, a legitimate transition happened and we
+                    // must not clobber it.
+                    let _ =
+                        state.compare_exchange(current, FREE, Ordering::AcqRel, Ordering::Acquire);
                 }
             }
         }

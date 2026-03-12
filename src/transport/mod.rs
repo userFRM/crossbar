@@ -41,7 +41,7 @@
 
 mod channel;
 mod memory;
-#[cfg(feature = "shm")]
+#[cfg(all(unix, feature = "shm"))]
 mod shm;
 mod tcp;
 #[cfg(unix)]
@@ -49,7 +49,7 @@ mod uds;
 
 pub use channel::{ChannelClient, ChannelServer};
 pub use memory::MemoryClient;
-#[cfg(feature = "shm")]
+#[cfg(all(unix, feature = "shm"))]
 pub use shm::{ShmClient, ShmConfig, ShmHandle, ShmServer};
 pub use tcp::{TcpClient, TcpServer};
 #[cfg(unix)]
@@ -80,12 +80,27 @@ pub const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
 ///   [2B key_len LE][key bytes][2B val_len LE][val bytes]
 /// ```
 pub(crate) fn serialize_headers(headers: &HashMap<String, String>) -> Vec<u8> {
+    assert!(
+        headers.len() <= u16::MAX as usize,
+        "header count {} exceeds u16::MAX",
+        headers.len()
+    );
     let num = headers.len() as u16;
     let mut out = Vec::new();
     out.extend_from_slice(&num.to_le_bytes());
     for (k, v) in headers {
         let kb = k.as_bytes();
         let vb = v.as_bytes();
+        assert!(
+            kb.len() <= u16::MAX as usize,
+            "header key length {} exceeds u16::MAX",
+            kb.len()
+        );
+        assert!(
+            vb.len() <= u16::MAX as usize,
+            "header value length {} exceeds u16::MAX",
+            vb.len()
+        );
         out.extend_from_slice(&(kb.len() as u16).to_le_bytes());
         out.extend_from_slice(kb);
         out.extend_from_slice(&(vb.len() as u16).to_le_bytes());

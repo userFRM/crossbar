@@ -39,8 +39,14 @@ impl Drop for ShmHandle {
 /// Shared-memory IPC server.
 ///
 /// Creates a memory-mapped region and serves requests from any [`ShmClient`]
-/// that attaches to the same name. Achieves sub-microsecond latency for small
+/// that attaches to the same name. Achieves low-microsecond latency for small
 /// payloads by avoiding kernel data copies.
+///
+/// The server uses a single blocking thread that polls all slots in a loop.
+/// Handlers are invoked sequentially via `block_on`, so a slow handler will
+/// delay processing of other slots. For workloads with consistently fast
+/// handlers (the typical shm use case), this is optimal; for slow handlers,
+/// consider a socket-based transport instead.
 ///
 /// Only available on Unix targets with the `shm` feature enabled.
 ///
@@ -192,6 +198,10 @@ impl ShmServer {
                 {
                     found_work = true;
 
+                    // Refresh timestamp so stale recovery doesn't
+                    // reclaim this slot while the handler runs.
+                    region.touch_slot(slot_idx);
+
                     // Read request from slot
                     let req = match region.read_request_from_slot(slot_idx) {
                         Ok(r) => r,
@@ -227,7 +237,9 @@ impl ShmServer {
 ///
 /// Attaches to an existing shared memory region created by [`ShmServer`].
 /// Each request acquires its own slot — no internal Mutex needed, so
-/// concurrent requests proceed without contention.
+/// multiple callers can submit requests concurrently without client-side
+/// contention. Note that the server processes slots sequentially, so
+/// server-side throughput is bounded by handler latency.
 ///
 /// # Examples
 ///

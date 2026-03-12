@@ -570,18 +570,18 @@ async fn tcp_json_roundtrip() {
 // ShmClient/Server
 // ═══════════════════════════════════════════════════════
 
-#[cfg(feature = "shm")]
+#[cfg(all(unix, feature = "shm"))]
 fn shm_name(name: &str) -> String {
     format!("test-{name}-{}", std::process::id())
 }
 
-#[cfg(feature = "shm")]
+#[cfg(all(unix, feature = "shm"))]
 fn cleanup_shm(name: &str) {
     let path = format!("/dev/shm/crossbar-{name}");
     let _ = std::fs::remove_file(&path);
 }
 
-#[cfg(feature = "shm")]
+#[cfg(all(unix, feature = "shm"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shm_get() {
     let name = shm_name("shm_get");
@@ -595,7 +595,7 @@ async fn shm_get() {
     cleanup_shm(&name);
 }
 
-#[cfg(feature = "shm")]
+#[cfg(all(unix, feature = "shm"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shm_post() {
     let name = shm_name("shm_post");
@@ -609,7 +609,7 @@ async fn shm_post() {
     cleanup_shm(&name);
 }
 
-#[cfg(feature = "shm")]
+#[cfg(all(unix, feature = "shm"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shm_404() {
     let name = shm_name("shm_404");
@@ -622,7 +622,7 @@ async fn shm_404() {
     cleanup_shm(&name);
 }
 
-#[cfg(feature = "shm")]
+#[cfg(all(unix, feature = "shm"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shm_empty_body() {
     let name = shm_name("shm_empty");
@@ -636,7 +636,7 @@ async fn shm_empty_body() {
     cleanup_shm(&name);
 }
 
-#[cfg(feature = "shm")]
+#[cfg(all(unix, feature = "shm"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shm_binary_roundtrip() {
     let name = shm_name("shm_binary");
@@ -650,7 +650,7 @@ async fn shm_binary_roundtrip() {
     cleanup_shm(&name);
 }
 
-#[cfg(feature = "shm")]
+#[cfg(all(unix, feature = "shm"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shm_json_roundtrip() {
     #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
@@ -683,7 +683,7 @@ async fn shm_json_roundtrip() {
     cleanup_shm(&name);
 }
 
-#[cfg(feature = "shm")]
+#[cfg(all(unix, feature = "shm"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shm_headers_roundtrip() {
     let router = Router::new().route(
@@ -727,7 +727,7 @@ async fn shm_headers_roundtrip() {
     cleanup_shm(&name);
 }
 
-#[cfg(feature = "shm")]
+#[cfg(all(unix, feature = "shm"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shm_concurrent_requests() {
     let name = shm_name("shm_concurrent");
@@ -852,7 +852,7 @@ async fn all_transports_post_identical() {
 }
 
 /// Verify that the shm transport returns the exact same response as MemoryClient.
-#[cfg(feature = "shm")]
+#[cfg(all(unix, feature = "shm"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shm_matches_memory_responses() {
     let router = test_router();

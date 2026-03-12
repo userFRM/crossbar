@@ -86,9 +86,10 @@
 //! ## Shared Memory
 //!
 //! [`ShmServer`](transport::ShmServer) and [`ShmClient`](transport::ShmClient)
-//! are gated behind the `shm` Cargo feature. Enable with
-//! `cargo add crossbar --features shm`. On Linux, the shared memory region
-//! lives at `/dev/shm/crossbar-{name}`.
+//! are gated behind the `shm` Cargo feature and are only available on Unix
+//! targets. Enable with `cargo add crossbar --features shm`. On Linux, the
+//! shared memory region lives at `/dev/shm/crossbar-{name}`; on other Unix
+//! platforms it falls back to `/tmp/crossbar-shm-{name}`.
 //!
 //! ## Unix Domain Socket
 //!

@@ -269,18 +269,18 @@ async fn stress_memory_rapid_1000() {
 // 50 concurrent SHM requests
 // ═══════════════════════════════════════════════════════
 
-#[cfg(feature = "shm")]
+#[cfg(all(unix, feature = "shm"))]
 fn shm_name(name: &str) -> String {
     format!("stress-{name}-{}", std::process::id())
 }
 
-#[cfg(feature = "shm")]
+#[cfg(all(unix, feature = "shm"))]
 fn cleanup_shm(name: &str) {
     let path = format!("/dev/shm/crossbar-{name}");
     let _ = std::fs::remove_file(&path);
 }
 
-#[cfg(feature = "shm")]
+#[cfg(all(unix, feature = "shm"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stress_shm_50_concurrent() {
     let name = shm_name("shm_50");
@@ -313,7 +313,7 @@ async fn stress_shm_50_concurrent() {
 // Rapid sequential SHM requests (1000)
 // ═══════════════════════════════════════════════════════
 
-#[cfg(feature = "shm")]
+#[cfg(all(unix, feature = "shm"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stress_rapid_sequential_shm_1000() {
     let name = shm_name("shm_rapid");

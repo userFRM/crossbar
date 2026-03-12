@@ -228,7 +228,7 @@ fn bench_channel(c: &mut Criterion) {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 /// Wait for a SHM server to become ready by retrying connections.
-#[cfg(feature = "shm")]
+#[cfg(all(unix, feature = "shm"))]
 fn wait_for_shm(rt: &tokio::runtime::Runtime, name: &str) {
     for _ in 0..50 {
         if rt
@@ -242,7 +242,7 @@ fn wait_for_shm(rt: &tokio::runtime::Runtime, name: &str) {
     panic!("SHM server '{name}' did not become ready");
 }
 
-#[cfg(feature = "shm")]
+#[cfg(all(unix, feature = "shm"))]
 fn bench_shm(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let shm_name = "crossbar-bench";
@@ -444,7 +444,7 @@ fn bench_throughput(c: &mut Criterion) {
     let mem = MemoryClient::new(make_router());
 
     // SHM client (separate name from the shm group)
-    #[cfg(feature = "shm")]
+    #[cfg(all(unix, feature = "shm"))]
     let shm = {
         let shm_name = "crossbar-bench-tp";
         rt.spawn({
@@ -491,7 +491,7 @@ fn bench_throughput(c: &mut Criterion) {
                 .iter(|| async { black_box(mem.get("/large/64k").await) })
         });
 
-        #[cfg(feature = "shm")]
+        #[cfg(all(unix, feature = "shm"))]
         group.bench_function("shm", |b| {
             let shm = shm.clone();
             b.to_async(&rt)
@@ -526,7 +526,7 @@ fn bench_throughput(c: &mut Criterion) {
                 .iter(|| async { black_box(mem.get("/large/1m").await) })
         });
 
-        #[cfg(feature = "shm")]
+        #[cfg(all(unix, feature = "shm"))]
         group.bench_function("shm", |b| {
             let shm = shm.clone();
             b.to_async(&rt)
@@ -550,7 +550,7 @@ fn bench_throughput(c: &mut Criterion) {
     }
 
     // Cleanup
-    #[cfg(feature = "shm")]
+    #[cfg(all(unix, feature = "shm"))]
     let _ = std::fs::remove_file("/dev/shm/crossbar-crossbar-bench-tp");
     #[cfg(unix)]
     let _ = std::fs::remove_file("/tmp/crossbar-bench-tp.sock");
@@ -567,7 +567,7 @@ criterion_group!(
     bench_throughput,
 );
 
-#[cfg(feature = "shm")]
+#[cfg(all(unix, feature = "shm"))]
 criterion_group!(benches_shm, bench_shm,);
 
 #[cfg(unix)]
