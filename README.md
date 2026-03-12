@@ -1,29 +1,114 @@
-# Crossbar
+# crossbar
 
-<!-- badges placeholder -->
+[![CI](https://github.com/userFRM/crossbar/actions/workflows/ci.yml/badge.svg)](https://github.com/userFRM/crossbar/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org)
-[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
 
-**Transport-polymorphic URI router for Rust. Define handlers once, serve them across in-process, channel, shared memory, UDS, and TCP transports.**
+**Define handlers once. Serve over any transport.**
 
-Crossbar lets you define your request handlers and URI routes exactly once, then serve them over any combination of transports -- in-process memory, tokio channels, shared memory, Unix domain sockets, or raw TCP -- with zero code changes. The same router, the same handlers, the same URIs, running at the speed each transport allows: sub-microsecond for in-process calls, single-digit microseconds across tasks, and low double-digits over the network.
+Crossbar is a URI router that decouples your request handlers from the transport layer. Write your routes once, then serve them over in-process memory, tokio channels, shared memory, Unix domain sockets, or TCP -- with zero code changes. Same router, same handlers, same URIs.
+
+```rust
+let router = Router::new()
+    .route("/health", get(health))
+    .route("/tick/:symbol", get(get_tick))
+    .route("/echo", post(echo));
+
+// Pick your transport -- the router doesn't care.
+MemoryClient::new(router.clone());                        // in-process, ~150 ns
+ChannelServer::spawn(router.clone());                     // cross-task, ~6 us
+ShmServer::spawn("myapp", router.clone()).await?;         // cross-process, ~3 us
+UdsServer::bind("/tmp/myapp.sock", router.clone()).await?; // Unix socket, ~13 us
+TcpServer::bind("0.0.0.0:4000", router).await?;          // network, ~26 us
+```
 
 ---
 
-## Features
+## Showcase: two binaries, one router
 
-- **Transport polymorphism** -- one `Router` drives five transports out of the box (Memory, Channel, SHM, UDS, TCP)
-- **URI pattern matching** with `:param` extraction and query string parsing
-- **Binary wire protocol** -- length-prefixed request/response frames with header support, body passed as `Bytes`
-- **Axum-inspired handler system** -- `async fn(Request) -> impl IntoResponse` with a rich `IntoResponse` trait
-- **Synchronous handler support** -- `sync_handler()` and `sync_handler_with_req()` for non-async functions
-- **Sub-microsecond in-process dispatch** via `MemoryClient` (direct function call, no serialization)
-- **Persistent connections** with keep-alive for UDS and TCP transports
-- **JSON and binary body support** -- `Json<T>` wrapper for automatic serde, raw `Bytes` for everything else
-- **`#[handler]` proc macro** -- convenience extraction for path/query parameters and JSON body (see [Proc Macro](#handler-proc-macro) below)
-- **`TCP_NODELAY`** enabled by default for low-latency networking (Nagle's algorithm disabled)
-- **Shared memory transport** -- zero-kernel-copy IPC via `/dev/shm`, enabled with `cargo add crossbar --features shm`
-- **UDS transport** -- available on Unix platforms only (`#[cfg(unix)]`)
+Start the server in one terminal, hit it from another. Same routes, no HTTP, no framework overhead.
+
+**Terminal 1 -- server**
+
+```sh
+cargo run --example server
+```
+
+```rust
+// examples/server.rs
+use crossbar::prelude::*;
+
+async fn health() -> &'static str { "ok" }
+
+async fn get_tick(req: Request) -> Json<Tick> {
+    let symbol = req.path_param("symbol").unwrap_or("???").to_uppercase();
+    Json(Tick { symbol, price: 182.63, volume: 48_392_100, ts: now() })
+}
+
+async fn echo(req: Request) -> Vec<u8> { req.body.to_vec() }
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let router = Router::new()
+        .route("/health", get(health))
+        .route("/tick/:symbol", get(get_tick))
+        .route("/echo", post(echo));
+
+    println!("listening on 127.0.0.1:4000");
+    TcpServer::bind("127.0.0.1:4000", router).await?;
+    Ok(())
+}
+```
+
+**Terminal 2 -- client**
+
+```sh
+cargo run --example client
+```
+
+```rust
+// examples/client.rs
+use crossbar::prelude::*;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = TcpClient::connect("127.0.0.1:4000").await?;
+
+    let resp = client.get("/health").await?;
+    println!("{} {}", resp.status, resp.body_str());          // 200 ok
+
+    let resp = client.get("/tick/AAPL").await?;
+    println!("{} {}", resp.status, resp.body_str());          // 200 {"symbol":"AAPL",...}
+
+    let resp = client.post("/echo", b"hello".to_vec()).await?;
+    println!("{} {}", resp.status, resp.body_str());          // 200 hello
+
+    Ok(())
+}
+```
+
+```
+GET /health          -> 200 ok
+GET /tick/AAPL       -> 200 {"symbol":"AAPL","price":182.63,"volume":48392100,"ts":1741810438000}
+POST /echo           -> 200 hello crossbar
+GET /nonexistent     -> 404
+```
+
+No HTTP. No JSON overhead on the wire. Just a 13-byte binary header + your payload.
+
+---
+
+## When this is useful
+
+For most web services, use axum or actix. Crossbar targets a different niche:
+
+- **Inter-process communication** where you want URI routing without HTTP overhead
+- **Trading systems** that need sub-microsecond in-process dispatch with the option to scale to cross-process later
+- **Game servers** with co-located services that communicate on the same host
+- **Microservice sidecars** that fan out to local processes before hitting the network
+- **Testing** -- swap a TCP transport for `MemoryClient` and run your integration tests without sockets
+
+The key insight: transport choice is an infrastructure decision, not a code decision. Your handlers shouldn't know or care.
 
 ---
 
@@ -31,422 +116,276 @@ Crossbar lets you define your request handlers and URI routes exactly once, then
 
 ```mermaid
 graph TD
-    URI["URI: /v3/stock/ohlc/:symbol?venue=nqb"]
-    URI --> Router
-    Router --> Handler["Handler<br/>async fn(Request) -> impl IntoResponse"]
-    Handler --> Memory["Memory<br/>~1 us"]
-    Handler --> Channel["Channel<br/>~8 us"]
-    Handler --> SHM["SHM<br/>~3 us<br/>(shm feature)"]
-    Handler --> UDS["UDS<br/>~13 us<br/>(Unix only)"]
-    Handler --> TCP["TCP<br/>~26 us"]
+    R["Router"] --> H["Handler<br>async fn(Request) -> impl IntoResponse"]
 
-    style URI fill:#2563eb,color:#fff
-    style Router fill:#7c3aed,color:#fff
-    style Handler fill:#059669,color:#fff
-    style Memory fill:#f59e0b,color:#000
-    style Channel fill:#f59e0b,color:#000
+    H --> M["Memory<br>~150 ns"]
+    H --> CH["Channel<br>~6 us"]
+    H --> SHM["SHM<br>~3 us"]
+    H --> UDS["UDS<br>~13 us"]
+    H --> TCP["TCP<br>~26 us"]
+
+    M -.- MP["In-process<br>direct fn call"]
+    CH -.- CP["Cross-task<br>tokio mpsc"]
+    SHM -.- SP["Cross-process<br>/dev/shm mmap"]
+    UDS -.- UP["Same host<br>Unix socket"]
+    TCP -.- TP["Any host<br>TCP_NODELAY"]
+
+    style R fill:#7c3aed,color:#fff
+    style H fill:#059669,color:#fff
+    style M fill:#f59e0b,color:#000
+    style CH fill:#f59e0b,color:#000
     style SHM fill:#f59e0b,color:#000
     style UDS fill:#f59e0b,color:#000
     style TCP fill:#f59e0b,color:#000
 ```
 
-**Router** holds an `Arc<Vec<Route>>`, each pairing a `Method` + `PathPattern` with a type-erased `BoxedHandler`. On dispatch, it iterates routes in registration order, matches the method and path segments, extracts `:param` captures into the request, and calls the handler.
+---
 
-**Handlers** are any `async fn` (or sync function wrapped in `sync_handler`) that returns `impl IntoResponse`. The `Handler` trait uses a marker-type trick (similar to axum) to support both zero-argument handlers (`async fn() -> R`) and single-argument handlers (`async fn(Request) -> R`) without ambiguity.
+## Transport comparison
 
-**Transports** share the same binary wire protocol for UDS, TCP, and SHM. Memory and Channel transports skip serialization entirely -- the `Request` struct is passed directly. The SHM transport communicates via memory-mapped `/dev/shm` regions for zero-kernel-copy IPC.
+| Transport | Latency | Mechanism | Use case | Platform |
+|-----------|---------|-----------|----------|----------|
+| **Memory** | ~150 ns | Direct `Arc<Router>` call | In-process dispatch, testing | All |
+| **Channel** | ~6 us | tokio `mpsc` + `oneshot` | Cross-task within one process | All |
+| **SHM** | ~3 us | `mmap` + atomics + futex | Ultra-low-latency cross-process IPC | Unix (`shm` feature) |
+| **UDS** | ~13 us | Unix domain socket, keep-alive | Cross-process, same host | Unix |
+| **TCP** | ~26 us | Raw TCP, `TCP_NODELAY` | Networked services | All |
+
+> Measured with `cargo bench --features shm` on localhost. Numbers are relative -- run on your hardware for absolutes.
 
 ---
 
-## Quick Start
+## Getting started
 
-Add to your `Cargo.toml`:
+### 1. Add the dependency
 
 ```toml
 [dependencies]
-crossbar = { path = "." }  # or your registry/git source
+crossbar = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 ```
 
-To enable shared memory transport, add the `shm` feature:
+For shared memory transport (Unix only):
 
 ```toml
-crossbar = { path = ".", features = ["shm"] }
+crossbar = { version = "0.1", features = ["shm"] }
 ```
 
-Minimal example -- router with an in-process memory client:
+### 2. Define your handlers
+
+Handlers are async functions returning anything that implements `IntoResponse`:
 
 ```rust
 use crossbar::prelude::*;
 
-async fn hello(req: Request) -> String {
-    let name = req.path_param("name").unwrap_or("world");
-    format!("Hello, {}!", name)
-}
-
-#[tokio::main]
-async fn main() {
-    let router = Router::new()
-        .route("/hello/:name", get(hello));
-
-    let client = MemoryClient::new(router);
-
-    let resp = client.get("/hello/crossbar").await;
-    assert_eq!(resp.status, 200);
-    assert_eq!(resp.body_str(), "Hello, crossbar!");
-}
-```
-
----
-
-## Full Example
-
-The included `examples/demo.rs` demonstrates all five transports serving the same routes (UDS is Unix only, SHM requires the `shm` feature). Run it with:
-
-```bash
-cargo run --release --example demo --features shm
-```
-
-```rust
-use serde::{Deserialize, Serialize};
-use crossbar::prelude::*;
-
-// Define handlers once -----------------------------------------------
-
-async fn health() -> &'static str {
-    "ok"
-}
-
-#[derive(Serialize)]
-struct OhlcData {
-    symbol: String,
-    venue: String,
-    open: f64,
-    high: f64,
-    low: f64,
-    close: f64,
-    volume: u64,
-}
-
-async fn get_ohlc(req: Request) -> Json<OhlcData> {
-    let symbol = req.path_param("symbol").unwrap_or("???").to_string();
-    let venue = req.query_param("venue").unwrap_or_else(|| "default".into());
-    Json(OhlcData {
-        symbol, venue,
-        open: 150.25, high: 155.80, low: 149.10, close: 153.42,
-        volume: 48_392_100,
-    })
-}
-
-#[derive(Deserialize)]
-struct OrderRequest { symbol: String, side: String, qty: u32 }
-
-#[derive(Serialize)]
-struct OrderResponse { order_id: String, symbol: String, side: String, qty: u32, status: String }
-
-async fn create_order(req: Request) -> Result<Json<OrderResponse>, (u16, &'static str)> {
-    let order: OrderRequest = req.json_body().map_err(|_| (400u16, "invalid JSON body"))?;
-    Ok(Json(OrderResponse {
-        order_id: "ORD-000042".into(),
-        symbol: order.symbol, side: order.side, qty: order.qty,
-        status: "filled".into(),
-    }))
-}
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let router = Router::new()
-        .route("/health", get(health))
-        .route("/v3/stock/snapshot/ohlc/:symbol", get(get_ohlc))
-        .route("/v3/stock/order", post(create_order));
-
-    // 1. Memory -- in-process, sub-microsecond
-    let mem = MemoryClient::new(router.clone());
-    let r = mem.get("/v3/stock/snapshot/ohlc/AAPL?venue=nqb").await;
-    println!("Memory:  {} {}", r.status, r.body_str());
-
-    // 2. Channel -- cross-task via tokio::mpsc
-    let chan = ChannelServer::spawn(router.clone());
-    let r = chan.get("/health").await.unwrap();
-    println!("Channel: {} {}", r.status, r.body_str());
-
-    // 3. Unix Domain Socket -- cross-process, same host (Unix only)
-    #[cfg(unix)]
-    {
-        let uds_path = "/tmp/crossbar-demo.sock";
-        tokio::spawn({
-            let r = router.clone();
-            async move { UdsServer::bind(uds_path, r).await.unwrap() }
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-        let uds = UdsClient::connect(uds_path).await?;
-        let r = uds.get("/health").await?;
-        println!("UDS:     {} {}", r.status, r.body_str());
-    }
-
-    // 4. TCP -- networked, with TCP_NODELAY
-    let tcp_addr = "127.0.0.1:19876";
-    tokio::spawn({
-        let r = router.clone();
-        async move { TcpServer::bind(tcp_addr, r).await.unwrap() }
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-    let tcp = TcpClient::connect(tcp_addr).await?;
-    let r = tcp.get("/health").await?;
-    println!("TCP:     {} {}", r.status, r.body_str());
-
-    Ok(())
-}
-```
-
----
-
-## Wire Protocol
-
-Crossbar uses a binary framing protocol for UDS, TCP, and SHM transports. No HTTP overhead, no text parsing -- length-prefixed frames with optional headers.
-
-```mermaid
-sequenceDiagram
-    participant Client
-    participant Server
-    Client->>Server: [1B method][4B uri_len][4B body_len][4B headers_len][uri][headers][body]
-    Server->>Server: Route -> Handler -> Response
-    Server->>Client: [2B status][4B body_len][4B headers_len][headers][body]
-```
-
-### Request Frame (13 + N + H + M bytes)
-
-```
-+--------+------------------+------------------+---------------------+-----------+---------------+-----------+
-| Method | URI Length (LE)   | Body Length (LE)  | Headers Length (LE) | URI bytes | Headers bytes | Body bytes|
-| 1 byte | 4 bytes          | 4 bytes           | 4 bytes             | N bytes   | H bytes       | M bytes   |
-+--------+------------------+------------------+---------------------+-----------+---------------+-----------+
-```
-
-### Response Frame (10 + H + M bytes)
-
-```
-+------------------+------------------+---------------------+---------------+-----------+
-| Status (LE)      | Body Length (LE)  | Headers Length (LE) | Headers bytes | Body bytes|
-| 2 bytes          | 4 bytes           | 4 bytes             | H bytes       | M bytes   |
-+------------------+------------------+---------------------+---------------+-----------+
-```
-
-### Headers Section
-
-The headers section is a sequence of key-value pairs:
-
-```
-+-------------------+------------------------------------------+
-| Count (LE)        | Repeated: [2B key_len LE][key][2B val_len LE][val] |
-| 2 bytes           | variable                                 |
-+-------------------+------------------------------------------+
-```
-
-### Method Encoding
-
-| Byte | Method |
-|------|--------|
-| `0x00` | GET |
-| `0x01` | POST |
-| `0x02` | PUT |
-| `0x03` | DELETE |
-| `0x04` | PATCH |
-
-**Design rationale:** The protocol is intentionally minimal. All integers are little-endian for zero-cost reads on x86/ARM. The body is transferred as raw bytes via `Bytes` (backed by `BytesMut`), enabling zero-copy slicing downstream. Frames are limited to 64 MiB by default (`MAX_FRAME_SIZE`).
-
----
-
-## Type Relationships
-
-```mermaid
-classDiagram
-    class Router {
-        +route(pattern, handler) Router
-        +dispatch(Request) Response
-    }
-    class Request {
-        +method: Method
-        +uri: Uri
-        +body: Bytes
-        +path_param(name) Option~str~
-        +query_param(name) Option~String~
-    }
-    class Response {
-        +status: u16
-        +body: Bytes
-        +ok() Response
-        +json(T) Response
-    }
-    Router --> Request : dispatches
-    Router --> Response : returns
-```
-
----
-
-## Transport Comparison
-
-| Transport | Avg Latency | Use Case | Connection Model | Platform |
-|-----------|-------------|----------|------------------|----------|
-| **Memory** | ~1 us | In-process dispatch, testing, embedded routers | Direct function call via `Arc<Router>` | All |
-| **Channel** | ~8 us | Cross-task communication within one process | `tokio::mpsc` + `oneshot` reply | All |
-| **SHM** | ~3 us | Ultra-low-latency cross-process IPC, same host | Shared memory region via `/dev/shm` | Unix (`shm` feature) |
-| **UDS** | ~13 us | Cross-process on the same host | Persistent connection, keep-alive loop | Unix only (`#[cfg(unix)]`) |
-| **TCP** | ~26 us | Networked services, remote hosts | Persistent connection, `TCP_NODELAY` | All |
-
-> Latencies measured on a single machine with `cargo run --release --example demo` (5000 iterations after 500 warmup). These are relative comparisons between transports, not absolute guarantees.
-
----
-
-## Benchmark Results
-
-Criterion-based benchmarks across all five transports (`cargo bench --features shm`):
-
-| Benchmark | Memory | Channel | SHM | UDS | TCP |
-|-----------|--------|---------|-----|-----|-----|
-| health (minimal) | 149 ns | 6.2 us | ~2 us | 10.8 us | 24.0 us |
-| ohlc (JSON + params) | 1.15 us | 7.7 us | ~4 us | 15.4 us | 27.6 us |
-| post_json | 1.32 us | 8.1 us | ~4 us | 14.7 us | 31.1 us |
-| 64KB payload | 1.26 us | 7.7 us | ~5 us | 24.2 us | 38.0 us |
-| 1MB payload | 17.3 us | 26.0 us | ~25 us | 214.6 us | 214.4 us |
-
-> Actual numbers depend on hardware. The relative ordering is consistent: Memory < Channel < SHM < UDS < TCP. SHM numbers are approximate pending benchmarks on your hardware.
-
-**Methodology:** Benchmarks use fixed socket paths and ports on localhost. Numbers are from a single machine and should be treated as relative comparisons between transports, not absolute guarantees. UDS/TCP servers use readiness-wait loops instead of arbitrary sleeps.
-
----
-
-## Handler System
-
-Handlers are async functions that return anything implementing the `IntoResponse` trait. Crossbar supports two async handler signatures and two synchronous handler wrappers:
-
-### Async Handlers
-
-```rust
-// Zero arguments -- request is ignored
 async fn health() -> &'static str { "ok" }
 
-// One argument -- receives the full Request
 async fn greet(req: Request) -> String {
-    format!("Hello, {}!", req.path_param("name").unwrap_or("stranger"))
+    let name = req.path_param("name").unwrap_or("world");
+    format!("Hello, {name}!")
+}
+
+async fn create_order(req: Request) -> Result<Json<Order>, (u16, &'static str)> {
+    let input: OrderInput = req.json_body()
+        .map_err(|_| (400u16, "invalid JSON"))?;
+    Ok(Json(process(input)))
 }
 ```
 
-### Synchronous Handlers
+### 3. Build the router
 
-When your handler does not need to be `async`, wrap it with `sync_handler` (zero arguments) or `sync_handler_with_req` (receives the `Request`):
+```rust
+let router = Router::new()
+    .route("/health", get(health))
+    .route("/greet/:name", get(greet))
+    .route("/order", post(create_order));
+```
+
+### 4. Serve over any transport
+
+```rust
+// In-process (testing, embedded)
+let mem = MemoryClient::new(router.clone());
+let resp = mem.get("/health").await;
+
+// TCP (production, networked)
+TcpServer::bind("0.0.0.0:4000", router).await?;
+
+// UDS (production, same-host)
+UdsServer::bind("/tmp/myapp.sock", router).await?;
+```
+
+---
+
+## Handler system
+
+Crossbar supports async handlers, sync wrappers, a `#[handler]` proc macro, and a rich `IntoResponse` trait.
+
+### Async handlers
+
+```rust
+async fn health() -> &'static str { "ok" }                // zero args
+async fn echo(req: Request) -> String { req.body_str() }   // receives Request
+```
+
+### Sync handlers
 
 ```rust
 use crossbar::prelude::*;
-
-fn health() -> &'static str { "ok" }
-
-fn echo(req: Request) -> String {
-    format!("got {} bytes", req.body.len())
-}
 
 let router = Router::new()
-    .route("/health", get(sync_handler(health)))
-    .route("/echo", post(sync_handler_with_req(echo)));
+    .route("/health", get(sync_handler(|| "ok")))
+    .route("/echo", post(sync_handler_with_req(|req: Request| {
+        format!("got {} bytes", req.body.len())
+    })));
 ```
 
-Sync and async handlers can be freely mixed on the same router.
+### `#[handler]` proc macro
 
-### `#[handler]` Proc Macro
-
-The `#[handler]` macro provides convenience extraction of `String` and `Option<String>` path/query parameters and JSON body deserialization. It is syntactic sugar, not a full extractor system like Axum's.
+Extract path params, query params, and JSON bodies automatically:
 
 ```rust
-use crossbar::prelude::*;
 use crossbar_macros::handler;
 
 #[handler]
-async fn get_ohlc(
+async fn get_tick(
     #[path("symbol")] symbol: String,
     #[query("venue")] venue: Option<String>,
-) -> Json<OhlcData> {
-    // symbol and venue are extracted automatically
-    // ...
+    #[body] filters: Filters,
+) -> Json<TickData> {
+    // symbol, venue, filters extracted automatically
+    // missing required params return 400
 }
 ```
 
-The macro generates roughly:
+| Attribute | Type | On missing |
+|-----------|------|------------|
+| `#[path("name")]` | `String` / `Option<String>` | 400 / `None` |
+| `#[query("name")]` | `String` / `Option<String>` | 400 / `None` |
+| `#[body]` | `T: Deserialize` | 400 |
+| *(none)* | `Request` | passthrough |
 
-```rust
-async fn get_ohlc(req: Request) -> impl IntoResponse {
-    let symbol: String = match req.path_param("symbol") {
-        Some(v) => v.to_string(),
-        None => return Response::new(400).with_body("missing path param: symbol"),
-    };
-    let venue: Option<String> = req.query_param("venue");
-    // ... original function body
-}
-```
+### `IntoResponse` types
 
-Supported extractor attributes:
-
-| Attribute | Type | Description | Behavior on Missing |
-|-----------|------|-------------|---------------------|
-| `#[path("name")]` | `String` | Extracts a path parameter by name | Returns 400 |
-| `#[path("name")]` | `Option<String>` | Extracts a path parameter by name | `None` |
-| `#[query("name")]` | `String` | Extracts a query parameter by name | Returns 400 |
-| `#[query("name")]` | `Option<String>` | Extracts a query parameter by name | `None` |
-| `#[body]` | `T: Deserialize` | Deserializes the request body as JSON | Returns 400 |
-| *(none)* | `Request` | Passes the raw `Request` through | -- |
-
-### `IntoResponse` Implementations
-
-| Type | Status | Body |
-|------|--------|------|
-| `&'static str` | `200` | Text body |
-| `String` | `200` | Text body |
-| `Bytes` | `200` | Raw bytes |
-| `Vec<u8>` | `200` | Raw bytes |
-| `Json<T: Serialize>` | `200` | JSON-serialized body |
-| `(u16, &'static str)` | Custom | Text body |
-| `(u16, String)` | Custom | Text body |
-| `Result<R, E>` | `Ok` -> R's status, `Err` -> E's status | Delegates to inner type |
-| `Response` | Passthrough | Passthrough |
-
-### Error Handling with `Result`
-
-```rust
-async fn create_order(req: Request) -> Result<Json<Order>, (u16, &'static str)> {
-    let input: OrderInput = req.json_body()
-        .map_err(|_| (400u16, "invalid JSON body"))?;
-    let order = process(input);
-    Ok(Json(order))
-}
-```
-
-On success, the handler returns `200` with a JSON body. On failure, it returns `400` with a plain-text error message. No manual `Response` construction needed.
+| Return type | Status | Body |
+|-------------|--------|------|
+| `&'static str` | 200 | text |
+| `String` | 200 | text |
+| `Vec<u8>` / `Bytes` | 200 | raw bytes |
+| `Json<T: Serialize>` | 200 | JSON |
+| `(u16, &str)` / `(u16, String)` | custom | text |
+| `Result<R, E>` | delegates | delegates |
+| `Response` | passthrough | passthrough |
 
 ---
 
-## Benchmarking
+## Wire protocol
 
-The demo example includes a built-in latency comparison that runs 5000 iterations (after 500 warmup) across transports (UDS is Unix only, SHM requires the `shm` feature):
+Binary framing for UDS, TCP, and SHM. No HTTP, no text parsing.
 
-```bash
-cargo run --release --example demo --features shm
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+
+    C->>S: [1B method][4B uri_len][4B body_len][4B headers_len]<br>[uri][headers][body]
+    S->>S: Router.dispatch(req)
+    S->>C: [2B status][4B body_len][4B headers_len]<br>[headers][body]
 ```
 
-For criterion-based benchmarks:
+13-byte request header, 10-byte response header. All integers little-endian. Max frame size 64 MiB. Body transferred as raw `Bytes` -- zero-copy slicing via `BytesMut::freeze().split_to()`.
 
-```bash
-cargo bench --features shm
+---
+
+## Shared memory transport
+
+The `shm` feature adds `ShmServer` and `ShmClient` for cross-process IPC without kernel data copies. Unix only.
+
+```toml
+crossbar = { version = "0.1", features = ["shm"] }
+```
+
+```rust
+// Process A -- server
+let router = Router::new().route("/tick", get(get_tick));
+ShmServer::bind("myapp", router).await?;
+
+// Process B -- client
+let client = ShmClient::connect("myapp").await?;
+let resp = client.get("/tick").await?;
+```
+
+**How it works:** Server creates a memory-mapped region at `/dev/shm/crossbar-{name}` with 64 request/response slots. Clients acquire slots via atomic CAS, write requests, and wait for responses using a spin-then-futex strategy. No syscalls on the data path.
+
+| Detail | Value |
+|--------|-------|
+| Slot count | 64 (configurable) |
+| Slot capacity | 64 KiB (configurable) |
+| Synchronization | spin 100x -> yield 10x -> futex_wait |
+| Crash recovery | Server heartbeat + stale slot CAS recovery |
+
+---
+
+## Benchmarks
+
+Criterion benchmarks across all five transports (`cargo bench --features shm`):
+
+| Benchmark | Memory | Channel | SHM | UDS | TCP |
+|-----------|--------|---------|-----|-----|-----|
+| `/health` (minimal) | 149 ns | 6.2 us | ~2 us | 10.8 us | 24.0 us |
+| JSON + path params | 1.15 us | 7.7 us | ~4 us | 15.4 us | 27.6 us |
+| POST JSON body | 1.32 us | 8.1 us | ~4 us | 14.7 us | 31.1 us |
+| 64 KB payload | 1.26 us | 7.7 us | ~5 us | 24.2 us | 38.0 us |
+| 1 MB payload | 17.3 us | 26.0 us | ~25 us | 214.6 us | 214.4 us |
+
+> Run `cargo bench --features shm` on your hardware. The relative ordering is consistent: Memory < SHM < Channel < UDS ~ TCP.
+
+---
+
+## Project layout
+
+```
+crossbar/
+  src/
+    lib.rs              Crate root, prelude
+    router.rs           URI pattern matching, route registration
+    handler.rs          Handler trait, sync wrappers, BoxedHandler
+    types.rs            Request, Response, Uri, Method, IntoResponse, Json
+    error.rs            CrossbarError enum
+    transport/
+      mod.rs            Wire protocol helpers, MAX_FRAME_SIZE
+      memory.rs         MemoryClient (direct dispatch)
+      channel.rs        ChannelServer, ChannelClient (tokio mpsc)
+      tcp.rs            TcpServer, TcpClient (TCP_NODELAY)
+      uds.rs            UdsServer, UdsClient (Unix only)
+      shm/
+        mod.rs          ShmServer, ShmClient, ShmHandle
+        region.rs       Memory-mapped region, slot state machine
+        notify.rs       Futex (Linux) / polling (macOS) wait/wake
+  crossbar-macros/      #[handler] and #[derive(IntoResponse)] proc macros
+  examples/
+    server.rs           TCP server example
+    client.rs           TCP client example
+    demo.rs             All-transport latency comparison
+  tests/
+    transport.rs        47 transport tests (including SHM)
+    stress.rs           11 stress/concurrency tests
+    routing.rs          31 URI pattern matching tests
+    handler.rs          28 handler trait tests
+    macros.rs           13 proc macro tests
+    types.rs            64 type/serialization tests
+  benches/
+    transport.rs        Criterion benchmarks across all transports
 ```
 
 ---
 
 ## Roadmap
 
-- **HTTP transport** -- axum/hyper integration for serving over standard HTTP
+- **HTTP bridge** -- serve crossbar routes over hyper/axum for HTTP compatibility
 - **Connection pooling** -- pooled UDS/TCP clients for concurrent workloads
-- **Middleware system** -- composable request/response interceptors (logging, auth, tracing)
-- **OpenAPI schema generation** -- derive OpenAPI specs from registered routes
+- **Middleware** -- composable request/response interceptors (logging, auth, metrics)
+- **WebSocket transport** -- persistent bidirectional communication
 
 ---
 

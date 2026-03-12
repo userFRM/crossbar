@@ -28,6 +28,12 @@ tokio = { version = "1", features = ["full"] }
 [[example]]
 name = "demo"
 
+[[example]]
+name = "server"
+
+[[example]]
+name = "client"
+
 [[bench]]
 name = "transport"
 harness = false
