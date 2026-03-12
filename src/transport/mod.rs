@@ -1,14 +1,15 @@
 //! Transport adapters: memory, channel, Unix Domain Socket, TCP, and shared memory.
 //!
 //! Every transport exposes the same conceptual API: a **server** that binds to
-//! some address and dispatches incoming requests through a [`Router`], and a
-//! **client** that sends [`Request`]s and receives [`Response`]s.
+//! some address and dispatches incoming requests through a
+//! [`Router`](crate::router::Router), and a **client** that sends
+//! [`Request`]s and receives [`Response`]s.
 //!
 //! | Transport | Typical latency | Notes |
 //! |-----------|-----------------|-------|
 //! | [`MemoryClient`] | sub-µs | In-process, bypasses framing entirely |
 //! | [`ChannelClient`] | 1–5 µs | tokio `mpsc` channel, cross-task |
-//! | [`ShmClient`] | 2–5 µs | Shared memory via `/dev/shm` (`shm` feature) |
+//! | `ShmClient` | 2–5 µs | Shared memory via `/dev/shm` (`shm` feature) |
 //! | [`UdsClient`] | 10–50 µs | Unix Domain Socket, same host (Unix only) |
 //! | [`TcpClient`] | 50–100 µs | Raw TCP, `TCP_NODELAY` enabled |
 //!
