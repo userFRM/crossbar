@@ -1,0 +1,27 @@
+[workspace]
+members = [".", "crossbar-macros"]
+
+[package]
+name = "crossbar"
+version = "0.1.0"
+edition = "2021"
+description = "Transport-polymorphic URI router. Define once, serve over memory, UDS, or TCP."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+crossbar-macros = { path = "crossbar-macros" }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
+tokio = { version = "1", features = ["full"] }
+
+[[example]]
+name = "demo"
+
+[[bench]]
+name = "transport"
+harness = false
