@@ -75,6 +75,9 @@ pub enum CrossbarError {
     /// The shared-memory region has invalid magic, version, or metadata.
     #[cfg(feature = "shm")]
     ShmInvalidRegion(String),
+
+    /// A header key, value, or count exceeds the u16 limit of the wire protocol.
+    HeaderOverflow(String),
 }
 
 impl fmt::Display for CrossbarError {
@@ -111,6 +114,9 @@ impl fmt::Display for CrossbarError {
             #[cfg(feature = "shm")]
             CrossbarError::ShmInvalidRegion(msg) => {
                 write!(f, "invalid shared-memory region: {msg}")
+            }
+            CrossbarError::HeaderOverflow(msg) => {
+                write!(f, "header overflow: {msg}")
             }
         }
     }

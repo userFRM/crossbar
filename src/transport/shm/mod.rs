@@ -299,13 +299,14 @@ impl ShmClient {
     /// - [`CrossbarError::ShmServerDead`] if the server heartbeat is stale.
     /// - [`CrossbarError::ShmSlotsFull`] if no slots are available.
     /// - [`CrossbarError::ShmMessageTooLarge`] if the request exceeds slot capacity.
+    /// - [`CrossbarError::HeaderOverflow`] if a header key/value exceeds u16::MAX bytes.
     pub async fn request(&self, req: Request) -> Result<Response, CrossbarError> {
         // Check server is alive
         self.region.check_heartbeat(self.stale_timeout)?;
 
         // Check message fits
         let uri_bytes = req.uri.raw().as_bytes();
-        let headers_data = super::serialize_headers(&req.headers);
+        let headers_data = super::serialize_headers(&req.headers)?;
         let total = uri_bytes.len() + headers_data.len() + req.body.len();
         if total > self.region.slot_data_capacity as usize {
             return Err(CrossbarError::ShmMessageTooLarge {
@@ -330,7 +331,7 @@ impl ShmClient {
         };
 
         // Write request into slot (state is WRITING from try_acquire_slot)
-        self.region.write_request_to_slot(slot_idx, &req);
+        self.region.write_request_to_slot(slot_idx, &req)?;
 
         // Data is written — transition to REQUEST_READY so the server picks it up
         let state_atom = self.region.slot_state(slot_idx);

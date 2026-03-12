@@ -24,6 +24,13 @@ pub const RESPONSE_READY: u32 = 3;
 /// [`REQUEST_READY`].
 pub const WRITING: u32 = 4;
 
+/// Minimum allowed `slot_data_capacity`.
+///
+/// Must be large enough to hold the error-response fallback payload
+/// (2-byte empty headers + error body). 64 bytes (one cache line)
+/// provides comfortable headroom.
+pub const MIN_SLOT_DATA_CAPACITY: u32 = 64;
+
 /// Configuration for shared memory transport.
 #[derive(Debug, Clone)]
 pub struct ShmConfig {
@@ -85,7 +92,17 @@ pub struct ShmRegion {
 
 impl ShmRegion {
     /// Creates a new shared memory region (server side).
+    ///
+    /// Returns [`CrossbarError::ShmInvalidRegion`] if `slot_data_capacity` is
+    /// below [`MIN_SLOT_DATA_CAPACITY`] (64 bytes).
     pub fn create(name: &str, config: &ShmConfig) -> Result<Self, CrossbarError> {
+        if config.slot_data_capacity < MIN_SLOT_DATA_CAPACITY {
+            return Err(CrossbarError::ShmInvalidRegion(format!(
+                "slot_data_capacity {} is below minimum {}",
+                config.slot_data_capacity, MIN_SLOT_DATA_CAPACITY
+            )));
+        }
+
         let path = shm_path(name);
         let size = region_size(config);
         let stride = slot_stride(config.slot_data_capacity);
@@ -297,10 +314,13 @@ impl ShmRegion {
     ///
     /// Slot metadata fields (method, uri_len, body_len, headers_data_len) are
     /// also written. The data region is packed as: [uri][headers_data][body].
-    pub fn write_request_to_slot(&self, idx: u32, req: &Request) {
+    ///
+    /// Returns [`CrossbarError::HeaderOverflow`] if headers exceed the wire
+    /// protocol's u16 length limits.
+    pub fn write_request_to_slot(&self, idx: u32, req: &Request) -> Result<(), CrossbarError> {
         let base = self.slot_base(idx);
         let uri_bytes = req.uri.raw().as_bytes();
-        let headers_data = crate::transport::serialize_headers(&req.headers);
+        let headers_data = crate::transport::serialize_headers(&req.headers)?;
 
         unsafe {
             // method (1 byte at offset 0x18)
@@ -333,6 +353,7 @@ impl ShmRegion {
             off += headers_data.len();
             std::ptr::copy_nonoverlapping(req.body.as_ptr(), data.add(off), req.body.len());
         }
+        Ok(())
     }
 
     /// Reads a request from a slot's data region.
@@ -401,23 +422,31 @@ impl ShmRegion {
 
     /// Writes a response into a slot's data region.
     ///
-    /// If the response exceeds [`slot_data_capacity`], it is replaced with a
-    /// 500 error containing the truncation message. This prevents out-of-bounds
-    /// writes from handler responses that are larger than the slot can hold.
+    /// If the response exceeds [`slot_data_capacity`] or its headers cannot be
+    /// serialized, a 500 error with an empty-header block is written instead.
+    /// The minimum capacity enforced by [`ShmRegion::create`] guarantees that
+    /// the fallback payload always fits.
     pub fn write_response_to_slot(&self, idx: u32, resp: &Response) {
         let base = self.slot_base(idx);
         let capacity = self.slot_data_capacity as usize;
-        let headers_data = crate::transport::serialize_headers(&resp.headers);
-        let total = headers_data.len() + resp.body.len();
 
-        // If the response doesn't fit, write a 500 error instead.
-        let (status, headers_data, body) = if total > capacity {
-            let err_body = b"response too large for shm slot";
-            let empty_headers =
-                crate::transport::serialize_headers(&std::collections::HashMap::new());
-            (500u16, empty_headers, &err_body[..])
-        } else {
-            (resp.status, headers_data, resp.body.as_ref())
+        // Hardcoded fallback: 2-byte empty headers ([0x00, 0x00] = 0 headers)
+        // + short error body. Always fits within MIN_SLOT_DATA_CAPACITY.
+        let fallback = || -> (u16, Vec<u8>, &'static [u8]) {
+            (500u16, vec![0u8, 0u8], b"response too large for shm slot")
+        };
+
+        let (status, headers_data, body) = match crate::transport::serialize_headers(&resp.headers)
+        {
+            Ok(hd) => {
+                let total = hd.len() + resp.body.len();
+                if total > capacity {
+                    fallback()
+                } else {
+                    (resp.status, hd, resp.body.as_ref())
+                }
+            }
+            Err(_) => fallback(),
         };
 
         unsafe {
@@ -547,12 +576,16 @@ impl ShmRegion {
         None
     }
 
-    /// Scans for stale slots (stuck in non-FREE state with old timestamps)
-    /// and resets them to FREE.
+    /// Scans for stale slots and resets them to FREE.
     ///
-    /// Uses CAS to avoid racing with legitimate state transitions — if a slot
-    /// changed state between the load and recovery attempt, the CAS fails and
-    /// the slot is left alone.
+    /// Only recovers client-owned states (WRITING, RESPONSE_READY) and
+    /// REQUEST_READY. PROCESSING slots are skipped because the server owns
+    /// them — if the server is alive (heartbeat is fresh) then a PROCESSING
+    /// slot is a legitimately running handler, regardless of how long it
+    /// takes. If the server dies, the heartbeat goes stale and clients will
+    /// get [`CrossbarError::ShmServerDead`] on their next request.
+    ///
+    /// Uses CAS to avoid racing with legitimate state transitions.
     pub fn recover_stale_slots(&self, stale_timeout: Duration) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -562,15 +595,18 @@ impl ShmRegion {
         for i in 0..self.slot_count {
             let state = self.slot_state(i);
             let current = state.load(Ordering::Acquire);
-            if current != FREE {
-                let ts = self.slot_timestamp(i);
-                if now.saturating_sub(ts) > stale_timeout.as_millis() as u64 {
-                    // CAS instead of store: if the state changed since we
-                    // loaded it, a legitimate transition happened and we
-                    // must not clobber it.
-                    let _ =
-                        state.compare_exchange(current, FREE, Ordering::AcqRel, Ordering::Acquire);
-                }
+
+            // Skip FREE (nothing to do) and PROCESSING (server owns it).
+            if current == FREE || current == PROCESSING {
+                continue;
+            }
+
+            let ts = self.slot_timestamp(i);
+            if now.saturating_sub(ts) > stale_timeout.as_millis() as u64 {
+                // CAS instead of store: if the state changed since we
+                // loaded it, a legitimate transition happened and we
+                // must not clobber it.
+                let _ = state.compare_exchange(current, FREE, Ordering::AcqRel, Ordering::Acquire);
             }
         }
     }

@@ -79,34 +79,39 @@ pub const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
 /// for each header:
 ///   [2B key_len LE][key bytes][2B val_len LE][val bytes]
 /// ```
-pub(crate) fn serialize_headers(headers: &HashMap<String, String>) -> Vec<u8> {
-    assert!(
-        headers.len() <= u16::MAX as usize,
-        "header count {} exceeds u16::MAX",
-        headers.len()
-    );
+pub(crate) fn serialize_headers(
+    headers: &HashMap<String, String>,
+) -> Result<Vec<u8>, CrossbarError> {
+    if headers.len() > u16::MAX as usize {
+        return Err(CrossbarError::HeaderOverflow(format!(
+            "header count {} exceeds u16::MAX",
+            headers.len()
+        )));
+    }
     let num = headers.len() as u16;
     let mut out = Vec::new();
     out.extend_from_slice(&num.to_le_bytes());
     for (k, v) in headers {
         let kb = k.as_bytes();
         let vb = v.as_bytes();
-        assert!(
-            kb.len() <= u16::MAX as usize,
-            "header key length {} exceeds u16::MAX",
-            kb.len()
-        );
-        assert!(
-            vb.len() <= u16::MAX as usize,
-            "header value length {} exceeds u16::MAX",
-            vb.len()
-        );
+        if kb.len() > u16::MAX as usize {
+            return Err(CrossbarError::HeaderOverflow(format!(
+                "header key length {} exceeds u16::MAX",
+                kb.len()
+            )));
+        }
+        if vb.len() > u16::MAX as usize {
+            return Err(CrossbarError::HeaderOverflow(format!(
+                "header value length {} exceeds u16::MAX",
+                vb.len()
+            )));
+        }
         out.extend_from_slice(&(kb.len() as u16).to_le_bytes());
         out.extend_from_slice(kb);
         out.extend_from_slice(&(vb.len() as u16).to_le_bytes());
         out.extend_from_slice(vb);
     }
-    out
+    Ok(out)
 }
 
 /// Deserializes a header map from the wire format.
@@ -176,7 +181,8 @@ pub(super) async fn write_request<W: AsyncWriteExt + Unpin>(
     req: &Request,
 ) -> io::Result<()> {
     let uri_bytes = req.uri.raw().as_bytes();
-    let headers_data = serialize_headers(&req.headers);
+    let headers_data =
+        serialize_headers(&req.headers).map_err(|e| io::Error::other(e.to_string()))?;
     let mut header = [0u8; 13];
     header[0] = u8::from(req.method);
     header[1..5].copy_from_slice(&(uri_bytes.len() as u32).to_le_bytes());
@@ -244,7 +250,8 @@ pub(super) async fn write_response<W: AsyncWriteExt + Unpin>(
     w: &mut W,
     resp: &Response,
 ) -> io::Result<()> {
-    let headers_data = serialize_headers(&resp.headers);
+    let headers_data =
+        serialize_headers(&resp.headers).map_err(|e| io::Error::other(e.to_string()))?;
     let mut header = [0u8; 10];
     header[0..2].copy_from_slice(&resp.status.to_le_bytes());
     header[2..6].copy_from_slice(&(resp.body.len() as u32).to_le_bytes());
