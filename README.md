@@ -6,7 +6,7 @@
 
 **Define handlers once. Serve over any transport.**
 
-Crossbar is a URI router that decouples your request handlers from the transport layer. Write your routes once, then serve them over in-process memory, tokio channels, shared memory, Unix domain sockets, or TCP -- with zero code changes. Same router, same handlers, same URIs.
+Crossbar is a transport-agnostic URI router for Rust. You write your request handlers once — then serve them over in-process memory, tokio channels, shared memory, Unix domain sockets, or TCP. Switch transports without changing a single line of handler code.
 
 ```rust
 let router = Router::new()
@@ -14,13 +14,35 @@ let router = Router::new()
     .route("/tick/:symbol", get(get_tick))
     .route("/echo", post(echo));
 
-// Pick your transport -- the router doesn't care.
-MemoryClient::new(router.clone());                        // in-process, ~150 ns
-ChannelServer::spawn(router.clone());                     // cross-task, ~6 us
-ShmServer::spawn("myapp", router.clone()).await?;         // cross-process, ~3 us
-UdsServer::bind("/tmp/myapp.sock", router.clone()).await?; // Unix socket, ~13 us
-TcpServer::bind("0.0.0.0:4000", router).await?;          // network, ~26 us
+// Same router, same handlers — pick your transport.
+MemoryClient::new(router.clone());                         // in-process,     ~150 ns
+ChannelServer::spawn(router.clone());                      // cross-task,     ~6 µs
+ShmServer::spawn("myapp", router.clone()).await?;          // cross-process,  ~6 µs
+UdsServer::bind("/tmp/myapp.sock", router.clone()).await?; // Unix socket,    ~13 µs
+TcpServer::bind("0.0.0.0:4000", router).await?;           // network,        ~32 µs
 ```
+
+---
+
+## What is crossbar?
+
+Most web frameworks (axum, actix, warp) couple your handlers to HTTP. Crossbar doesn't. It gives you a lightweight router where the **transport is just a deployment decision** — not a code decision.
+
+**In plain terms:** imagine you have a function that returns stock prices. With crossbar, that same function can serve requests from:
+
+- Another function in the same program (150 nanoseconds)
+- Another thread via a channel (6 microseconds)
+- Another process on the same machine via shared memory (6 microseconds)
+- Another process via Unix sockets (13 microseconds)
+- Another machine over TCP (32 microseconds)
+
+You never change the function. You only change how it's wired up.
+
+> [!NOTE]
+> Crossbar is **not** an HTTP framework. It uses a compact binary protocol (13-byte header)
+> instead of HTTP. If you need HTTP, use [axum](https://github.com/tokio-rs/axum). Crossbar
+> targets workloads where HTTP overhead matters: trading systems, game servers, IPC sidecars,
+> and real-time pipelines.
 
 ---
 
@@ -28,7 +50,7 @@ TcpServer::bind("0.0.0.0:4000", router).await?;          // network, ~26 us
 
 Start the server in one terminal, hit it from another. Same routes, no HTTP, no framework overhead.
 
-**Terminal 1 -- server**
+**Terminal 1 — server**
 
 ```sh
 cargo run --example server
@@ -60,7 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-**Terminal 2 -- client**
+**Terminal 2 — client**
 
 ```sh
 cargo run --example client
@@ -90,7 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 GET /health          -> 200 ok
 GET /tick/AAPL       -> 200 {"symbol":"AAPL","price":182.63,"volume":48392100,"ts":1741810438000}
-POST /echo           -> 200 hello crossbar
+POST /echo           -> 200 hello
 GET /nonexistent     -> 404
 ```
 
@@ -98,17 +120,25 @@ No HTTP. No JSON overhead on the wire. Just a 13-byte binary header + your paylo
 
 ---
 
-## When this is useful
+## When to use crossbar (and when not to)
 
-For most web services, use axum or actix. Crossbar targets a different niche:
+### Use crossbar when
 
-- **Inter-process communication** where you want URI routing without HTTP overhead
-- **Trading systems** that need sub-microsecond in-process dispatch with the option to scale to cross-process later
-- **Game servers** with co-located services that communicate on the same host
-- **Microservice sidecars** that fan out to local processes before hitting the network
-- **Testing** -- swap a TCP transport for `MemoryClient` and run your integration tests without sockets
+- **You need IPC with URI routing** — crossbar gives you REST-like patterns (`/tick/:symbol`) without HTTP overhead
+- **You're building a trading system** — sub-microsecond in-process dispatch, with the option to scale to cross-process later
+- **You have co-located services** — game servers, microservice sidecars, or ML pipelines on the same host
+- **You want transport-agnostic testing** — swap TCP for `MemoryClient` and run integration tests without sockets
 
-The key insight: transport choice is an infrastructure decision, not a code decision. Your handlers shouldn't know or care.
+### Don't use crossbar when
+
+- **You need HTTP** — use [axum](https://github.com/tokio-rs/axum) or [actix-web](https://github.com/actix/actix-web)
+- **You need browser compatibility** — crossbar's wire protocol is not HTTP
+- **You want a mature ecosystem** — crossbar is new; axum has middleware, extractors, and a large community
+
+> [!TIP]
+> The crossbar roadmap includes an **HTTP bridge** that will let you serve crossbar routes
+> over hyper/axum. This will give you the best of both worlds: crossbar for internal IPC,
+> HTTP for external traffic, same handlers.
 
 ---
 
@@ -119,10 +149,10 @@ graph TD
     R["Router"] --> H["Handler<br>async fn(Request) -> impl IntoResponse"]
 
     H --> M["Memory<br>~150 ns"]
-    H --> CH["Channel<br>~6 us"]
-    H --> SHM["SHM<br>~3 us"]
-    H --> UDS["UDS<br>~13 us"]
-    H --> TCP["TCP<br>~26 us"]
+    H --> CH["Channel<br>~6 µs"]
+    H --> SHM["SHM<br>~6 µs"]
+    H --> UDS["UDS<br>~13 µs"]
+    H --> TCP["TCP<br>~32 µs"]
 
     M -.- MP["In-process<br>direct fn call"]
     CH -.- CP["Cross-task<br>tokio mpsc"]
@@ -143,15 +173,19 @@ graph TD
 
 ## Transport comparison
 
-| Transport | Latency | Mechanism | Use case | Platform |
-|-----------|---------|-----------|----------|----------|
+| Transport | Typical latency | Mechanism | Use case | Platform |
+|---|---|---|---|---|
 | **Memory** | ~150 ns | Direct `Arc<Router>` call | In-process dispatch, testing | All |
-| **Channel** | ~6 us | tokio `mpsc` + `oneshot` | Cross-task within one process | All |
-| **SHM** | ~3 us | `mmap` + atomics + futex | Ultra-low-latency cross-process IPC | Unix (`shm` feature) |
-| **UDS** | ~13 us | Unix domain socket, keep-alive | Cross-process, same host | Unix |
-| **TCP** | ~26 us | Raw TCP, `TCP_NODELAY` | Networked services | All |
+| **Channel** | ~6 µs | tokio `mpsc` + `oneshot` | Cross-task within one process | All |
+| **SHM** | ~6 µs | `mmap` + atomics + futex | Ultra-low-latency cross-process IPC | Unix (`shm` feature) |
+| **UDS** | ~13 µs | Unix domain socket, keep-alive | Cross-process, same host | Unix |
+| **TCP** | ~32 µs | Raw TCP, `TCP_NODELAY` | Networked services | All |
 
-> Measured with `cargo bench --features shm` on localhost. Numbers are relative -- run on your hardware for absolutes.
+> [!IMPORTANT]
+> These latency numbers are from Criterion benchmarks on an Intel i7-10700KF. They will vary
+> on your hardware. The relative ordering is consistent: **Memory < Channel ≈ SHM < UDS < TCP**.
+> See [BENCHMARKS.md](BENCHMARKS.md) for full methodology, per-payload breakdowns, and
+> throughput numbers.
 
 ---
 
@@ -215,6 +249,10 @@ TcpServer::bind("0.0.0.0:4000", router).await?;
 UdsServer::bind("/tmp/myapp.sock", router).await?;
 ```
 
+> [!TIP]
+> Use `MemoryClient` in your test suite. It has zero network overhead and doesn't need
+> port allocation, so your tests run faster and never flake on CI due to port conflicts.
+
 ---
 
 ## Handler system
@@ -259,7 +297,7 @@ async fn get_tick(
 ```
 
 | Attribute | Type | On missing |
-|-----------|------|------------|
+|---|---|---|
 | `#[path("name")]` | `String` / `Option<String>` | 400 / `None` |
 | `#[query("name")]` | `String` / `Option<String>` | 400 / `None` |
 | `#[body]` | `T: Deserialize` | 400 |
@@ -268,7 +306,7 @@ async fn get_tick(
 ### `IntoResponse` types
 
 | Return type | Status | Body |
-|-------------|--------|------|
+|---|---|---|
 | `&'static str` | 200 | text |
 | `String` | 200 | text |
 | `Vec<u8>` / `Bytes` | 200 | raw bytes |
@@ -293,52 +331,75 @@ sequenceDiagram
     S->>C: [2B status][4B body_len][4B headers_len]<br>[headers][body]
 ```
 
-13-byte request header, 10-byte response header. All integers little-endian. Max frame size 64 MiB. Body transferred as raw `Bytes` -- zero-copy slicing via `BytesMut::freeze().split_to()`.
+- **Request header:** 13 bytes (1B method + 4B URI length + 4B body length + 4B headers length)
+- **Response header:** 10 bytes (2B status + 4B body length + 4B headers length)
+- All integers little-endian
+- Max frame size: 64 MiB
+- Body transferred as raw `Bytes` — zero-copy slicing via `BytesMut::freeze().split_to()`
+
+> [!NOTE]
+> The wire protocol is intentionally simple. There is no compression, no multiplexing, and
+> no connection negotiation. This keeps the implementation small and the overhead predictable.
 
 ---
 
 ## Shared memory transport
 
-The `shm` feature adds `ShmServer` and `ShmClient` for cross-process IPC without kernel data copies. Unix only.
+The `shm` feature adds `ShmServer` and `ShmClient` for cross-process IPC without kernel data copies.
 
 ```toml
 crossbar = { version = "0.1", features = ["shm"] }
 ```
 
 ```rust
-// Process A -- server
+// Process A — server
 let router = Router::new().route("/tick", get(get_tick));
 ShmServer::bind("myapp", router).await?;
 
-// Process B -- client
+// Process B — client
 let client = ShmClient::connect("myapp").await?;
 let resp = client.get("/tick").await?;
 ```
 
-**How it works:** Server creates a memory-mapped region at `/dev/shm/crossbar-{name}` with 64 request/response slots. Clients acquire slots via atomic CAS, write requests, and wait for responses using a spin-then-futex strategy. No syscalls on the data path.
+**How it works:** The server creates a memory-mapped region at `/dev/shm/crossbar-{name}` with 64 request/response slots. Clients acquire slots via atomic CAS, write requests, and wait for responses using a spin-then-futex strategy. No syscalls on the data path.
 
 | Detail | Value |
-|--------|-------|
+|---|---|
 | Slot count | 64 (configurable) |
 | Slot capacity | 64 KiB (configurable) |
-| Synchronization | spin 100x -> yield 10x -> futex_wait |
+| Synchronization | spin 100x → yield 10x → futex_wait |
 | Crash recovery | Server heartbeat + stale slot CAS recovery |
+
+> [!WARNING]
+> The SHM transport is **Unix-only** (Linux and macOS). On Linux it uses futex for
+> cross-process wake; on macOS it falls back to polling. SHM requires the `shm` feature flag.
+
+> [!CAUTION]
+> Payloads larger than the slot capacity (default 64 KiB) will be rejected with
+> `CrossbarError::ShmMessageTooLarge`. If you need larger payloads, increase slot capacity
+> via `ShmConfig` or use UDS/TCP instead.
 
 ---
 
 ## Benchmarks
 
-Criterion benchmarks across all five transports (`cargo bench --features shm`):
+Criterion benchmarks across all transports. Full results, methodology, and throughput data
+in [BENCHMARKS.md](BENCHMARKS.md).
 
-| Benchmark | Memory | Channel | SHM | UDS | TCP |
-|-----------|--------|---------|-----|-----|-----|
-| `/health` (minimal) | 149 ns | 6.2 us | ~2 us | 10.8 us | 24.0 us |
-| JSON + path params | 1.15 us | 7.7 us | ~4 us | 15.4 us | 27.6 us |
-| POST JSON body | 1.32 us | 8.1 us | ~4 us | 14.7 us | 31.1 us |
-| 64 KB payload | 1.26 us | 7.7 us | ~5 us | 24.2 us | 38.0 us |
-| 1 MB payload | 17.3 us | 26.0 us | ~25 us | 214.6 us | 214.4 us |
+| Benchmark | Memory | Channel | UDS | TCP |
+|---|---|---|---|---|
+| `/health` (2B response) | 151 ns | 6.2 µs | 13.4 µs | 32.3 µs |
+| JSON + path params | 1.17 µs | 8.4 µs | 16.2 µs | 34.1 µs |
+| POST JSON body | 1.32 µs | 8.3 µs | 17.0 µs | 35.2 µs |
+| 64 KB response | 1.22 µs | 8.0 µs | 27.2 µs | 43.9 µs |
+| 1 MB response | 18.5 µs | 24.7 µs | 215.8 µs | 229.1 µs |
 
-> Run `cargo bench --features shm` on your hardware. The relative ordering is consistent: Memory < SHM < Channel < UDS ~ TCP.
+SHM throughput: **6.2 µs** (64 KB) and **26.3 µs** (1 MB) — measured via `throughput/` benchmark group.
+
+> [!NOTE]
+> Measured on Intel i7-10700KF, Ubuntu, kernel 6.8.0, Rust 1.93.1.
+> Run `cargo bench --features shm` on your hardware — your numbers will differ.
+> See [BENCHMARKS.md](BENCHMARKS.md) for what is and isn't measured.
 
 ---
 
@@ -378,14 +439,28 @@ crossbar/
     transport.rs        Criterion benchmarks across all transports
 ```
 
+> **194 tests** across the workspace. Run with `cargo test --workspace --features shm`.
+
 ---
 
 ## Roadmap
 
-- **HTTP bridge** -- serve crossbar routes over hyper/axum for HTTP compatibility
-- **Connection pooling** -- pooled UDS/TCP clients for concurrent workloads
-- **Middleware** -- composable request/response interceptors (logging, auth, metrics)
-- **WebSocket transport** -- persistent bidirectional communication
+- **HTTP bridge** — serve crossbar routes over hyper/axum for HTTP compatibility
+- **Connection pooling** — pooled UDS/TCP clients for concurrent workloads
+- **Middleware** — composable request/response interceptors (logging, auth, metrics)
+- **WebSocket transport** — persistent bidirectional communication
+
+---
+
+## Contributing
+
+Contributions welcome. Run the test suite before submitting:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --features shm -- -D warnings
+cargo test --workspace --features shm
+```
 
 ---
 
