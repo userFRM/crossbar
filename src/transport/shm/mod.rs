@@ -354,8 +354,20 @@ impl ShmClient {
                     break;
                 }
                 if std::time::Instant::now() >= deadline {
-                    // Release the slot so it doesn't get stuck
-                    state.store(FREE, Ordering::Release);
+                    // Only reclaim if the slot is still client-owned
+                    // (REQUEST_READY = server hasn't picked it up yet).
+                    // If the server already CAS'd to PROCESSING, it owns
+                    // the slot — we must NOT free it or the server could
+                    // later write its response into a slot that another
+                    // request has reused. Stale recovery will eventually
+                    // clean up the abandoned RESPONSE_READY slot after
+                    // the handler finishes.
+                    let _ = state.compare_exchange(
+                        REQUEST_READY,
+                        FREE,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
                     return Err(CrossbarError::ShmServerDead);
                 }
                 // Use futex/spin wait based on current state
@@ -363,8 +375,8 @@ impl ShmClient {
                     // ignore timeout, we check deadline above
                     notify::wait_until_not(state, current, Duration::from_millis(50)).ok();
                 } else {
-                    // Unexpected state — bail out
-                    state.store(FREE, Ordering::Release);
+                    // Unexpected state — don't force-free, just bail.
+                    // Stale recovery handles cleanup.
                     return Err(CrossbarError::ShmServerDead);
                 }
             }

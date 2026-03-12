@@ -756,6 +756,56 @@ async fn shm_concurrent_requests() {
     cleanup_shm(&name);
 }
 
+/// Verify that a client timeout on a slow handler does not corrupt slots.
+///
+/// The handler sleeps longer than the client's stale_timeout, so the client
+/// gives up. A subsequent request must still succeed — proving the
+/// timed-out slot was NOT unsafely freed while the server was still using it.
+#[cfg(all(unix, feature = "shm"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shm_slow_handler_timeout_no_corruption() {
+    use crossbar::prelude::*;
+
+    let name = shm_name("shm_slow");
+
+    // A router with one slow handler and one fast handler.
+    let router = Router::new()
+        .route(
+            "/slow",
+            get(|| async {
+                tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                "done"
+            }),
+        )
+        .route("/fast", get(|| async { "ok" }));
+
+    let _handle = ShmServer::spawn(&name, router).await.unwrap();
+
+    // Client with a very short timeout — will give up before /slow returns.
+    let client = ShmClient::connect_with_timeout(&name, std::time::Duration::from_millis(200))
+        .await
+        .unwrap();
+
+    // This request should time out (server handler runs 600ms, timeout is 200ms).
+    let result = client.get("/slow").await;
+    assert!(result.is_err(), "expected timeout error from slow handler");
+
+    // Wait for the server to finish processing the slow request and for
+    // stale recovery to clean up the abandoned RESPONSE_READY slot.
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+    // Now make a fresh client with a generous timeout and verify the
+    // system is still healthy — no corruption from the timed-out slot.
+    let client2 = ShmClient::connect_with_timeout(&name, std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+    let resp = client2.get("/fast").await.unwrap();
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body_str(), "ok");
+
+    cleanup_shm(&name);
+}
+
 // ═══════════════════════════════════════════════════════
 // Cross-transport consistency
 // ═══════════════════════════════════════════════════════
