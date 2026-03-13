@@ -133,12 +133,158 @@ No HTTP. No JSON overhead on the wire. Just a 13-byte binary header + your paylo
 
 - **You need HTTP** — use [axum](https://github.com/tokio-rs/axum) or [actix-web](https://github.com/actix/actix-web)
 - **You need browser compatibility** — crossbar's wire protocol is not HTTP
+- **You need true zero-copy IPC** — see [How crossbar compares](#how-crossbar-compares) below
 - **You want a mature ecosystem** — crossbar is new; axum has middleware, extractors, and a large community
 
 > [!TIP]
 > The crossbar roadmap includes an **HTTP bridge** that will let you serve crossbar routes
 > over hyper/axum. This will give you the best of both worlds: crossbar for internal IPC,
 > HTTP for external traffic, same handlers.
+
+---
+
+## How each transport works
+
+Every transport follows the same pattern: the **client** sends a `Request`, the **router** dispatches it to a handler, and the **server** returns a `Response`. The difference is how the bytes travel between client and server.
+
+### Memory — direct function call
+
+```
+Client                   Server
+  │                        │
+  ├── router.dispatch(req) ┤  (direct call, same thread)
+  │                        │
+  ◄── Response ────────────┘
+```
+
+The simplest transport. `MemoryClient` holds an `Arc<Router>` and calls `router.dispatch(req)` directly — the same way you'd call any async function. There is no serialization, no framing, no I/O. The request and response stay in the same memory space and the same thread.
+
+**Cost:** one async function call (~150 ns).
+
+**Use case:** in-process dispatch, unit testing, embedding crossbar as a function router.
+
+### Channel — tokio mpsc + oneshot
+
+```
+Client task              Background task
+  │                          │
+  ├── mpsc::send(req) ──────►│
+  │                          ├── router.dispatch(req)
+  │◄── oneshot::recv() ──────┤
+  │                          │
+```
+
+`ChannelServer::spawn()` starts a background tokio task that owns the router. The client sends a `(Request, oneshot::Sender<Response>)` tuple through a bounded `mpsc` channel. The background task dispatches the request and sends the response back on the oneshot.
+
+**Cost:** two channel operations + one async dispatch (~6 µs). The overhead comes from tokio's channel synchronization (wake notifications, task scheduling), not from data copying — the `Request` and `Response` are moved, not copied.
+
+**Use case:** cross-task communication within a single process. Multiple tasks can share a `ChannelClient` (it's `Clone`) and submit requests concurrently.
+
+### TCP — binary framing over TCP sockets
+
+```
+Client process                      Server process
+  │                                     │
+  ├── [13B header][uri][hdrs][body] ───►│  (write syscall)
+  │                                     ├── router.dispatch(req)
+  │◄── [10B header][hdrs][body] ────────┤  (write syscall)
+  │                                     │
+```
+
+The client serializes the request into crossbar's binary wire format (13-byte header + payload), writes it to a TCP socket with `TCP_NODELAY` enabled (disables Nagle's algorithm to avoid buffering delays), and reads the response.
+
+The server runs a tokio task per connection. Connections are persistent (keep-alive) — multiple requests reuse the same socket.
+
+**Cost:** two kernel boundary crossings (write + read), TCP/IP stack processing, and memory copies through kernel socket buffers (~32 µs). Latency scales with payload size because the entire payload passes through kernel buffers.
+
+**Use case:** networked services, cross-machine communication, anything that needs to traverse a network.
+
+### UDS — binary framing over Unix domain sockets
+
+```
+Client process                      Server process
+  │                                     │
+  ├── [13B header][uri][hdrs][body] ───►│  (write syscall)
+  │                                     ├── router.dispatch(req)
+  │◄── [10B header][hdrs][body] ────────┤  (write syscall)
+  │                                     │
+```
+
+Identical to TCP in structure, but uses a Unix domain socket file instead of a TCP port. UDS skips the TCP/IP stack entirely — the kernel transfers data directly between socket buffers without routing, checksumming, or congestion control.
+
+**Cost:** two kernel boundary crossings, but no TCP/IP overhead (~13 µs). At large payloads (1 MB+), UDS and TCP converge because the bottleneck shifts to memory copying through kernel buffers.
+
+**Use case:** cross-process communication on the same host where you want lower latency than TCP but don't need shared memory.
+
+### SHM — shared memory with atomic slot machine
+
+```
+Client process                      Server process
+  │                                     │
+  ├── acquire slot (CAS) ──────────────►│
+  ├── memcpy request into slot          │
+  ├── state = REQUEST_READY             │
+  │                                     ├── poll: sees REQUEST_READY
+  │                                     ├── state = PROCESSING
+  │                                     ├── memcpy request from slot
+  │                                     ├── router.dispatch(req)
+  │                                     ├── memcpy response into slot
+  │                                     ├── state = RESPONSE_READY
+  ├── poll: sees RESPONSE_READY ◄───────┤
+  ├── memcpy response from slot         │
+  ├── state = FREE                      │
+  │                                     │
+```
+
+Both processes `mmap` the same file at `/dev/shm/crossbar-{name}`. The region contains 64 request/response **slots**. The client acquires a free slot via atomic compare-and-swap (CAS), copies the request into the slot's data region, and signals readiness by atomically updating the slot state. The server polls slot states, processes requests, writes responses, and signals completion.
+
+Synchronization uses a spin-then-futex strategy: spin for ~100 iterations (fast path), then fall back to `futex_wait` (Linux) or polling (macOS) to avoid burning CPU while idle.
+
+**Cost:** two `memcpy` operations (request in, response out) + atomic synchronization (~6 µs). No kernel syscalls on the data path — both processes read/write the same physical memory pages. Latency scales with payload size because data is copied into and out of slots.
+
+**Use case:** ultra-low-latency cross-process IPC on the same host. ~5x faster than UDS for small payloads, ~8x faster than UDS for 1 MB payloads.
+
+> [!IMPORTANT]
+> Crossbar's SHM transport is a **copy-based** design — it copies data into and out of
+> shared memory slots. This is different from **true zero-copy** solutions like
+> [iceoryx2](https://github.com/eclipse-iceoryx/iceoryx2), which transfer only a pointer
+> offset (~8 bytes) regardless of payload size. See [How crossbar compares](#how-crossbar-compares)
+> for a detailed breakdown.
+
+---
+
+## How crossbar compares
+
+### vs axum / actix-web
+
+Crossbar and HTTP frameworks solve different problems. Crossbar provides URI routing without HTTP — no headers, no content negotiation, no middleware ecosystem. If your service talks to browsers or external clients, use axum. If your services talk to each other on the same host, crossbar removes HTTP overhead while keeping the same routing patterns.
+
+### vs iceoryx2
+
+[iceoryx2](https://github.com/eclipse-iceoryx/iceoryx2) is a true zero-copy shared memory middleware. The architectural difference is fundamental:
+
+| | crossbar SHM | iceoryx2 |
+|---|---|---|
+| **What is transferred** | The entire payload (memcpy into slot) | A pointer offset (~8 bytes) |
+| **Latency scaling** | O(n) — grows with payload size | O(1) — constant regardless of payload |
+| **1 MB transfer** | ~26 µs (memcpy dominated) | ~100 ns (just an offset) |
+| **Pattern** | Request/response with URI routing | Publish/subscribe (and request/response) |
+| **Memory model** | Fixed-size slots, data copied in/out | Pool allocator, producer writes directly into shared memory |
+| **Routing** | Built-in URI pattern matching | Service-oriented discovery |
+| **Complexity** | ~3K lines, simple slot state machine | Production-grade middleware, safety-critical certified |
+
+**When to choose iceoryx2:** you need the absolute lowest latency regardless of payload size, you're streaming large data (sensor feeds, video frames, point clouds), or you're in an automotive/robotics context where iceoryx2's safety certifications matter.
+
+**When to choose crossbar:** you want familiar REST-like URI routing (`/api/orders/:id`), you need multiple transport options (not just shared memory), your payloads are small (< 64 KB where the memcpy cost is negligible), or you want the simplicity of a single router that works identically across in-process, cross-process, and networked contexts.
+
+> [!NOTE]
+> Crossbar is not trying to compete with iceoryx2 on raw shared memory throughput. They
+> occupy different niches. Crossbar's value is **transport polymorphism** — the same router
+> and handlers serving over any transport, from a direct function call to a TCP socket.
+
+### vs raw Unix IPC (pipes, message queues, domain sockets)
+
+Crossbar adds URI-based routing on top of these mechanisms. Without crossbar, you'd need to implement your own message framing, request dispatching, and serialization. Crossbar gives you `router.route("/tick/:symbol", get(handler))` semantics over any transport.
 
 ---
 
@@ -173,19 +319,19 @@ graph TD
 
 ## Transport comparison
 
-| Transport | Typical latency | Mechanism | Use case | Platform |
+| Transport | Typical latency | Boundary | Data path | Platform |
 |---|---|---|---|---|
-| **Memory** | ~150 ns | Direct `Arc<Router>` call | In-process dispatch, testing | All |
-| **Channel** | ~6 µs | tokio `mpsc` + `oneshot` | Cross-task within one process | All |
-| **SHM** | ~6 µs | `mmap` + atomics + futex | Ultra-low-latency cross-process IPC | Unix (`shm` feature) |
-| **UDS** | ~13 µs | Unix domain socket, keep-alive | Cross-process, same host | Unix |
-| **TCP** | ~32 µs | Raw TCP, `TCP_NODELAY` | Networked services | All |
+| **Memory** | ~150 ns | Same thread | Direct `Arc<Router>` call | All |
+| **Channel** | ~6 µs | Cross-task | tokio `mpsc` + `oneshot` | All |
+| **SHM** | ~6 µs | Cross-process | `mmap` + atomics + futex | Unix (`shm` feature) |
+| **UDS** | ~13 µs | Cross-process | Unix domain socket, kernel buffers | Unix |
+| **TCP** | ~32 µs | Cross-machine | TCP socket, `TCP_NODELAY` | All |
 
 > [!IMPORTANT]
-> These latency numbers are from Criterion benchmarks on an Intel i7-10700KF. They will vary
-> on your hardware. The relative ordering is consistent: **Memory < Channel ≈ SHM < UDS < TCP**.
-> See [BENCHMARKS.md](BENCHMARKS.md) for full methodology, per-payload breakdowns, and
-> throughput numbers.
+> These latency numbers are from Criterion benchmarks on an Intel i7-10700KF (see
+> [BENCHMARKS.md](BENCHMARKS.md)). They will vary on your hardware. The relative ordering
+> is consistent: **Memory < Channel ≈ SHM < UDS < TCP**. Run `cargo bench --features shm`
+> to see your own numbers.
 
 ---
 

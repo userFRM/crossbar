@@ -226,8 +226,13 @@ impl ShmServer {
             }
 
             if !found_work {
-                // Brief pause when idle to avoid 100% CPU
-                std::thread::yield_now();
+                // Brief pause when idle to avoid 100% CPU.
+                // yield_now() alone is a near-no-op on Linux — it issues
+                // sched_yield() which re-runs immediately if nothing else
+                // is scheduled, burning 100% CPU.  A short sleep keeps
+                // idle overhead negligible while adding < 1 µs to latency
+                // when a request arrives mid-sleep.
+                std::thread::sleep(Duration::from_micros(1));
             }
         }
     }
