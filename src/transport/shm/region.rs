@@ -582,22 +582,19 @@ impl ShmRegion {
     ///
     /// Uses `monotonic_ms()` (~6 ns on Linux) instead of `SystemTime::now()`
     /// (~25 ns) to avoid vDSO overhead on the hot path.
+    /// Atomic store prevents torn reads by recovery thread.
+    #[allow(clippy::cast_ptr_alignment)] // offset 0x10 within 64-byte aligned slot
     pub fn touch_slot(&self, idx: u32) {
         let now = monotonic_ms();
-        unsafe {
-            let ptr = self.slot_base(idx).add(0x10);
-            std::ptr::copy_nonoverlapping(now.to_le_bytes().as_ptr(), ptr, 8);
-        }
+        let atom = unsafe { &*self.slot_base(idx).add(0x10).cast::<AtomicU64>() };
+        atom.store(now, Ordering::Release);
     }
 
-    /// Reads the slot timestamp.
+    /// Reads the slot timestamp (atomic to prevent torn reads).
+    #[allow(clippy::cast_ptr_alignment)]
     pub fn slot_timestamp(&self, idx: u32) -> u64 {
-        unsafe {
-            let ptr = self.slot_base(idx).add(0x10);
-            let mut buf = [0u8; 8];
-            std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), 8);
-            u64::from_le_bytes(buf)
-        }
+        let atom = unsafe { &*self.slot_base(idx).add(0x10).cast::<AtomicU64>() };
+        atom.load(Ordering::Acquire)
     }
 
     // -- Coordination slot metadata accessors --

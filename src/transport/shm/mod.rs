@@ -603,6 +603,15 @@ impl ShmClient {
     /// Reads the response from a completed slot and releases it back to FREE.
     ///
     /// Shared by both the inline fast-spin path and the poller thread.
+    ///
+    /// # Slot lifecycle
+    ///
+    /// CASes `RESPONSE_READY → PROCESSING` to claim exclusive access, reads
+    /// the response block, then stores `FREE`. The PROCESSING window is a
+    /// few nanoseconds. If the client process crashes during this window,
+    /// the slot and response block are stranded until the server recreates
+    /// the region (stale recovery skips PROCESSING to avoid racing with
+    /// active work — this is a deliberate safety tradeoff).
     #[inline]
     fn complete_response(
         region: &Arc<ShmRegion>,
