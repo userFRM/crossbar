@@ -278,7 +278,7 @@ impl ShmServer {
                         .store(slot_idx.wrapping_add(1) % n, Ordering::Relaxed);
                     region.touch_slot(slot_idx);
 
-                    let Ok(req) = region.read_request_from_block(slot_idx) else {
+                    let Ok(mut req) = region.read_request_from_block(slot_idx) else {
                         region.set_request_block_idx(slot_idx, NO_BLOCK);
                         let resp = Response::bad_request("malformed shm request");
                         if let Some(resp_block_idx) = region.alloc_block() {
@@ -293,10 +293,24 @@ impl ShmServer {
                         continue;
                     };
 
-                    // Try-poll: skip tokio for sync-like handlers
-                    let resp = Self::dispatch_fast(router, req, rt_handle);
+                    // Inject SHM region so handlers can allocate born-in-SHM responses
+                    req.shm_region = Some(Arc::clone(region));
 
-                    if let Some(resp_block_idx) = region.alloc_block() {
+                    // Try-poll: skip tokio for sync-like handlers
+                    let mut resp = Self::dispatch_fast(router, req, rt_handle);
+
+                    // Check if the handler used born-in-SHM (Body::ShmDirect)
+                    if let Body::ShmDirect(ref mut guard) = resp.body {
+                        // Body is already in a pool block — just append headers
+                        let block_idx = guard.take_block_idx();
+                        region.write_response_direct(
+                            slot_idx,
+                            block_idx,
+                            guard.body_len,
+                            &resp.headers,
+                            resp.status,
+                        );
+                    } else if let Some(resp_block_idx) = region.alloc_block() {
                         region.write_response_to_block(slot_idx, resp_block_idx, &resp);
                     } else {
                         region.set_response_status(slot_idx, 503);

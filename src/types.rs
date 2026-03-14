@@ -68,6 +68,62 @@ impl std::fmt::Debug for ShmBodyGuard {
     }
 }
 
+/// Guard for a response body that was written directly into a SHM pool block
+/// by the handler (born-in-SHM pattern). The block is freed on drop unless
+/// ownership is taken via [`ShmDirectGuard::take_block_idx`].
+#[cfg(feature = "shm")]
+pub struct ShmDirectGuard {
+    pub(crate) region: Arc<ShmRegion>,
+    pub(crate) block_idx: u32,
+    pub(crate) body_len: usize,
+}
+
+#[cfg(feature = "shm")]
+#[allow(unsafe_code)]
+unsafe impl Send for ShmDirectGuard {}
+#[cfg(feature = "shm")]
+#[allow(unsafe_code)]
+unsafe impl Sync for ShmDirectGuard {}
+
+#[cfg(feature = "shm")]
+impl ShmDirectGuard {
+    /// Takes ownership of the block index, preventing the guard from
+    /// freeing the block on drop.
+    pub(crate) fn take_block_idx(&mut self) -> u32 {
+        let idx = self.block_idx;
+        self.block_idx = crate::transport::shm::region::NO_BLOCK;
+        idx
+    }
+}
+
+#[cfg(feature = "shm")]
+#[allow(unsafe_code)]
+impl ShmDirectGuard {
+    fn as_slice(&self) -> &[u8] {
+        let ptr = self.region.block_ptr(self.block_idx);
+        unsafe { std::slice::from_raw_parts(ptr, self.body_len) }
+    }
+}
+
+#[cfg(feature = "shm")]
+impl Drop for ShmDirectGuard {
+    fn drop(&mut self) {
+        if self.block_idx != crate::transport::shm::region::NO_BLOCK {
+            self.region.free_block(self.block_idx);
+        }
+    }
+}
+
+#[cfg(feature = "shm")]
+impl std::fmt::Debug for ShmDirectGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShmDirectGuard")
+            .field("block_idx", &self.block_idx)
+            .field("body_len", &self.body_len)
+            .finish()
+    }
+}
+
 /// Zero-copy request/response body.
 ///
 /// Avoids heap allocation on the SHM path by storing the mmap block guard
@@ -81,6 +137,11 @@ pub enum Body {
     /// variant is dropped. Only constructed inside `region.rs`.
     #[cfg(feature = "shm")]
     Mmap(ShmBodyGuard),
+    /// Response body already written directly into a SHM pool block by the
+    /// handler (born-in-SHM pattern). The block is freed when this variant
+    /// is dropped, unless the server takes ownership via `take_block_idx()`.
+    #[cfg(feature = "shm")]
+    ShmDirect(ShmDirectGuard),
 }
 
 impl Body {
@@ -100,6 +161,8 @@ impl Body {
             Body::Owned(v) => v.len(),
             #[cfg(feature = "shm")]
             Body::Mmap(guard) => guard.len,
+            #[cfg(feature = "shm")]
+            Body::ShmDirect(guard) => guard.body_len,
         }
     }
 
@@ -121,6 +184,8 @@ impl Body {
             Body::Owned(v) => v.as_ptr(),
             #[cfg(feature = "shm")]
             Body::Mmap(guard) => guard.as_slice().as_ptr(),
+            #[cfg(feature = "shm")]
+            Body::ShmDirect(guard) => guard.as_slice().as_ptr(),
         }
     }
 }
@@ -139,6 +204,8 @@ impl std::fmt::Debug for Body {
             Body::Owned(v) => write!(f, "Body::Owned(len={})", v.len()),
             #[cfg(feature = "shm")]
             Body::Mmap(guard) => write!(f, "Body::Mmap(len={})", guard.len),
+            #[cfg(feature = "shm")]
+            Body::ShmDirect(guard) => write!(f, "Body::ShmDirect(len={})", guard.body_len),
         }
     }
 }
@@ -150,6 +217,8 @@ impl Clone for Body {
             Body::Owned(v) => Body::Owned(v.clone()),
             #[cfg(feature = "shm")]
             Body::Mmap(guard) => Body::Owned(guard.as_slice().to_vec()),
+            #[cfg(feature = "shm")]
+            Body::ShmDirect(guard) => Body::Owned(guard.as_slice().to_vec()),
         }
     }
 }
@@ -162,6 +231,8 @@ impl AsRef<[u8]> for Body {
             Body::Owned(v) => v.as_ref(),
             #[cfg(feature = "shm")]
             Body::Mmap(guard) => guard.as_slice(),
+            #[cfg(feature = "shm")]
+            Body::ShmDirect(guard) => guard.as_slice(),
         }
     }
 }
@@ -216,6 +287,108 @@ impl From<String> for Body {
         } else {
             Body::Owned(s.into_bytes())
         }
+    }
+}
+
+// ── ShmResponseLoan (born-in-SHM) ──────────────────────
+
+/// A loan of a SHM pool block for writing response data directly into
+/// shared memory (born-in-SHM pattern).
+///
+/// Eliminates the heap allocation and heap-to-SHM memcpy by giving the
+/// handler a mutable slice into a pool block. Data is written exactly
+/// once, directly to its final location in shared memory.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use crossbar::prelude::*;
+///
+/// async fn big_response(req: Request) -> Response {
+///     if let Some(mut loan) = req.alloc_response_block() {
+///         let data = loan.as_mut_slice();
+///         data[..4].copy_from_slice(&42u32.to_le_bytes());
+///         loan.set_len(4);
+///         Response::ok().with_body(loan)
+///     } else {
+///         // Fallback for non-SHM transport or pool exhaustion
+///         Response::ok().with_body(vec![42u8; 4])
+///     }
+/// }
+/// ```
+#[cfg(feature = "shm")]
+pub struct ShmResponseLoan {
+    region: Arc<ShmRegion>,
+    block_idx: u32,
+    body_len: usize,
+}
+
+#[cfg(feature = "shm")]
+impl ShmResponseLoan {
+    /// Creates a new response loan by allocating a block from the pool.
+    pub(crate) fn new(region: &Arc<ShmRegion>) -> Option<Self> {
+        let block_idx = region.alloc_block()?;
+        Some(ShmResponseLoan {
+            region: Arc::clone(region),
+            block_idx,
+            body_len: 0,
+        })
+    }
+
+    /// Minimum bytes reserved at the end of the block for the header count
+    /// field (2 bytes) when the server finalizes the response.
+    const HEADER_RESERVE: usize = 2;
+
+    /// Returns a mutable slice into the pool block for writing response data.
+    /// The last 2 bytes are reserved for the header count field.
+    #[inline]
+    #[allow(unsafe_code)]
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        let ptr = self.region.block_ptr(self.block_idx);
+        let cap = self.region.block_size as usize - Self::HEADER_RESERVE;
+        unsafe { std::slice::from_raw_parts_mut(ptr, cap) }
+    }
+
+    /// Sets the number of bytes actually written to the block.
+    #[inline]
+    pub fn set_len(&mut self, len: usize) {
+        debug_assert!(len <= self.capacity());
+        self.body_len = len;
+    }
+
+    /// Returns the block capacity (maximum bytes that can be written).
+    /// This is `block_size - 2` to reserve space for the header count field.
+    #[inline]
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.region.block_size as usize - Self::HEADER_RESERVE
+    }
+}
+
+#[cfg(feature = "shm")]
+impl Drop for ShmResponseLoan {
+    fn drop(&mut self) {
+        // If the loan was not consumed (converted to Body::ShmDirect),
+        // free the block back to the pool.
+        if self.block_idx != crate::transport::shm::region::NO_BLOCK {
+            self.region.free_block(self.block_idx);
+        }
+    }
+}
+
+#[cfg(feature = "shm")]
+impl From<ShmResponseLoan> for Body {
+    #[inline]
+    fn from(mut loan: ShmResponseLoan) -> Self {
+        let guard = ShmDirectGuard {
+            region: Arc::clone(&loan.region),
+            block_idx: loan.block_idx,
+            body_len: loan.body_len,
+        };
+        // Prevent the loan from freeing the block on drop — ownership
+        // transfers to ShmDirectGuard.
+        loan.block_idx = crate::transport::shm::region::NO_BLOCK;
+        Body::ShmDirect(guard)
     }
 }
 
@@ -474,7 +647,6 @@ impl From<&str> for Uri {
 /// assert_eq!(req.uri.path(), "/v1/users/42");
 /// assert!(req.is_get());
 /// ```
-#[derive(Debug)]
 pub struct Request {
     /// The HTTP-style method of the request.
     pub method: Method,
@@ -486,6 +658,22 @@ pub struct Request {
     pub body: Body,
     /// Path parameters extracted by the router (e.g. `{id}` from `/users/:id`).
     pub(crate) path_params: HashMap<String, String>,
+    /// SHM region reference for born-in-SHM response allocation.
+    /// Set by the SHM transport when the request arrives via shared memory.
+    #[cfg(feature = "shm")]
+    pub(crate) shm_region: Option<Arc<ShmRegion>>,
+}
+
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Request")
+            .field("method", &self.method)
+            .field("uri", &self.uri)
+            .field("headers", &self.headers)
+            .field("body", &self.body)
+            .field("path_params", &self.path_params)
+            .finish()
+    }
 }
 
 impl Request {
@@ -506,6 +694,8 @@ impl Request {
             headers: HashMap::new(),
             body: Body::Empty,
             path_params: HashMap::new(),
+            #[cfg(feature = "shm")]
+            shm_region: None,
         }
     }
 
@@ -633,6 +823,34 @@ impl Request {
     /// ```
     pub fn json_body<T: serde::de::DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
         serde_json::from_slice(&self.body)
+    }
+
+    /// Allocates a pool block for writing the response body directly into
+    /// shared memory (born-in-SHM pattern).
+    ///
+    /// Returns `None` if the request did not arrive via the SHM transport
+    /// or the pool is exhausted. In that case, fall back to returning a
+    /// normal `Vec<u8>` body.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use crossbar::prelude::*;
+    ///
+    /// async fn handler(req: Request) -> Response {
+    ///     if let Some(mut loan) = req.alloc_response_block() {
+    ///         loan.as_mut_slice()[..2].copy_from_slice(b"ok");
+    ///         loan.set_len(2);
+    ///         Response::ok().with_body(loan)
+    ///     } else {
+    ///         Response::ok().with_body("ok")
+    ///     }
+    /// }
+    /// ```
+    #[cfg(feature = "shm")]
+    #[must_use]
+    pub fn alloc_response_block(&self) -> Option<ShmResponseLoan> {
+        self.shm_region.as_ref().and_then(ShmResponseLoan::new)
     }
 }
 
@@ -911,6 +1129,16 @@ impl IntoResponse for (u16, String) {
     #[inline]
     fn into_response(self) -> Response {
         Response::with_status(self.0).with_body(self.1)
+    }
+}
+
+#[cfg(feature = "shm")]
+impl IntoResponse for ShmResponseLoan {
+    /// Converts the loan into a `200 OK` response with the body written
+    /// directly in SHM.
+    #[inline]
+    fn into_response(self) -> Response {
+        Response::ok().with_body(self)
     }
 }
 

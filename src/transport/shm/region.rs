@@ -861,7 +861,8 @@ impl ShmRegion {
 
     /// Writes a response directly into a block.
     ///
-    /// Block layout: `[headers_data][body bytes]`.
+    /// Block layout: `[body bytes][headers_data]` (body first for born-in-SHM
+    /// compatibility — see [`write_response_direct`]).
     ///
     /// If the response exceeds block capacity or headers fail to serialize,
     /// a 500 fallback is written instead (this method never fails).
@@ -875,42 +876,42 @@ impl ShmRegion {
         let result = (|| -> Result<(u16, usize, usize), CrossbarError> {
             let mut off = 0usize;
 
-            // Write headers directly into block
-            let remaining =
-                unsafe { std::slice::from_raw_parts_mut(block.add(off), block_cap - off) };
-            let headers_len = crate::transport::serialize_headers_into(&resp.headers, remaining)?;
-            off += headers_len;
-
-            // Write body
-            if off + resp.body.len() > block_cap {
+            // Write body first
+            if resp.body.len() > block_cap {
                 return Err(CrossbarError::ShmMessageTooLarge {
-                    size: off + resp.body.len(),
+                    size: resp.body.len(),
                     max: block_cap,
                 });
             }
             unsafe {
                 std::ptr::copy_nonoverlapping(resp.body.as_ptr(), block.add(off), resp.body.len());
             }
+            off += resp.body.len();
+
+            // Write headers after body
+            let remaining =
+                unsafe { std::slice::from_raw_parts_mut(block.add(off), block_cap - off) };
+            let headers_len = crate::transport::serialize_headers_into(&resp.headers, remaining)?;
 
             Ok((resp.status, headers_len, resp.body.len()))
         })();
 
         let (status, headers_data_len, body_len) = result.unwrap_or_else(|_| {
             // Fallback: write a 500 error into the block, but respect block_cap.
-            let fallback_headers = [0u8, 0u8]; // 0 headers
             let fallback_body = b"response too large for shm block";
-            let total = fallback_headers.len() + fallback_body.len();
+            let fallback_headers = [0u8, 0u8]; // 0 headers
+            let total = fallback_body.len() + fallback_headers.len();
             if total <= block_cap {
                 unsafe {
                     std::ptr::copy_nonoverlapping(
-                        fallback_headers.as_ptr(),
+                        fallback_body.as_ptr(),
                         block,
-                        fallback_headers.len(),
+                        fallback_body.len(),
                     );
                     std::ptr::copy_nonoverlapping(
-                        fallback_body.as_ptr(),
-                        block.add(fallback_headers.len()),
-                        fallback_body.len(),
+                        fallback_headers.as_ptr(),
+                        block.add(fallback_body.len()),
+                        fallback_headers.len(),
                     );
                 }
                 (500u16, fallback_headers.len(), fallback_body.len())
@@ -933,10 +934,44 @@ impl ShmRegion {
         self.set_response_body_len(slot_idx, body_len as u32);
     }
 
+    /// Finalizes a born-in-SHM response: the body is already in the block
+    /// at offset 0, so only headers are appended after the body.
+    ///
+    /// Block layout: `[body bytes (already written)][headers_data]`.
+    #[inline]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn write_response_direct(
+        &self,
+        slot_idx: u32,
+        block_idx: u32,
+        body_len: usize,
+        headers: &std::collections::HashMap<String, String>,
+        status: u16,
+    ) {
+        let block_cap = self.block_size as usize;
+        let block = self.block_ptr(block_idx);
+
+        // Write headers after the body
+        let headers_data_len = if body_len < block_cap {
+            let remaining = unsafe {
+                std::slice::from_raw_parts_mut(block.add(body_len), block_cap - body_len)
+            };
+            crate::transport::serialize_headers_into(headers, remaining).unwrap_or(0)
+        } else {
+            0
+        };
+
+        // Write metadata to coordination slot
+        self.set_response_block_idx(slot_idx, block_idx);
+        self.set_response_status(slot_idx, status);
+        self.set_response_headers_data_len(slot_idx, headers_data_len as u32);
+        self.set_response_body_len(slot_idx, body_len as u32);
+    }
+
     /// Reads a response from a block.
     ///
     /// The body is zero-copy via `Body::Mmap`.
-    /// Block layout: `[headers_data][body bytes]`.
+    /// Block layout: `[body bytes][headers_data]`.
     ///
     /// # Errors
     ///
@@ -956,41 +991,46 @@ impl ShmRegion {
         let headers_data_len = self.response_headers_data_len(slot_idx) as usize;
 
         // Bounds check
-        let total = headers_data_len.checked_add(body_len);
+        let total = body_len.checked_add(headers_data_len);
         match total {
             Some(t) if t <= block_cap => {}
             _ => {
                 // Free the block before returning — caller won't see it again.
                 self.free_block(block_idx);
                 return Err(CrossbarError::ShmInvalidRegion(format!(
-                    "response payload ({headers_data_len}+{body_len}) exceeds block size ({block_cap})"
+                    "response payload ({body_len}+{headers_data_len}) exceeds block size ({block_cap})"
                 )));
             }
         }
 
-        let mut off = 0usize;
-
-        // Headers
-        let headers_slice = self.block_slice(block_idx, off, headers_data_len);
-        let headers = match crate::transport::deserialize_headers(headers_slice) {
-            Ok(h) => h,
-            Err(e) => {
-                self.free_block(block_idx);
-                return Err(e);
-            }
-        };
-        off += headers_data_len;
-
-        // Body — zero-copy via Body::Mmap
+        // Body at offset 0 — zero-copy via Body::Mmap
         let body = if body_len == 0 {
             Body::Empty
         } else {
             Body::Mmap(ShmBodyGuard {
                 region: Arc::clone(self),
                 block_idx,
-                offset: off,
+                offset: 0,
                 len: body_len,
             })
+        };
+
+        // Headers after body
+        let headers = if headers_data_len == 0 {
+            std::collections::HashMap::new()
+        } else {
+            let headers_slice = self.block_slice(block_idx, body_len, headers_data_len);
+            match crate::transport::deserialize_headers(headers_slice) {
+                Ok(h) => h,
+                Err(e) => {
+                    // Drop the body guard first (if any) to avoid double-free
+                    drop(body);
+                    if body_len == 0 {
+                        self.free_block(block_idx);
+                    }
+                    return Err(e);
+                }
+            }
         };
 
         // If body is empty, free the block immediately

@@ -202,7 +202,67 @@ fn bench_shm(c: &mut Criterion) {
 }
 
 // ====================================================
-// 3b. Pub/Sub -- zero-copy SHM (shm feature)
+// 3b. Born-in-SHM RPC -- zero-copy response writes
+// ====================================================
+
+#[cfg(all(unix, feature = "shm"))]
+fn bench_shm_born_in_shm(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let shm_name = "crossbar-bench-born";
+
+    // Handlers that write directly into pool blocks (no heap alloc, no memcpy)
+    let router = Router::new()
+        .route(
+            "/born/64k",
+            get(|req: Request| async move {
+                if let Some(mut loan) = req.alloc_response_block() {
+                    let cap = loan.capacity().min(65_536);
+                    loan.as_mut_slice()[..cap].fill(42);
+                    loan.set_len(cap);
+                    black_box(Response::ok().with_body(loan))
+                } else {
+                    Response::ok().with_body(vec![42u8; 65_536])
+                }
+            }),
+        )
+        .route(
+            "/born/2b",
+            get(|req: Request| async move {
+                if let Some(mut loan) = req.alloc_response_block() {
+                    loan.as_mut_slice()[..2].copy_from_slice(b"ok");
+                    loan.set_len(2);
+                    Response::ok().with_body(loan)
+                } else {
+                    Response::ok().with_body("ok")
+                }
+            }),
+        );
+
+    let _handle = rt.block_on(async { ShmServer::spawn(shm_name, router).await.unwrap() });
+    let client = Arc::new(rt.block_on(ShmClient::connect(shm_name)).unwrap());
+
+    let mut group = c.benchmark_group("shm_born_in_shm");
+    group.measurement_time(Duration::from_secs(1));
+
+    group.bench_function("health_2B", |b| {
+        let client = client.clone();
+        b.to_async(&rt)
+            .iter(|| async { black_box(client.get("/born/2b").await.unwrap()) })
+    });
+
+    group.bench_function("64KB", |b| {
+        let client = client.clone();
+        b.to_async(&rt)
+            .iter(|| async { black_box(client.get("/born/64k").await.unwrap()) })
+    });
+
+    group.finish();
+
+    let _ = std::fs::remove_file("/dev/shm/crossbar-crossbar-bench-born");
+}
+
+// ====================================================
+// 3c. Pub/Sub -- zero-copy SHM (shm feature)
 // ====================================================
 
 #[cfg(all(unix, feature = "shm"))]
@@ -651,6 +711,9 @@ criterion_group!(
 criterion_group!(benches_shm, bench_shm,);
 
 #[cfg(all(unix, feature = "shm"))]
+criterion_group!(benches_born_in_shm, bench_shm_born_in_shm,);
+
+#[cfg(all(unix, feature = "shm"))]
 criterion_group!(benches_pubsub, bench_pubsub,);
 
 #[cfg(all(unix, feature = "shm"))]
@@ -660,6 +723,7 @@ criterion_group!(benches_pool_pubsub, bench_pool_pubsub,);
 criterion_main!(
     benches_common,
     benches_shm,
+    benches_born_in_shm,
     benches_pubsub,
     benches_pool_pubsub
 );

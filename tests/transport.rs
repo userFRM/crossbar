@@ -715,6 +715,143 @@ async fn shm_matches_inproc_responses() {
     cleanup_shm(&name);
 }
 
+/// Born-in-SHM: handler writes response directly into a pool block,
+/// eliminating the heap→SHM memcpy.
+#[cfg(all(unix, feature = "shm"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shm_born_in_shm_response() {
+    let router = Router::new().route(
+        "/born",
+        get(|req: Request| async move {
+            if let Some(mut loan) = req.alloc_response_block() {
+                let data = loan.as_mut_slice();
+                // Write a known pattern directly into SHM
+                for (i, byte) in data.iter_mut().enumerate().take(256) {
+                    *byte = (i % 256) as u8;
+                }
+                loan.set_len(256);
+                Response::ok().with_body(loan)
+            } else {
+                // Fallback — should not happen in SHM transport
+                Response::with_status(500).with_body("no shm region")
+            }
+        }),
+    );
+    let name = shm_name("born_shm");
+    let _handle = ShmServer::spawn(&name, router).await.unwrap();
+    let client = ShmClient::connect(&name).await.unwrap();
+
+    let resp = client.get("/born").await.unwrap();
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body.len(), 256);
+    for (i, &b) in resp.body.as_ref().iter().enumerate() {
+        assert_eq!(b, (i % 256) as u8, "mismatch at byte {i}");
+    }
+
+    cleanup_shm(&name);
+}
+
+/// Born-in-SHM with headers: verify headers roundtrip correctly
+/// alongside the zero-copy body.
+#[cfg(all(unix, feature = "shm"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shm_born_in_shm_with_headers() {
+    let router = Router::new().route(
+        "/born-hdr",
+        get(|req: Request| async move {
+            if let Some(mut loan) = req.alloc_response_block() {
+                loan.as_mut_slice()[..5].copy_from_slice(b"hello");
+                loan.set_len(5);
+                Response::ok()
+                    .with_body(loan)
+                    .with_header("x-born", "true")
+                    .with_header("content-type", "text/plain")
+            } else {
+                Response::with_status(500).with_body("no shm region")
+            }
+        }),
+    );
+    let name = shm_name("born_hdr");
+    let _handle = ShmServer::spawn(&name, router).await.unwrap();
+    let client = ShmClient::connect(&name).await.unwrap();
+
+    let resp = client.get("/born-hdr").await.unwrap();
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body_str(), "hello");
+    assert_eq!(resp.headers.get("x-born").map(String::as_str), Some("true"));
+    assert_eq!(
+        resp.headers.get("content-type").map(String::as_str),
+        Some("text/plain")
+    );
+
+    cleanup_shm(&name);
+}
+
+/// Born-in-SHM large payload: 64 KiB written directly into pool block.
+#[cfg(all(unix, feature = "shm"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shm_born_in_shm_large_payload() {
+    let router = Router::new().route(
+        "/born-big",
+        get(|req: Request| async move {
+            if let Some(mut loan) = req.alloc_response_block() {
+                let cap = loan.capacity();
+                let data = loan.as_mut_slice();
+                // Fill entire block with pattern
+                for (i, byte) in data.iter_mut().enumerate().take(cap) {
+                    *byte = (i & 0xFF) as u8;
+                }
+                loan.set_len(cap);
+                Response::ok().with_body(loan)
+            } else {
+                Response::with_status(500).with_body("no shm region")
+            }
+        }),
+    );
+    let name = shm_name("born_big");
+    let _handle = ShmServer::spawn(&name, router).await.unwrap();
+    let client = ShmClient::connect(&name).await.unwrap();
+
+    let resp = client.get("/born-big").await.unwrap();
+    assert_eq!(resp.status, 200);
+    // Body should fill the block (minus space used by headers appended after)
+    assert!(resp.body.len() > 60_000, "body should be large");
+    // Verify pattern
+    for (i, &b) in resp.body.as_ref().iter().enumerate() {
+        assert_eq!(b, (i & 0xFF) as u8, "pattern mismatch at byte {i}");
+    }
+
+    cleanup_shm(&name);
+}
+
+/// Born-in-SHM loan dropped without use: block must be freed.
+#[cfg(all(unix, feature = "shm"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shm_born_in_shm_loan_dropped() {
+    let router = Router::new().route(
+        "/born-drop",
+        get(|req: Request| async move {
+            // Allocate a loan but DON'T use it — fall back to normal body
+            if let Some(_loan) = req.alloc_response_block() {
+                // loan dropped here without being consumed
+            }
+            Response::ok().with_body("normal")
+        }),
+    );
+    let name = shm_name("born_drop");
+    let _handle = ShmServer::spawn(&name, router).await.unwrap();
+    let client = ShmClient::connect(&name).await.unwrap();
+
+    // Call multiple times to verify blocks are freed properly
+    for _ in 0..50 {
+        let resp = client.get("/born-drop").await.unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body_str(), "normal");
+    }
+
+    cleanup_shm(&name);
+}
+
 // ===============================================
 // PubSub seqlock torn-read detection tests (task 6)
 // ===============================================

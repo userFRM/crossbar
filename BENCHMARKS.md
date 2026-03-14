@@ -84,6 +84,19 @@ matching.
 | 64 KB response | 1.28 µs | 1.96 µs | 680 ns |
 | 1 MB response | 18.3 µs | 18.9 µs | 600 ns |
 
+### Born-in-SHM (zero-copy writes)
+
+Handlers write directly into SHM pool blocks via `req.alloc_response_block()`,
+eliminating the heap→SHM memcpy on the response path.
+
+| Payload | Normal SHM | Born-in-SHM | Improvement |
+|---|---|---|---|
+| 2B (health) | 718 ns | 820 ns | −14% (pool overhead > memcpy savings) |
+| 64 KB | 3.12 µs | **1.78 µs** | **43% faster** |
+
+Born-in-SHM is beneficial for payloads ≥ ~1 KB where the eliminated memcpy outweighs
+the pool alloc/free overhead. For tiny responses, the normal path is faster.
+
 ### Throughput
 
 | Payload | In-process | SHM |
@@ -145,9 +158,10 @@ and the **read** (`Body::Mmap` points directly into mmap — zero copy). However
 still **enter** SHM somehow: the handler creates the response body (e.g. `vec![42u8; 65536]`)
 and the transport `memcpy`s it into a pool block. Both operations are O(n).
 
-For true O(1) end-to-end, handlers would need to write directly into SHM blocks
-("born-in-SHM") — the same pattern pub/sub uses with `loan.as_mut_slice()`. This is a
-planned future API extension.
+For O(1) writes, handlers can use `req.alloc_response_block()` to get an `ShmResponseLoan`
+and write directly into a SHM pool block ("born-in-SHM") — the same pattern pub/sub uses
+with `loan.as_mut_slice()`. This eliminates the heap→SHM memcpy, reducing 64 KB response
+latency by 43%.
 
 ### Scaling
 
@@ -170,6 +184,9 @@ cargo bench --features shm -- "pool_pubsub"
 
 # SHM RPC only
 cargo bench --features shm -- "shm/"
+
+# Born-in-SHM (zero-copy writes)
+cargo bench --features shm -- "shm_born_in_shm"
 
 # Throughput only
 cargo bench --features shm -- "throughput"
