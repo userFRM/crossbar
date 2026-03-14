@@ -8,8 +8,8 @@
 //!
 //! | Transport | Typical latency | Notes |
 //! |-----------|-----------------|-------|
-//! | [`InProcessClient`] | ~152 ns | Direct dispatch, no serialization |
-//! | `ShmClient` | ~54 µs | Cross-process via `/dev/shm` (`shm` feature) |
+//! | [`InProcessClient`] | ~143 ns | Direct dispatch, no serialization |
+//! | `ShmClient` | ~757 ns | Cross-process via `/dev/shm` (`shm` feature) |
 //!
 //! **Pub/Sub** — zero-copy O(1) streaming over shared memory.
 //!

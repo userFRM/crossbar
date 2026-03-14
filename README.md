@@ -4,7 +4,7 @@
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org)
 
-**High-performance IPC framework for Rust.** Two data paths over shared memory: **pub/sub** for streaming (67 ns) and **RPC** for request/response with URI routing (~54 µs). All latency numbers measured in-process via Criterion; real cross-process latency includes kernel scheduling.
+**High-performance IPC framework for Rust.** Two data paths over shared memory: **pub/sub** for streaming (67 ns) and **RPC** for request/response with URI routing (~757 ns). All latency numbers measured in-process via Criterion; real cross-process latency includes kernel scheduling.
 
 ---
 
@@ -20,7 +20,7 @@ graph LR
 
     subgraph "Crossbar"
         PS["Pub/Sub<br/>streaming · 67 ns"]
-        RPC["RPC<br/>request/response · ~54 µs"]
+        RPC["RPC<br/>request/response · ~757 ns"]
         R["URI Router"]
     end
 
@@ -43,7 +43,7 @@ graph LR
 | | Pub/Sub | RPC |
 |---|---|---|
 | **Purpose** | Stream raw bytes between processes | Request/response with URI routing |
-| **Latency** | **67 ns** | ~54 µs |
+| **Latency** | **67 ns** | **~757 ns** |
 | **Pattern** | Publisher → Subscriber(s) | Client → Router → Handler → Response |
 | **Data format** | Raw `&[u8]` (you decide the format) | Structured `Request` / `Response` |
 | **Routing** | Topic string (e.g. `"prices/AAPL"`) | URI patterns (e.g. `/tick/:symbol`) |
@@ -127,7 +127,7 @@ The 67 ns is the end-to-end cost for 8 bytes. The *transfer* (writing the 8B des
 
 ---
 
-## RPC — request/response with URI routing (~54 µs)
+## RPC — request/response with URI routing (~757 ns)
 
 When you need to call a function in another process by URI. Define handlers with path patterns, register them on a router, serve over shared memory.
 
@@ -137,19 +137,19 @@ sequenceDiagram
     participant SHM as Shared Memory<br/>(mmap)
     participant S as Server Process
 
-    C->>SHM: alloc block + write request<br/>(URI, method, headers, body)
-    C->>SHM: state = REQUEST_READY + futex_wake
+    C->>SHM: alloc block (CAS) + write request
+    C->>SHM: state = REQUEST_READY + smart wake
 
-    Note over C: spawn_blocking waits<br/>for response (~15-20 µs)
+    Note over C: inline spin (~2 µs window)
 
-    S->>SHM: poll loop sees REQUEST_READY
-    S->>S: router.dispatch(req)<br/>pattern match + handler
+    S->>SHM: hint-based scan finds REQUEST_READY
+    S->>S: dispatch_fast(req)<br/>zero-alloc route match + try-poll
     S->>SHM: alloc block + write response
-    S->>SHM: state = RESPONSE_READY + futex_wake
+    S->>SHM: state = RESPONSE_READY
 
-    SHM->>C: response returned (zero-copy body)
+    SHM->>C: spin detects RESPONSE_READY<br/>zero-copy body via Body::Mmap
 
-    Note over C,S: Total: ~54 µs (health check)<br/>Bottleneck: spawn_blocking + futex overhead
+    Note over C,S: Total: ~757 ns (/health)<br/>No channels, no tokio, no futex on hot path
 ```
 
 ### Code
@@ -176,22 +176,32 @@ let client = ShmClient::connect("myapp").await?;
 let resp = client.get("/tick/AAPL").await?;
 ```
 
-### Why ~54 µs?
+### Why ~757 ns?
 
-The data transfer itself is O(1) (block pool with zero-copy reads). The latency comes from coordination overhead that pub/sub does not have:
+The data transfer is O(1) (block offsets + zero-copy reads via `Body::Mmap`). The ~757 ns is the coordination overhead — CAS operations, slot metadata writes, and route matching:
 
-| Step | Cost | Pub/Sub equivalent |
-|---|---|---|
-| `spawn_blocking` (tokio threadpool) | ~15-20 µs | not used |
-| Futex wake/wait round-trips (×2) | ~2-4 µs | smart wake (~2 ns) |
-| Request serialization (URI + headers + body) | ~1-2 µs | raw bytes only |
-| Router dispatch (pattern matching) | ~152 ns | no routing |
-| Server poll sleep (idle cycles) | 0-1 µs | subscriber polls directly |
-| CAS state transitions (×5) | ~500 ns | seqlock (2 stores) |
+| Step | Cost |
+|---|---|
+| Block pool alloc (Treiber stack CAS) | ~50 ns |
+| Slot acquisition (CAS + hint scan) | ~80 ns |
+| Request serialization into block | ~100 ns |
+| Smart wake (atomic store, no syscall) | ~5 ns |
+| Server: hint scan + CAS + dispatch_fast | ~300 ns |
+| Response serialization into block | ~80 ns |
+| Client: spin detection + zero-copy read | ~100 ns |
 
-> [!NOTE]
-> The roadmap includes a **dedicated SHM poller** that eliminates `spawn_blocking`
-> and the tokio runtime from the hot path, targeting sub-10 µs RPC latency.
+**Why 71x faster than the naive approach (~54 µs):**
+
+| Optimization | Savings |
+|---|---|
+| **Inline spin** — client spins on slot state, catches fast handlers without channels | ~4 µs (eliminates poller + oneshot + eventfd) |
+| **Dedicated OS threads** — server poll loop off tokio, no `spawn_blocking` | ~15-20 µs |
+| **Smart wake** — skip `futex_wake` syscall when server is busy | ~170 ns |
+| **Try-poll dispatch** — poll handler with noop waker, skip `block_on` | ~200 ns |
+| **Hint-based scanning** — client + server skip to last-known slot | ~300 ns |
+| **Zero-alloc route matching** — literal patterns skip HashMap/Vec | ~50 ns |
+| **Counter heartbeat** — check liveness every 1024 requests | ~20 ns |
+| **`CLOCK_MONOTONIC_COARSE`** — ~6 ns timestamps instead of ~25 ns | ~19 ns |
 
 ### In-process shortcut
 
@@ -199,7 +209,7 @@ For testing or same-process dispatch, `InProcessClient` calls the router directl
 
 ```rust
 let client = InProcessClient::new(router.clone());
-let resp = client.get("/health").await;  // ~152 ns
+let resp = client.get("/health").await;  // ~143 ns
 ```
 
 ---
@@ -298,11 +308,15 @@ cargo bench --features shm
 
 ### RPC
 
-| Benchmark | In-process | SHM |
-|---|---|---|
-| `/health` (2B) | 152 ns | 53.5 µs |
-| 64 KB response | 1.19 µs | 55.8 µs |
-| 1 MB response | 16.97 µs | 72.7 µs |
+| Benchmark | In-process | SHM | SHM overhead |
+|---|---|---|---|
+| `/health` (2B) | 143 ns | **757 ns** | 614 ns |
+| OHLC (JSON + path params) | 937 ns | 1.63 µs | 693 ns |
+| POST JSON body | 1.26 µs | 1.86 µs | 600 ns |
+| 64 KB response | 1.28 µs | 1.96 µs | 680 ns |
+| 1 MB response | 18.3 µs | 18.9 µs | 600 ns |
+
+The SHM overhead is a flat **~600-700 ns** regardless of payload size. The *transfer* (writing a block offset to the coordination slot) is always O(1). Larger payloads add the cost of writing data *into* the SHM block (O(n) memcpy). For 1 MB, SHM is nearly the same as in-process because the handler's `Vec` creation dominates and `Body::Mmap` zero-copy avoids the clone that in-process dispatch does.
 
 ---
 
@@ -379,7 +393,7 @@ crossbar/
   crossbar-macros/      #[handler] and #[derive(IntoResponse)] proc macros
   examples/
     demo.rs             In-process + SHM latency comparison
-  tests/                256 tests (transport, stress, routing, handler, macros, types, doc-tests)
+  tests/                244 tests (transport, stress, routing, handler, macros, types, doc-tests)
   benches/
     transport.rs        Criterion benchmarks
 ```
@@ -388,8 +402,9 @@ crossbar/
 
 ## Roadmap
 
-- **Dedicated SHM poller** — eliminate `spawn_blocking` from RPC, targeting sub-10 µs
-- **Pub/sub-backed RPC** — route requests over the pub/sub transport for ~200-500 ns RPC
+- ~~**Dedicated SHM poller**~~ — **done** (inline spin + OS threads, 757 ns)
+- **Born-in-SHM responses** — handlers write directly into pool blocks for true O(1) end-to-end
+- **Bidirectional RPC** — server can push to clients over the same region
 - **HTTP bridge** — serve crossbar routes over hyper/axum
 - **Middleware** — composable interceptors (logging, auth, metrics)
 

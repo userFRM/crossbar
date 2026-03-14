@@ -70,24 +70,29 @@ The transfer itself is always O(1) — only an 8-byte descriptor is written to t
 
 ## RPC
 
-SHM RPC uses V2 block pool architecture (64 coordination slots, 192 blocks x 64 KiB).
+SHM RPC uses V2 block pool architecture (64 coordination slots, 192 blocks x 64 KiB)
+with inline spin response detection, hint-based slot scanning, and zero-alloc route
+matching.
 
 ### Latency
 
-| Benchmark | In-process | SHM |
-|---|---|---|
-| `/health` (2B) | 152 ns | 53.5 µs |
-| JSON + path params (OHLC) | 1.14 µs | 55.7 µs |
-| POST JSON body (order) | 1.34 µs | 56.5 µs |
-| 64 KB response | 1.19 µs | 55.8 µs |
-| 1 MB response | 16.97 µs | 72.7 µs |
+| Benchmark | In-process | SHM | SHM overhead |
+|---|---|---|---|
+| `/health` (2B) | 143 ns | **757 ns** | 614 ns |
+| JSON + path params (OHLC) | 937 ns | 1.63 µs | 693 ns |
+| POST JSON body (order) | 1.26 µs | 1.86 µs | 600 ns |
+| 64 KB response | 1.28 µs | 1.96 µs | 680 ns |
+| 1 MB response | 18.3 µs | 18.9 µs | 600 ns |
 
 ### Throughput
 
 | Payload | In-process | SHM |
 |---|---|---|
-| 64 KB | 53.2 GiB/s | 1.09 GiB/s |
-| 1 MB | 54.7 GiB/s | 13.6 GiB/s |
+| 64 KB | 49.7 GiB/s | 35.6 GiB/s |
+| 1 MB | 50.9 GiB/s | 54.2 GiB/s |
+
+SHM throughput at 1 MB exceeds in-process because `Body::Mmap` zero-copy avoids the
+`Vec<u8>` clone that in-process dispatch performs.
 
 ---
 
@@ -105,19 +110,44 @@ via `as_mut_slice()` (born-in-SHM). The subscriber reads via `Deref` into mmap.
 - Inline hot paths: `alloc_block`, `commit`, `try_recv` are `#[inline]`
 - Minimal coordination: seqlock + refcount + Treiber stack — no service discovery
 
-### Why RPC is ~54 µs
+### Why RPC is ~757 ns
 
-The data transfer is O(1) (block pool with zero-copy reads), but RPC has
-coordination overhead that pub/sub does not:
+The data transfer is O(1) (block offsets + zero-copy reads via `Body::Mmap`). The
+~757 ns is purely coordination overhead:
 
 | Step | Cost |
 |---|---|
-| `spawn_blocking` (tokio threadpool handoff) | ~15-20 µs |
-| Futex wake/wait round-trips (x2) | ~2-4 µs |
-| Request/response serialization (URI + headers + body) | ~1-2 µs |
-| Server poll sleep (idle cycles) | 0-1 µs |
-| CAS state transitions (x5) | ~500 ns |
-| Router dispatch (pattern matching) | ~152 ns |
+| Block pool alloc (Treiber stack CAS) | ~50 ns |
+| Slot acquisition (CAS + hint scan) | ~80 ns |
+| Request serialization into block | ~100 ns |
+| Smart wake (atomic store, no syscall under load) | ~5 ns |
+| Server: hint scan + CAS + dispatch_fast | ~300 ns |
+| Response serialization into block | ~80 ns |
+| Client: spin detection + zero-copy read | ~100 ns |
+
+### What was eliminated (71x speedup from naive)
+
+| Optimization | Savings |
+|---|---|
+| **Inline spin** — client spins on slot state, catches fast handlers without channels | ~4 µs |
+| **Dedicated OS threads** — server off tokio, no `spawn_blocking` | ~15-20 µs |
+| **Smart wake** — skip `futex_wake` when server is busy | ~170 ns |
+| **Try-poll dispatch** — noop waker poll, skip `block_on` for sync handlers | ~200 ns |
+| **Hint-based scanning** — client + server skip to last-known slot | ~300 ns |
+| **Zero-alloc route matching** — literal patterns bypass HashMap/Vec | ~50 ns |
+| **Counter heartbeat** — check liveness every 1024 requests | ~20 ns |
+| **`CLOCK_MONOTONIC_COARSE`** — ~6 ns timestamps vs ~25 ns | ~19 ns |
+
+### Why larger payloads cost more
+
+The O(1) claim applies to the **transfer** (writing a block offset to a coordination slot)
+and the **read** (`Body::Mmap` points directly into mmap — zero copy). However, data must
+still **enter** SHM somehow: the handler creates the response body (e.g. `vec![42u8; 65536]`)
+and the transport `memcpy`s it into a pool block. Both operations are O(n).
+
+For true O(1) end-to-end, handlers would need to write directly into SHM blocks
+("born-in-SHM") — the same pattern pub/sub uses with `loan.as_mut_slice()`. This is a
+planned future API extension.
 
 ### Scaling
 
