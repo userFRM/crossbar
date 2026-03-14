@@ -996,6 +996,65 @@ fn bench_iceoryx2_vs_crossbar(c: &mut Criterion) {
 }
 
 // ====================================================
+// Pub/Sub-backed RPC
+// ====================================================
+
+#[cfg(all(unix, feature = "shm"))]
+fn bench_pubsub_rpc(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let rpc_name = "crossbar-bench-rpc";
+    let body = order_json_body();
+
+    let _handle = rt.block_on(async {
+        PubSubRpcServer::spawn(rpc_name, make_router())
+            .await
+            .unwrap()
+    });
+
+    let client = Arc::new(rt.block_on(PubSubRpcClient::connect(rpc_name)).unwrap());
+
+    let mut group = c.benchmark_group("pubsub_rpc");
+    group.measurement_time(Duration::from_secs(1));
+
+    group.bench_function("health", |b| {
+        let client = client.clone();
+        b.to_async(&rt)
+            .iter(|| async { black_box(client.get("/health").await.unwrap()) })
+    });
+
+    group.bench_function("ohlc", |b| {
+        let client = client.clone();
+        b.to_async(&rt).iter(|| async {
+            black_box(
+                client
+                    .get("/v3/stock/snapshot/ohlc/AAPL?venue=nqb")
+                    .await
+                    .unwrap(),
+            )
+        })
+    });
+
+    group.bench_function("post_json", |b| {
+        let client = client.clone();
+        let body = body.clone();
+        b.to_async(&rt).iter(|| {
+            let body = body.clone();
+            async { black_box(client.post("/v3/stock/order", body).await.unwrap()) }
+        })
+    });
+
+    group.bench_function("large_64kb", |b| {
+        let client = client.clone();
+        b.to_async(&rt)
+            .iter(|| async { black_box(client.get("/large/64k").await.unwrap()) })
+    });
+
+    group.finish();
+
+    let _ = std::fs::remove_file("/dev/shm/crossbar-rpc-crossbar-bench-rpc");
+}
+
+// ====================================================
 
 criterion_group!(
     benches_common,
@@ -1024,13 +1083,17 @@ criterion_group!(benches_pool_pubsub, bench_pool_pubsub,);
 criterion_group!(benches_head_to_head, bench_iceoryx2_vs_crossbar,);
 
 #[cfg(all(unix, feature = "shm"))]
+criterion_group!(benches_pubsub_rpc, bench_pubsub_rpc,);
+
+#[cfg(all(unix, feature = "shm"))]
 criterion_main!(
     benches_common,
     benches_shm,
     benches_born_in_shm,
     benches_pubsub,
     benches_pool_pubsub,
-    benches_head_to_head
+    benches_head_to_head,
+    benches_pubsub_rpc
 );
 
 #[cfg(not(all(unix, feature = "shm")))]

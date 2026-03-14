@@ -13,6 +13,7 @@ mod mmap;
 mod notify;
 mod pool_pubsub;
 mod pubsub;
+mod pubsub_rpc;
 pub(crate) mod region;
 
 pub use bidi::{BidiClient, BidiConfig, BidiServer};
@@ -25,6 +26,7 @@ pub use pubsub::{
     PubSubConfig, ShmLoan, ShmPublisher, ShmSample, ShmSampleRef, ShmSubscriber, ShmSubscription,
     TopicHandle,
 };
+pub use pubsub_rpc::{PubSubRpcClient, PubSubRpcConfig, PubSubRpcServer};
 pub use region::ShmConfig;
 
 use crate::error::CrossbarError;
@@ -58,7 +60,7 @@ use std::time::Duration;
 /// # }
 /// ```
 pub struct ShmHandle {
-    stop: Arc<std::sync::atomic::AtomicBool>,
+    pub(super) stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ShmHandle {

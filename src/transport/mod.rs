@@ -17,7 +17,8 @@
 //! | Transport | Typical latency | Notes |
 //! |-----------|-----------------|-------|
 //! | [`InProcessClient`] | ~143 ns | Direct dispatch, no serialization |
-//! | `ShmClient` | ~757 ns | Cross-process via `/dev/shm` (`shm` feature) |
+//! | `PubSubRpcClient` | ~561 ns | Pub/sub-backed RPC, 25% faster than slot-based |
+//! | `ShmClient` | ~745 ns | Cross-process via `/dev/shm` (`shm` feature) |
 //!
 //! **Pub/Sub** — zero-copy O(1) streaming over shared memory.
 //!
@@ -32,10 +33,10 @@ pub(crate) mod shm;
 pub use inproc::InProcessClient;
 #[cfg(all(unix, feature = "shm"))]
 pub use shm::{
-    BidiClient, BidiConfig, BidiServer, PoolPubSubConfig, PoolTopicHandle, PubSubConfig, ShmClient,
-    ShmConfig, ShmHandle, ShmLoan, ShmPoolLoan, ShmPoolPublisher, ShmPoolSampleGuard,
-    ShmPoolSubscriber, ShmPoolSubscription, ShmPublisher, ShmSample, ShmSampleRef, ShmServer,
-    ShmSubscriber, ShmSubscription, TopicHandle,
+    BidiClient, BidiConfig, BidiServer, PoolPubSubConfig, PoolTopicHandle, PubSubConfig,
+    PubSubRpcClient, PubSubRpcConfig, PubSubRpcServer, ShmClient, ShmConfig, ShmHandle, ShmLoan,
+    ShmPoolLoan, ShmPoolPublisher, ShmPoolSampleGuard, ShmPoolSubscriber, ShmPoolSubscription,
+    ShmPublisher, ShmSample, ShmSampleRef, ShmServer, ShmSubscriber, ShmSubscription, TopicHandle,
 };
 
 #[cfg(feature = "shm")]

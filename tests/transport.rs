@@ -1595,3 +1595,170 @@ async fn bidi_custom_config() {
 
     assert_eq!(&*sub.try_recv().unwrap(), b"configured");
 }
+
+// ===============================================
+// PubSubRpcClient/Server
+// ===============================================
+
+#[cfg(all(unix, feature = "shm"))]
+fn cleanup_rpc(name: &str) {
+    let path = format!("/dev/shm/crossbar-rpc-{name}");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[cfg(all(unix, feature = "shm"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pubsub_rpc_get() {
+    let name = shm_name("rpc_get");
+    let _handle = PubSubRpcServer::spawn(&name, test_router()).await.unwrap();
+
+    let client = PubSubRpcClient::connect(&name).await.unwrap();
+    let resp = client.get("/health").await.unwrap();
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body_str(), "ok");
+
+    cleanup_rpc(&name);
+}
+
+#[cfg(all(unix, feature = "shm"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pubsub_rpc_post() {
+    let name = shm_name("rpc_post");
+    let _handle = PubSubRpcServer::spawn(&name, test_router()).await.unwrap();
+
+    let client = PubSubRpcClient::connect(&name).await.unwrap();
+    let resp = client.post("/echo", "rpc body").await.unwrap();
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body_str(), "rpc body");
+
+    cleanup_rpc(&name);
+}
+
+#[cfg(all(unix, feature = "shm"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pubsub_rpc_404() {
+    let name = shm_name("rpc_404");
+    let _handle = PubSubRpcServer::spawn(&name, test_router()).await.unwrap();
+
+    let client = PubSubRpcClient::connect(&name).await.unwrap();
+    let resp = client.get("/nonexistent").await.unwrap();
+    assert_eq!(resp.status, 404);
+
+    cleanup_rpc(&name);
+}
+
+#[cfg(all(unix, feature = "shm"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pubsub_rpc_path_params() {
+    let name = shm_name("rpc_params");
+    let _handle = PubSubRpcServer::spawn(&name, test_router()).await.unwrap();
+
+    let client = PubSubRpcClient::connect(&name).await.unwrap();
+    let resp = client.get("/status/201").await.unwrap();
+    assert_eq!(resp.status, 201);
+    assert_eq!(resp.body_str(), "status:201");
+
+    cleanup_rpc(&name);
+}
+
+#[cfg(all(unix, feature = "shm"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pubsub_rpc_empty_body() {
+    let name = shm_name("rpc_empty");
+    let _handle = PubSubRpcServer::spawn(&name, test_router()).await.unwrap();
+
+    let client = PubSubRpcClient::connect(&name).await.unwrap();
+    let resp = client.post("/echo", "").await.unwrap();
+    assert_eq!(resp.status, 200);
+    assert!(resp.body.is_empty());
+
+    cleanup_rpc(&name);
+}
+
+#[cfg(all(unix, feature = "shm"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pubsub_rpc_binary_roundtrip() {
+    let name = shm_name("rpc_binary");
+    let _handle = PubSubRpcServer::spawn(&name, test_router()).await.unwrap();
+
+    let binary: Vec<u8> = (0..=255).collect();
+    let client = PubSubRpcClient::connect(&name).await.unwrap();
+    let resp = client.post("/echo", binary.clone()).await.unwrap();
+    assert_eq!(resp.body.as_ref(), binary.as_slice());
+
+    cleanup_rpc(&name);
+}
+
+#[cfg(all(unix, feature = "shm"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pubsub_rpc_multiple_requests() {
+    let name = shm_name("rpc_multi");
+    let _handle = PubSubRpcServer::spawn(&name, test_router()).await.unwrap();
+
+    let client = PubSubRpcClient::connect(&name).await.unwrap();
+    for i in 0..100 {
+        let resp = client.get("/health").await.unwrap();
+        assert_eq!(resp.status, 200, "failed on iteration {i}");
+        assert_eq!(resp.body_str(), "ok");
+    }
+
+    cleanup_rpc(&name);
+}
+
+#[cfg(all(unix, feature = "shm"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pubsub_rpc_multiple_clients() {
+    let name = shm_name("rpc_clients");
+    let _handle = PubSubRpcServer::spawn(&name, test_router()).await.unwrap();
+
+    let mut handles = Vec::new();
+    for i in 0..4 {
+        let n = name.clone();
+        handles.push(tokio::spawn(async move {
+            let client = PubSubRpcClient::connect(&n).await.unwrap();
+            for _ in 0..25 {
+                let resp = client.get("/health").await.unwrap();
+                assert_eq!(resp.status, 200);
+            }
+            drop(client);
+            i
+        }));
+    }
+
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    cleanup_rpc(&name);
+}
+
+#[cfg(all(unix, feature = "shm"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pubsub_rpc_large_payload() {
+    let name = shm_name("rpc_large");
+    let _handle = PubSubRpcServer::spawn(&name, test_router()).await.unwrap();
+
+    let payload = vec![0xABu8; 32768]; // 32 KiB
+    let client = PubSubRpcClient::connect(&name).await.unwrap();
+    let resp = client.post("/echo", payload.clone()).await.unwrap();
+    assert_eq!(resp.body.as_ref(), payload.as_slice());
+
+    cleanup_rpc(&name);
+}
+
+#[cfg(all(unix, feature = "shm"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pubsub_rpc_json_response() {
+    let name = shm_name("rpc_json");
+    let _handle = PubSubRpcServer::spawn(&name, test_router()).await.unwrap();
+
+    let client = PubSubRpcClient::connect(&name).await.unwrap();
+    let resp = client.get("/json").await.unwrap();
+    assert_eq!(resp.status, 200);
+
+    let body: serde_json::Value = serde_json::from_slice(resp.body.as_ref()).unwrap();
+    assert_eq!(body["msg"], "hello");
+    assert_eq!(body["num"], 42);
+
+    cleanup_rpc(&name);
+}
