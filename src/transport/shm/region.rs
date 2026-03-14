@@ -337,6 +337,16 @@ impl ShmRegion {
                     mmap.len()
                 )));
             }
+            if slot_count == 0 {
+                return Err(CrossbarError::ShmInvalidRegion(
+                    "slot_count must be > 0".into(),
+                ));
+            }
+            if block_count == 0 {
+                return Err(CrossbarError::ShmInvalidRegion(
+                    "block_count must be > 0".into(),
+                ));
+            }
             if block_size < 64 {
                 return Err(CrossbarError::ShmInvalidRegion(format!(
                     "block_size must be >= 64 (got {block_size})"
@@ -1203,7 +1213,7 @@ impl ShmRegion {
             let state = self.slot_state(i);
             let current = state.load(Ordering::Acquire);
 
-            if current == FREE || current == PROCESSING {
+            if current == FREE {
                 continue;
             }
 

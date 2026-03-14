@@ -734,12 +734,13 @@ impl ShmClient {
                     // Phase 2: yield — let sibling hyperthreads run
                     std::thread::yield_now();
                 } else {
-                    // Phase 3: park with exponential backoff
+                    // Phase 3: poll-based backoff — interruptible by wake()
                     let backoff_step = miss_count - Self::SPIN_ITERS - Self::YIELD_ITERS;
                     let park_us = Self::PARK_MIN_US
                         .saturating_mul(1u64.wrapping_shl(backoff_step.min(16)))
                         .min(Self::PARK_MAX_US);
-                    std::thread::park_timeout(Duration::from_micros(park_us));
+                    let park_ms = park_us.div_ceil(1000) as i32;
+                    wake.wait(park_ms.max(1));
                 }
             }
         }
@@ -826,6 +827,10 @@ impl ShmClient {
                 }
             }
         };
+
+        // Publish block_idx immediately so stale recovery can find and free
+        // the block if the client dies while the slot is still WRITING.
+        self.region.set_request_block_idx(slot_idx, req_block_idx);
 
         // Write request into block (state is WRITING from try_acquire_slot)
         let write_result = if let Some(body_len) = direct_body_len {
