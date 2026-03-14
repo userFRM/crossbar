@@ -710,8 +710,11 @@ impl ShmClient {
             .alloc_block()
             .ok_or(CrossbarError::ShmPoolExhausted)?;
 
-        // Acquire a slot (with bounded retry)
-        let slot_idx = {
+        // Acquire a slot — try once without Instant::now() (saves ~25 ns)
+        let slot_idx = if let Some(idx) = self.region.try_acquire_slot(self.client_id) {
+            idx
+        } else {
+            // Contention: retry with deadline
             let deadline = std::time::Instant::now() + Duration::from_millis(100);
             loop {
                 if let Some(idx) = self.region.try_acquire_slot(self.client_id) {
