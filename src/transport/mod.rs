@@ -51,7 +51,10 @@ mod uds;
 pub use channel::{ChannelClient, ChannelServer};
 pub use memory::MemoryClient;
 #[cfg(all(unix, feature = "shm"))]
-pub use shm::{ShmClient, ShmConfig, ShmHandle, ShmServer};
+pub use shm::{
+    PubSubConfig, ShmClient, ShmConfig, ShmHandle, ShmLoan, ShmPublisher, ShmSample, ShmSampleRef,
+    ShmServer, ShmSubscriber, ShmSubscription, TopicHandle,
+};
 pub use tcp::{TcpClient, TcpServer};
 #[cfg(unix)]
 pub use uds::{UdsClient, UdsServer};

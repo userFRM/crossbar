@@ -1,8 +1,13 @@
 #![allow(unsafe_code)]
 
 mod notify;
+mod pubsub;
 mod region;
 
+pub use pubsub::{
+    PubSubConfig, ShmLoan, ShmPublisher, ShmSample, ShmSampleRef, ShmSubscriber, ShmSubscription,
+    TopicHandle,
+};
 pub use region::ShmConfig;
 
 use crate::error::CrossbarError;

@@ -28,6 +28,9 @@ pub fn wait_until_not(addr: &AtomicU32, current: u32, timeout: Duration) -> Resu
     }
 
     // Phase 3: platform-specific park
+    // Use the caller's timeout as the futex chunk so sub-10ms stale timeouts
+    // are honored. Cap at 10ms to keep default latency reasonable.
+    let chunk = timeout.min(Duration::from_millis(10));
     let deadline = std::time::Instant::now() + timeout;
     loop {
         let val = addr.load(Ordering::Acquire);
@@ -37,7 +40,7 @@ pub fn wait_until_not(addr: &AtomicU32, current: u32, timeout: Duration) -> Resu
         if std::time::Instant::now() >= deadline {
             return Err(());
         }
-        platform::futex_wait(addr, current, Some(Duration::from_millis(10)));
+        platform::futex_wait(addr, current, Some(chunk));
     }
 }
 

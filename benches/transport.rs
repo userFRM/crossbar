@@ -227,32 +227,15 @@ fn bench_channel(c: &mut Criterion) {
 // 4. SHM — Shared Memory (shm feature)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-/// Wait for a SHM server to become ready by retrying connections.
-#[cfg(all(unix, feature = "shm"))]
-fn wait_for_shm(rt: &tokio::runtime::Runtime, name: &str) {
-    for _ in 0..50 {
-        if rt
-            .block_on(async { ShmClient::connect(name).await })
-            .is_ok()
-        {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    panic!("SHM server '{name}' did not become ready");
-}
-
 #[cfg(all(unix, feature = "shm"))]
 fn bench_shm(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let shm_name = "crossbar-bench";
     let body = order_json_body();
 
-    rt.spawn({
-        let router = make_router();
-        async move { ShmServer::bind(shm_name, router).await.unwrap() }
-    });
-    wait_for_shm(&rt, shm_name);
+    // Use spawn() so the ShmHandle can stop the server when dropped,
+    // preventing the runtime from hanging on drop.
+    let _handle = rt.block_on(async { ShmServer::spawn(shm_name, make_router()).await.unwrap() });
 
     let client = Arc::new(rt.block_on(ShmClient::connect(shm_name)).unwrap());
 
@@ -301,6 +284,155 @@ fn bench_shm(c: &mut Criterion) {
     group.finish();
 
     let _ = std::fs::remove_file("/dev/shm/crossbar-crossbar-bench");
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 4b. Pub/Sub — zero-copy SHM (shm feature)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+#[cfg(all(unix, feature = "shm"))]
+fn bench_pubsub(c: &mut Criterion) {
+    // Create publisher with enough capacity for 1 MB samples
+    let ps_name = "crossbar-bench-ps";
+    let cfg = PubSubConfig {
+        sample_capacity: 1_048_576,
+        max_topics: 3, // only 3 topics registered → ~128 MiB instead of ~1 GiB
+        ..PubSubConfig::default()
+    };
+    let mut pub_ = ShmPublisher::create(ps_name, cfg).unwrap();
+    let h_64b = pub_.register("/bench/64b").unwrap();
+    let h_64kb = pub_.register("/bench/64kb").unwrap();
+    let h_1mb = pub_.register("/bench/1mb").unwrap();
+
+    let sub = ShmSubscriber::connect(ps_name).unwrap();
+    let mut s_64b = sub.subscribe("/bench/64b").unwrap();
+    let mut s_64kb = sub.subscribe("/bench/64kb").unwrap();
+    let mut s_1mb = sub.subscribe("/bench/1mb").unwrap();
+
+    let payload_64b = vec![42u8; 64];
+    let payload_64kb = vec![42u8; 65_536];
+    let payload_1mb = vec![42u8; 1_048_576];
+
+    // ── Zero-copy path: memcpy write + zero-copy read ──────
+    // Publisher: loan_to → memcpy payload into mmap → publish
+    // Subscriber: try_recv_ref → deref (pointer into mmap, no copy)
+    // The *write* is O(n) but the *read* is O(1) — just a pointer deref.
+    // Compare with pubsub_memcpy which copies on both sides.
+    {
+        let mut group = c.benchmark_group("pubsub_zerocopy");
+        group.measurement_time(Duration::from_secs(1));
+
+        group.bench_function("8B", |b| {
+            b.iter(|| {
+                let mut loan = pub_.loan_to(&h_64b);
+                let buf = loan.as_mut_slice();
+                buf[0..8].copy_from_slice(&42u64.to_le_bytes());
+                loan.set_len(8);
+                loan.publish();
+                let s = s_64b.try_recv_ref().unwrap();
+                black_box(&*s);
+            })
+        });
+
+        group.bench_function("64KB", |b| {
+            b.iter(|| {
+                let mut loan = pub_.loan_to(&h_64kb);
+                loan.as_mut_slice()[..payload_64kb.len()].copy_from_slice(&payload_64kb);
+                loan.set_len(payload_64kb.len());
+                loan.publish();
+                let s = s_64kb.try_recv_ref().unwrap();
+                black_box(&*s);
+            })
+        });
+
+        group.bench_function("1MB", |b| {
+            b.iter(|| {
+                let mut loan = pub_.loan_to(&h_1mb);
+                loan.as_mut_slice()[..payload_1mb.len()].copy_from_slice(&payload_1mb);
+                loan.set_len(payload_1mb.len());
+                loan.publish();
+                let s = s_1mb.try_recv_ref().unwrap();
+                black_box(&*s);
+            })
+        });
+
+        group.finish();
+    }
+
+    // ── memcpy path: write_all full payload ────────────────
+    {
+        let mut group = c.benchmark_group("pubsub_memcpy");
+        group.measurement_time(Duration::from_secs(1));
+
+        group.bench_function("64_bytes", |b| {
+            b.iter(|| {
+                let mut loan = pub_.loan_to(&h_64b);
+                loan.set_data(&payload_64b);
+                loan.publish();
+                let s = s_64b.try_recv_ref().unwrap();
+                black_box(&*s);
+            })
+        });
+
+        group.bench_function("64kb", |b| {
+            b.iter(|| {
+                let mut loan = pub_.loan_to(&h_64kb);
+                loan.set_data(&payload_64kb);
+                loan.publish();
+                let s = s_64kb.try_recv_ref().unwrap();
+                black_box(&*s);
+            })
+        });
+
+        group.bench_function("1mb", |b| {
+            b.iter(|| {
+                let mut loan = pub_.loan_to(&h_1mb);
+                loan.set_data(&payload_1mb);
+                loan.publish();
+                let s = s_1mb.try_recv_ref().unwrap();
+                black_box(&*s);
+            })
+        });
+
+        group.finish();
+    }
+
+    // Throughput measurements
+    {
+        let mut group = c.benchmark_group("throughput_pubsub");
+        group.measurement_time(Duration::from_secs(3));
+
+        group.throughput(Throughput::Bytes(65_536));
+        group.bench_function("64kb", |b| {
+            b.iter(|| {
+                let mut loan = pub_.loan_to(&h_64kb);
+                loan.set_data(&payload_64kb);
+                loan.publish();
+                black_box(s_64kb.try_recv().unwrap());
+            })
+        });
+
+        group.finish();
+    }
+
+    {
+        let mut group = c.benchmark_group("throughput_pubsub_1mb");
+        group.throughput(Throughput::Bytes(1_048_576));
+        group.measurement_time(Duration::from_secs(3));
+
+        group.bench_function("1mb", |b| {
+            b.iter(|| {
+                let mut loan = pub_.loan_to(&h_1mb);
+                loan.set_data(&payload_1mb);
+                loan.publish();
+                black_box(s_1mb.try_recv().unwrap());
+            })
+        });
+
+        group.finish();
+    }
+
+    drop(pub_); // removes /dev/shm file
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -445,14 +577,12 @@ fn bench_throughput(c: &mut Criterion) {
 
     // SHM client (separate name from the shm group)
     #[cfg(all(unix, feature = "shm"))]
-    let shm = {
+    let (_shm_handle, shm) = {
         let shm_name = "crossbar-bench-tp";
-        rt.spawn({
-            let router = make_router();
-            async move { ShmServer::bind(shm_name, router).await.unwrap() }
-        });
-        wait_for_shm(&rt, shm_name);
-        Arc::new(rt.block_on(ShmClient::connect(shm_name)).unwrap())
+        let handle =
+            rt.block_on(async { ShmServer::spawn(shm_name, make_router()).await.unwrap() });
+        let client = Arc::new(rt.block_on(ShmClient::connect(shm_name)).unwrap());
+        (handle, client)
     };
 
     // UDS client (separate socket from the uds group) -- Unix only
@@ -570,17 +700,19 @@ criterion_group!(
 #[cfg(all(unix, feature = "shm"))]
 criterion_group!(benches_shm, bench_shm,);
 
+#[cfg(all(unix, feature = "shm"))]
+criterion_group!(benches_pubsub, bench_pubsub,);
+
 #[cfg(unix)]
 criterion_group!(benches_unix, bench_uds,);
 
 #[cfg(all(unix, feature = "shm"))]
-criterion_main!(benches_common, benches_shm, benches_unix);
+criterion_main!(benches_common, benches_shm, benches_pubsub, benches_unix);
 
 #[cfg(all(unix, not(feature = "shm")))]
 criterion_main!(benches_common, benches_unix);
 
-#[cfg(all(not(unix), feature = "shm"))]
-criterion_main!(benches_common, benches_shm);
-
-#[cfg(all(not(unix), not(feature = "shm")))]
+// On non-Unix, SHM groups are not defined (SHM requires Unix), so
+// fall through to common-only regardless of the shm feature flag.
+#[cfg(not(unix))]
 criterion_main!(benches_common);
