@@ -1,3 +1,11 @@
+// Copyright (c) 2026 The Crossbar Contributors
+//
+// This source code is licensed under the MIT license or Apache License 2.0,
+// at your option. See LICENSE-MIT and LICENSE-APACHE files in the project
+// root for details.
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! URI router that dispatches requests to registered handlers.
 //!
 //! The [`Router`] is the central piece of crossbar.  It matches incoming

@@ -1,3 +1,11 @@
+// Copyright (c) 2026 The Crossbar Contributors
+//
+// This source code is licensed under the MIT license or Apache License 2.0,
+// at your option. See LICENSE-MIT and LICENSE-APACHE files in the project
+// root for details.
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Error types for the crossbar crate.
 //!
 //! All fallible operations in crossbar return [`CrossbarError`], which captures
@@ -6,19 +14,7 @@
 
 use std::fmt;
 
-// -- CrossbarError ----
-
-/// The unified error type for all crossbar operations.
-///
-/// # Examples
-///
-/// ```rust
-/// use crossbar::error::CrossbarError;
-///
-/// fn show(e: CrossbarError) {
-///     eprintln!("crossbar error: {e}");
-/// }
-/// ```
+/// Unified error type for all crossbar operations.
 #[derive(Debug)]
 pub enum CrossbarError {
     /// An I/O error occurred on the underlying stream or socket.

@@ -1,3 +1,11 @@
+// Copyright (c) 2026 The Crossbar Contributors
+//
+// This source code is licensed under the MIT license or Apache License 2.0,
+// at your option. See LICENSE-MIT and LICENSE-APACHE files in the project
+// root for details.
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 #![allow(unsafe_code)]
 
 mod bidi;
@@ -69,7 +77,7 @@ impl Drop for ShmHandle {
     }
 }
 
-/// Shared-memory IPC server (V2 — block pool, zero-copy reads).
+/// Shared-memory IPC server.
 ///
 /// Creates a memory-mapped region and serves requests from any [`ShmClient`]
 /// that attaches to the same name. Achieves low-microsecond latency by
@@ -420,6 +428,7 @@ impl PollerWake {
 
 #[cfg(all(unix, not(target_os = "linux")))]
 impl PollerWake {
+    /// Creates a new self-pipe for poller wakeups.
     fn new() -> io::Result<Self> {
         use std::os::fd::FromRawFd;
         let mut fds = [0i32; 2];
@@ -435,6 +444,7 @@ impl PollerWake {
         })
     }
 
+    /// Signal the poller thread to wake up (non-blocking, idempotent).
     fn wake(&self) {
         use std::os::fd::AsRawFd;
         let buf: [u8; 1] = [1];
@@ -444,6 +454,7 @@ impl PollerWake {
         }
     }
 
+    /// Drain the pipe (non-blocking). Returns true if a wake was pending.
     fn try_drain(&self) -> bool {
         use std::os::fd::AsRawFd;
         let mut buf = [0u8; 64];
@@ -472,7 +483,7 @@ impl PollerWake {
 unsafe impl Send for PollerWake {}
 unsafe impl Sync for PollerWake {}
 
-/// Shared-memory IPC client (V2 — inline spin + poller fallback).
+/// Shared-memory IPC client.
 ///
 /// Attaches to an existing shared memory region created by [`ShmServer`].
 /// Uses a two-phase response strategy:

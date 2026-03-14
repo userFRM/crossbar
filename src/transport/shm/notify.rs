@@ -1,4 +1,18 @@
+// Copyright (c) 2026 The Crossbar Contributors
+//
+// This source code is licensed under the MIT license or Apache License 2.0,
+// at your option. See LICENSE-MIT and LICENSE-APACHE files in the project
+// root for details.
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 #![allow(unsafe_code)]
+
+//! Futex-based notification helpers for cross-process synchronization.
+//!
+//! Provides a three-phase wait strategy (spin, yield, futex/poll) and
+//! wake primitives. On Linux, uses the `futex(2)` syscall directly.
+//! On other Unix platforms, falls back to short polling sleeps.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -67,6 +81,16 @@ mod platform {
     use std::sync::atomic::AtomicU32;
     use std::time::Duration;
 
+    /// Blocks the calling thread until `*addr != expected` or `timeout` elapses.
+    ///
+    /// Wraps the Linux `futex(FUTEX_WAIT)` syscall. Spurious wakeups are
+    /// possible and handled by the caller's retry loop.
+    ///
+    /// # Safety
+    ///
+    /// Uses `libc::syscall` with a pointer to a valid `AtomicU32`. The pointer
+    /// is derived via `std::ptr::from_ref` and remains valid for the duration
+    /// of the syscall.
     #[allow(unsafe_code)]
     pub fn futex_wait(addr: &AtomicU32, expected: u32, timeout: Option<Duration>) {
         let ts = timeout.map(|d| libc::timespec {
@@ -87,6 +111,11 @@ mod platform {
         }
     }
 
+    /// Wakes up to `count` threads blocked in `futex_wait` on `addr`.
+    ///
+    /// # Safety
+    ///
+    /// Uses `libc::syscall` with a pointer to a valid `AtomicU32`.
     #[allow(unsafe_code)]
     pub fn futex_wake(addr: &AtomicU32, count: i32) {
         unsafe {
@@ -108,8 +137,11 @@ mod platform {
     use std::sync::atomic::AtomicU32;
     use std::time::Duration;
 
-    // On macOS and other Unix, there's no futex. Use a polling strategy
-    // with short sleeps. The spin+yield phases above handle the fast path.
+    /// Fallback wait for non-Linux Unix (e.g. macOS).
+    ///
+    /// Sleeps for `min(timeout, 1ms)` since there is no futex equivalent.
+    /// The spin+yield phases in [`wait_until_not`](super::wait_until_not)
+    /// handle the fast path; this covers the slow/idle case.
     pub fn futex_wait(_addr: &AtomicU32, _expected: u32, timeout: Option<Duration>) {
         let sleep_time = timeout
             .map(|d| d.min(Duration::from_millis(1)))
@@ -117,7 +149,6 @@ mod platform {
         std::thread::sleep(sleep_time);
     }
 
-    pub fn futex_wake(_addr: &AtomicU32, _count: i32) {
-        // No-op: the polling loop in wait_until_not will pick up the change
-    }
+    /// No-op on non-Linux: the polling loop in `wait_until_not` picks up changes.
+    pub fn futex_wake(_addr: &AtomicU32, _count: i32) {}
 }

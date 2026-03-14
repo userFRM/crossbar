@@ -386,27 +386,18 @@ crossbar/
       shm/
         mod.rs          ShmServer, ShmClient, ShmHandle
         mmap.rs         Raw mmap wrappers (MAP_POPULATE, MADV_HUGEPAGE)
-        region.rs       V2 memory-mapped region, block pool allocator
+        region.rs       Memory-mapped region, block pool allocator
         notify.rs       Futex (Linux) / polling (macOS) wait/wake
-        pubsub.rs       ShmPublisher, ShmSubscriber (ring-based, legacy)
-        pool_pubsub.rs  ShmPoolPublisher, ShmPoolSubscriber (O(1) pub/sub)
+        pubsub.rs       ShmPublisher, ShmSubscriber (ring-based pub/sub)
+        pool_pubsub.rs  ShmPoolPublisher, ShmPoolSubscriber (O(1) pool pub/sub)
+        bidi.rs         BidiServer, BidiClient (RPC + server-push events)
   crossbar-macros/      #[handler] and #[derive(IntoResponse)] proc macros
   examples/
     demo.rs             In-process + SHM latency comparison
-  tests/                244 tests (transport, stress, routing, handler, macros, types, doc-tests)
+  tests/                Integration and stress tests
   benches/
     transport.rs        Criterion benchmarks
 ```
-
----
-
-## Roadmap
-
-- ~~**Dedicated SHM poller**~~ — **done** (inline spin + OS threads, 757 ns)
-- **Born-in-SHM responses** — handlers write directly into pool blocks for true O(1) end-to-end
-- **Bidirectional RPC** — server can push to clients over the same region
-- **HTTP bridge** — serve crossbar routes over hyper/axum
-- **Middleware** — composable interceptors (logging, auth, metrics)
 
 ---
 

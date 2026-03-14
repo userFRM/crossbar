@@ -1,13 +1,20 @@
+// Copyright (c) 2026 The Crossbar Contributors
+//
+// This source code is licensed under the MIT license or Apache License 2.0,
+// at your option. See LICENSE-MIT and LICENSE-APACHE files in the project
+// root for details.
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 #![allow(unsafe_code)]
 
-//! Zero-copy pub/sub over shared memory.
+//! Seqlock-based pub/sub over shared memory.
 //!
 //! Data is never serialized or deserialized by the transport — the publisher
 //! writes raw bytes directly into mmap, the subscriber reads them in-place.
-//! What those bytes mean (JSON, rkyv, protobuf, a raw struct) is entirely
-//! the user's business.
+//! What those bytes mean is entirely the user's business.
 //!
-//! Per-publish overhead: one `memcpy` (data into mmap) + two atomic stores.
+//! Per-publish overhead: one copy (data into mmap) + two atomic stores.
 //! No URI, no headers, no method byte, no syscall — just bytes.
 
 use std::io;
@@ -685,8 +692,7 @@ pub struct ShmLoan<'a> {
 }
 
 impl<'a> ShmLoan<'a> {
-    /// Returns the writable region as a mutable slice. You can write
-    /// directly into this slice for structs, `rkyv`, `memcpy`, etc.
+    /// Returns the writable region as a mutable slice.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.data_ptr, self.capacity) }
     }
@@ -1372,9 +1378,6 @@ impl ShmSubscription {
 /// An owned snapshot of a published sample. Data is copied from shared
 /// memory within the seqlock-checked window, so the bytes are guaranteed
 /// consistent — no risk of torn reads from a concurrent publisher.
-///
-/// Parse however you like: `serde_json`, `sonic_rs`, `rkyv`, `bytemuck`,
-/// or just read the raw bytes. The transport doesn't care.
 pub struct ShmSample {
     data: Box<[u8]>,
 }

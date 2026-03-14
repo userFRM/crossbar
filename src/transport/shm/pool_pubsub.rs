@@ -1,3 +1,11 @@
+// Copyright (c) 2026 The Crossbar Contributors
+//
+// This source code is licensed under the MIT license or Apache License 2.0,
+// at your option. See LICENSE-MIT and LICENSE-APACHE files in the project
+// root for details.
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 #![allow(unsafe_code)]
 #![allow(dead_code)] // Types are used by consumers; not internally cross-referenced
 
@@ -641,7 +649,6 @@ pub struct ShmPoolLoan<'a> {
 
 impl<'a> ShmPoolLoan<'a> {
     /// Returns the writable data region as a mutable slice.
-    /// Write directly for structs, rkyv, protobuf, etc.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.data_ptr, self.capacity) }
     }

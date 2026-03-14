@@ -1,3 +1,11 @@
+// Copyright (c) 2026 The Crossbar Contributors
+//
+// This source code is licensed under the MIT license or Apache License 2.0,
+// at your option. See LICENSE-MIT and LICENSE-APACHE files in the project
+// root for details.
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 #![allow(unsafe_code)]
 
 use super::mmap::RawMmap;
@@ -47,7 +55,7 @@ pub const GLOBAL_HEADER_SIZE: usize = 128;
 /// Size of each coordination slot, in bytes.
 pub const SLOT_SIZE: usize = 64;
 
-// Sentinel for "no block assigned"
+/// Sentinel for "no block assigned" in slot block-index fields.
 pub(crate) const NO_BLOCK: u32 = u32::MAX;
 
 /// Slot state: no request is pending; the slot is available for acquisition.
@@ -122,24 +130,28 @@ pub fn shm_path(name: &str) -> PathBuf {
 
 // -- Treiber stack helpers --
 
+/// Packs a generation counter and block index into a single `u64` for
+/// the Treiber stack head (ABA-safe CAS).
 #[inline]
 fn pack(gen: u32, idx: u32) -> u64 {
     u64::from(gen) << 32 | u64::from(idx)
 }
 
+/// Unpacks a `u64` Treiber stack head into `(generation, block_index)`.
 #[inline]
 #[allow(clippy::cast_possible_truncation)] // intentional: extracting u32 halves from a u64
 fn unpack(val: u64) -> (u32, u32) {
     ((val >> 32) as u32, val as u32)
 }
 
+/// Computes the total region size in bytes, returning `None` on overflow.
 fn region_size(config: &ShmConfig) -> Option<usize> {
     let slots = (config.slot_count as usize).checked_mul(SLOT_SIZE)?;
     let blocks = (config.block_count as usize).checked_mul(config.block_size as usize)?;
     GLOBAL_HEADER_SIZE.checked_add(slots)?.checked_add(blocks)
 }
 
-/// Handle to a V2 memory-mapped shared region with a lock-free block pool.
+/// Handle to a memory-mapped shared region with a lock-free block pool.
 ///
 /// The region layout is: global header (128 bytes) | coordination slots |
 /// data blocks. Coordination slots track request/response state machines;
@@ -167,7 +179,7 @@ unsafe impl Send for ShmRegion {}
 unsafe impl Sync for ShmRegion {}
 
 impl ShmRegion {
-    /// Creates a new V2 shared memory region (server side).
+    /// Creates a new shared memory region (server side).
     ///
     /// # Errors
     ///
@@ -266,7 +278,7 @@ impl ShmRegion {
         Ok(region)
     }
 
-    /// Opens an existing V2 shared memory region (client side).
+    /// Opens an existing shared memory region (client side).
     ///
     /// # Errors
     ///
@@ -426,6 +438,7 @@ impl ShmRegion {
 
     // -- Pool allocator (Treiber stack) --
 
+    /// Returns a reference to the Treiber stack head (offset 0x28 in global header).
     #[allow(clippy::cast_ptr_alignment)] // offset 0x28 is 8-byte aligned within the header
     fn pool_head(&self) -> &AtomicU64 {
         unsafe { &*self.mmap.as_ptr().add(0x28).cast::<AtomicU64>() }
@@ -445,6 +458,7 @@ impl ShmRegion {
         self.pool_head().store(pack(0, 0), Ordering::Release);
     }
 
+    /// Reads the next-free pointer from the start of block `idx`.
     fn read_block_next_free(&self, idx: u32) -> u32 {
         let ptr = self.block_ptr(idx);
         unsafe {
@@ -454,6 +468,7 @@ impl ShmRegion {
         }
     }
 
+    /// Writes the next-free pointer into the start of block `idx`.
     fn write_block_next_free(&self, idx: u32, next: u32) {
         let ptr = self.block_ptr(idx);
         unsafe {
@@ -528,7 +543,7 @@ impl ShmRegion {
         unsafe { self.mmap.as_ptr().add(offset).cast_mut() }
     }
 
-    /// Returns a slice of the block's data region.
+    /// Returns a byte slice of `len` bytes starting at `offset` within block `idx`.
     fn block_slice(&self, idx: u32, offset: usize, len: usize) -> &[u8] {
         let ptr = self.block_ptr(idx);
         unsafe { std::slice::from_raw_parts(ptr.add(offset), len) }
@@ -536,6 +551,7 @@ impl ShmRegion {
 
     // -- Slot access --
 
+    /// Returns a raw pointer to the start of coordination slot `idx`.
     fn slot_base(&self, idx: u32) -> *mut u8 {
         debug_assert!((idx as usize) < self.slot_count as usize);
         unsafe {
@@ -611,6 +627,7 @@ impl ShmRegion {
         unsafe { *self.slot_base(idx).add(0x18) }
     }
 
+    /// Reads a little-endian `u32` from slot `idx` at byte `offset`.
     fn read_slot_u32(&self, idx: u32, offset: usize) -> u32 {
         unsafe {
             let ptr = self.slot_base(idx).add(offset);
@@ -620,6 +637,7 @@ impl ShmRegion {
         }
     }
 
+    /// Writes a little-endian `u32` to slot `idx` at byte `offset`.
     fn write_slot_u32(&self, idx: u32, offset: usize, val: u32) {
         unsafe {
             let ptr = self.slot_base(idx).add(offset);
@@ -627,6 +645,7 @@ impl ShmRegion {
         }
     }
 
+    /// Reads a little-endian `u16` from slot `idx` at byte `offset`.
     fn read_slot_u16(&self, idx: u32, offset: usize) -> u16 {
         unsafe {
             let ptr = self.slot_base(idx).add(offset);
@@ -636,6 +655,7 @@ impl ShmRegion {
         }
     }
 
+    /// Writes a little-endian `u16` to slot `idx` at byte `offset`.
     fn write_slot_u16(&self, idx: u32, offset: usize, val: u16) {
         unsafe {
             let ptr = self.slot_base(idx).add(offset);
@@ -643,7 +663,7 @@ impl ShmRegion {
         }
     }
 
-    // Slot field accessors per V2 layout:
+    // Slot field accessors — coordination slot layout:
     // 0x1C: uri_len (u32)
     // 0x20: body_len (u32)
     // 0x24: headers_data_len (u32)

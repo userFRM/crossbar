@@ -24,6 +24,7 @@ libc = { version = "0.2.183", optional = true }
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["async_tokio"] }
 tokio = { version = "1.50.0", features = ["full"] }
+iceoryx2 = "0.8.1"
 
 [[example]]
 name = "demo"

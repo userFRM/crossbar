@@ -1,3 +1,11 @@
+// Copyright (c) 2026 The Crossbar Contributors
+//
+// This source code is licensed under the MIT license or Apache License 2.0,
+// at your option. See LICENSE-MIT and LICENSE-APACHE files in the project
+// root for details.
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! # Crossbar
 //!
 //! **Transport-polymorphic URI router** -- define your handlers once and serve
@@ -57,10 +65,15 @@
 #![warn(missing_docs)]
 #![deny(unsafe_code)]
 
+/// Error types returned by crossbar operations.
 pub mod error;
+/// Handler trait and sync/async adapters.
 pub mod handler;
+/// URI-based request router.
 pub mod router;
+/// Transport implementations (in-process, shared memory).
 pub mod transport;
+/// Core request, response, and serialization types.
 pub mod types;
 
 /// Re-export procedural macros from `crossbar-macros`.

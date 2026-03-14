@@ -1,3 +1,11 @@
+// Copyright (c) 2026 The Crossbar Contributors
+//
+// This source code is licensed under the MIT license or Apache License 2.0,
+// at your option. See LICENSE-MIT and LICENSE-APACHE files in the project
+// root for details.
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 #![allow(unsafe_code)]
 
 //! Raw mmap wrappers with `MADV_HUGEPAGE`.
@@ -37,8 +45,10 @@ pub struct RawMmap {
     len: usize,
 }
 
-// SAFETY: The mmap region is process-shared memory. All cross-process access
-// is mediated by atomic operations in the caller (region.rs, pubsub.rs).
+// SAFETY: The mmap region is process-shared memory backed by a named file in
+// /dev/shm. All cross-process access is mediated by atomic operations in the
+// caller (region.rs, pool_pubsub.rs). The raw pointer is never dereferenced
+// without explicit unsafe blocks in those callers.
 unsafe impl Send for RawMmap {}
 unsafe impl Sync for RawMmap {}
 
@@ -55,6 +65,12 @@ impl RawMmap {
     ///
     /// Use this when you've just called `file.set_len()` and want to map
     /// exactly that many bytes (avoids an extra `fstat` call).
+    ///
+    /// # Safety considerations
+    ///
+    /// The returned mapping uses `MAP_SHARED`, so the memory is shared with
+    /// other processes. Callers must use atomic operations or other
+    /// synchronization to coordinate access.
     pub fn from_file_with_len(file: &std::fs::File, len: usize) -> io::Result<Self> {
         if len == 0 {
             return Err(io::Error::new(
@@ -63,6 +79,8 @@ impl RawMmap {
             ));
         }
 
+        // SAFETY: We pass a valid fd, non-zero length, and standard flags.
+        // The returned pointer is checked against MAP_FAILED before use.
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -79,8 +97,9 @@ impl RawMmap {
         }
 
         #[cfg(target_os = "linux")]
+        // SAFETY: ptr is a valid mmap region of `len` bytes. MADV_HUGEPAGE is
+        // advisory — failure is silently ignored if THP is disabled system-wide.
         unsafe {
-            // Best-effort: fails silently if THP is disabled system-wide
             libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
         }
 
@@ -112,6 +131,8 @@ impl RawMmap {
 
 impl Drop for RawMmap {
     fn drop(&mut self) {
+        // SAFETY: ptr and len were produced by a successful mmap call in
+        // from_file_with_len and have not been modified since.
         unsafe {
             libc::munmap(self.ptr as *mut libc::c_void, self.len);
         }
@@ -135,6 +156,8 @@ pub struct RawMmapReadOnly {
     len: usize,
 }
 
+// SAFETY: Same rationale as RawMmap — the pointer references process-shared
+// memory and all access is mediated by atomics in the caller.
 unsafe impl Send for RawMmapReadOnly {}
 unsafe impl Sync for RawMmapReadOnly {}
 
@@ -161,14 +184,14 @@ impl RawMmapReadOnly {
             ));
         }
 
-        let flags = libc::MAP_SHARED;
-
+        // SAFETY: We pass a valid fd, non-zero length, and standard flags.
+        // The returned pointer is checked against MAP_FAILED before use.
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
                 len,
                 libc::PROT_READ,
-                flags,
+                libc::MAP_SHARED,
                 file.as_raw_fd(),
                 0,
             )
@@ -179,6 +202,7 @@ impl RawMmapReadOnly {
         }
 
         #[cfg(target_os = "linux")]
+        // SAFETY: ptr is a valid mmap region of `len` bytes. Advisory only.
         unsafe {
             libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
         }
@@ -205,6 +229,8 @@ impl RawMmapReadOnly {
 
 impl Drop for RawMmapReadOnly {
     fn drop(&mut self) {
+        // SAFETY: ptr and len were produced by a successful mmap call in
+        // from_file_with_len and have not been modified since.
         unsafe {
             libc::munmap(self.ptr as *mut libc::c_void, self.len);
         }
