@@ -1,18 +1,7 @@
 use crossbar::prelude::*;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 
-// ── Helpers ────────────────────────────────────────────
-
-static STRESS_PORT: AtomicU16 = AtomicU16::new(20_000);
-
-fn next_port() -> u16 {
-    STRESS_PORT.fetch_add(1, Ordering::SeqCst)
-}
-
-fn uds_path(name: &str) -> String {
-    format!("/tmp/crossbar-stress-{name}-{}.sock", std::process::id())
-}
+// -- Helpers ----
 
 fn echo_router() -> Router {
     Router::new()
@@ -23,9 +12,9 @@ fn echo_router() -> Router {
         )
 }
 
-// ═══════════════════════════════════════════════════════
+// ===============================================
 // 100 concurrent memory requests
-// ═══════════════════════════════════════════════════════
+// ===============================================
 
 #[tokio::test]
 async fn stress_memory_100_concurrent() {
@@ -46,75 +35,9 @@ async fn stress_memory_100_concurrent() {
     }
 }
 
-// ═══════════════════════════════════════════════════════
-// 50 concurrent UDS requests (separate clients per task)
-// ═══════════════════════════════════════════════════════
-
-#[cfg(unix)]
-#[tokio::test]
-async fn stress_uds_50_concurrent() {
-    let path = uds_path("stress_uds_50");
-    let router = echo_router();
-
-    tokio::spawn({
-        let path = path.clone();
-        async move { UdsServer::bind(&path, router).await.unwrap() }
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    let mut handles = Vec::new();
-    for i in 0..50 {
-        let path = path.clone();
-        handles.push(tokio::spawn(async move {
-            let client = UdsClient::connect(&path).await.unwrap();
-            let resp = client.post("/echo", format!("uds-{i}")).await.unwrap();
-            assert_eq!(resp.status, 200);
-            assert_eq!(resp.body_str(), format!("uds-{i}"));
-        }));
-    }
-
-    for h in handles {
-        h.await.unwrap();
-    }
-
-    let _ = std::fs::remove_file(&path);
-}
-
-// ═══════════════════════════════════════════════════════
-// 50 concurrent TCP requests
-// ═══════════════════════════════════════════════════════
-
-#[tokio::test]
-async fn stress_tcp_50_concurrent() {
-    let port = next_port();
-    let addr = format!("127.0.0.1:{port}");
-    let router = echo_router();
-
-    tokio::spawn({
-        let addr = addr.clone();
-        async move { TcpServer::bind(&addr, router).await.unwrap() }
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    let mut handles = Vec::new();
-    for i in 0..50 {
-        let addr = addr.clone();
-        handles.push(tokio::spawn(async move {
-            let client = TcpClient::connect(&addr).await.unwrap();
-            let resp = client.post("/echo", format!("tcp-{i}")).await.unwrap();
-            assert_eq!(resp.status, 200);
-            assert_eq!(resp.body_str(), format!("tcp-{i}"));
-        }));
-    }
-
-    for h in handles {
-        h.await.unwrap();
-    }
-}
-
-// ═══════════════════════════════════════════════════════
+// ===============================================
 // Large number of routes (100+ routes, correct dispatch)
-// ═══════════════════════════════════════════════════════
+// ===============================================
 
 #[tokio::test]
 async fn stress_100_routes_dispatch() {
@@ -152,108 +75,9 @@ async fn stress_100_routes_dispatch() {
     assert_eq!(router.routes_info().len(), 150);
 }
 
-// ═══════════════════════════════════════════════════════
-// Rapid sequential requests on persistent connection (1000)
-// ═══════════════════════════════════════════════════════
-
-#[cfg(unix)]
-#[tokio::test]
-async fn stress_rapid_sequential_uds_1000() {
-    let path = uds_path("stress_rapid_uds");
-    let router = echo_router();
-
-    tokio::spawn({
-        let path = path.clone();
-        async move { UdsServer::bind(&path, router).await.unwrap() }
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    let client = UdsClient::connect(&path).await.unwrap();
-
-    for i in 0..1000 {
-        let resp = client.get("/health").await.unwrap();
-        assert_eq!(resp.status, 200, "request {i} failed");
-        assert_eq!(resp.body_str(), "ok");
-    }
-
-    let _ = std::fs::remove_file(&path);
-}
-
-#[tokio::test]
-async fn stress_rapid_sequential_tcp_1000() {
-    let port = next_port();
-    let addr = format!("127.0.0.1:{port}");
-    let router = echo_router();
-
-    tokio::spawn({
-        let addr = addr.clone();
-        async move { TcpServer::bind(&addr, router).await.unwrap() }
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    let client = TcpClient::connect(&addr).await.unwrap();
-
-    for i in 0..1000 {
-        let resp = client.get("/health").await.unwrap();
-        assert_eq!(resp.status, 200, "request {i} failed");
-        assert_eq!(resp.body_str(), "ok");
-    }
-}
-
-// ═══════════════════════════════════════════════════════
-// Channel with multiple producers
-// ═══════════════════════════════════════════════════════
-
-#[tokio::test]
-async fn stress_channel_multiple_producers() {
-    let client = ChannelServer::spawn(echo_router());
-
-    let mut handles = Vec::new();
-    for i in 0..50 {
-        let client = client.clone();
-        handles.push(tokio::spawn(async move {
-            for j in 0..10 {
-                let resp = client
-                    .post("/echo", format!("producer-{i}-msg-{j}"))
-                    .await
-                    .unwrap();
-                assert_eq!(resp.status, 200);
-                assert_eq!(resp.body_str(), format!("producer-{i}-msg-{j}"));
-            }
-        }));
-    }
-
-    for h in handles {
-        h.await.unwrap();
-    }
-}
-
-// ═══════════════════════════════════════════════════════
-// Concurrent channel requests (100)
-// ═══════════════════════════════════════════════════════
-
-#[tokio::test]
-async fn stress_channel_100_concurrent() {
-    let client = ChannelServer::spawn(echo_router());
-
-    let mut handles = Vec::new();
-    for i in 0..100 {
-        let client = client.clone();
-        handles.push(tokio::spawn(async move {
-            let resp = client.post("/echo", format!("chan-{i}")).await.unwrap();
-            assert_eq!(resp.status, 200);
-            assert_eq!(resp.body_str(), format!("chan-{i}"));
-        }));
-    }
-
-    for h in handles {
-        h.await.unwrap();
-    }
-}
-
-// ═══════════════════════════════════════════════════════
+// ===============================================
 // Memory rapid sequential (1000)
-// ═══════════════════════════════════════════════════════
+// ===============================================
 
 #[tokio::test]
 async fn stress_memory_rapid_1000() {
@@ -265,9 +89,9 @@ async fn stress_memory_rapid_1000() {
     }
 }
 
-// ═══════════════════════════════════════════════════════
+// ===============================================
 // 50 concurrent SHM requests
-// ═══════════════════════════════════════════════════════
+// ===============================================
 
 #[cfg(all(unix, feature = "shm"))]
 fn shm_name(name: &str) -> String {
@@ -309,9 +133,59 @@ async fn stress_shm_50_concurrent() {
     cleanup_shm(&name);
 }
 
-// ═══════════════════════════════════════════════════════
+// ===============================================
 // Rapid sequential SHM requests (1000)
-// ═══════════════════════════════════════════════════════
+// ===============================================
+
+// ===============================================
+// Concurrent SHM slot allocation
+// ===============================================
+
+/// Multiple clients racing for slots simultaneously.
+/// Verifies that concurrent CAS-based slot acquisition is safe.
+#[cfg(all(unix, feature = "shm"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shm_concurrent_pool_allocation() {
+    let name = shm_name("shm_pool_alloc");
+    let config = ShmConfig {
+        slot_count: 8,
+        block_size: 4096,
+        ..ShmConfig::default()
+    };
+
+    let _handle = ShmServer::spawn_with_config(&name, echo_router(), config)
+        .await
+        .unwrap();
+
+    // Create multiple independent clients to maximize contention
+    let mut handles = Vec::new();
+    for i in 0..20 {
+        let name = name.clone();
+        handles.push(tokio::spawn(async move {
+            let client = ShmClient::connect_with_timeout(&name, std::time::Duration::from_secs(30))
+                .await
+                .unwrap();
+            for j in 0..10 {
+                let resp = client
+                    .post("/echo", format!("client-{i}-msg-{j}"))
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status, 200);
+                assert_eq!(resp.body_str(), format!("client-{i}-msg-{j}"));
+            }
+        }));
+    }
+
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    cleanup_shm(&name);
+}
+
+// ===============================================
+// Rapid sequential SHM requests (1000)
+// ===============================================
 
 #[cfg(all(unix, feature = "shm"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

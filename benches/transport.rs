@@ -1,9 +1,10 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use crossbar::prelude::*;
+#[cfg(all(unix, feature = "shm"))]
 use std::sync::Arc;
 use std::time::Duration;
 
-// ── Handlers ────────────────────────────────────────────────
+// -- Handlers ----
 
 async fn health() -> &'static str {
     "ok"
@@ -33,7 +34,7 @@ async fn large_payload_1m(_req: Request) -> Response {
     Response::ok().with_body(vec![42u8; 1_048_576])
 }
 
-// ── Shared router ───────────────────────────────────────────
+// -- Shared router ----
 
 fn make_router() -> Router {
     Router::new()
@@ -44,7 +45,7 @@ fn make_router() -> Router {
         .route("/large/1m", get(large_payload_1m))
 }
 
-// ── JSON body for POST benchmarks ───────────────────────────
+// -- JSON body for POST benchmarks ----
 
 fn order_json_body() -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
@@ -56,40 +57,9 @@ fn order_json_body() -> Vec<u8> {
     .unwrap()
 }
 
-// ── Server readiness helpers ────────────────────────────────
-
-/// Wait for a TCP server to become ready by retrying connections.
-fn wait_for_tcp(rt: &tokio::runtime::Runtime, addr: &str) {
-    for _ in 0..50 {
-        if rt
-            .block_on(async { tokio::net::TcpStream::connect(addr).await })
-            .is_ok()
-        {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    panic!("TCP server at {addr} did not become ready");
-}
-
-/// Wait for a UDS server to become ready by retrying connections.
-#[cfg(unix)]
-fn wait_for_uds(rt: &tokio::runtime::Runtime, path: &str) {
-    for _ in 0..50 {
-        if rt
-            .block_on(async { tokio::net::UnixStream::connect(path).await })
-            .is_ok()
-        {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    panic!("UDS server at {path} did not become ready");
-}
-
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// 1. Dispatch — router dispatch only (via MemoryClient, zero transport)
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ====================================================
+// 1. Dispatch -- router dispatch only (via MemoryClient, zero transport)
+// ====================================================
 
 fn bench_dispatch(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -120,9 +90,9 @@ fn bench_dispatch(c: &mut Criterion) {
     group.finish();
 }
 
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// 2. Memory — in-process MemoryClient
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ====================================================
+// 2. Memory -- in-process MemoryClient
+// ====================================================
 
 fn bench_memory(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -169,63 +139,9 @@ fn bench_memory(c: &mut Criterion) {
     group.finish();
 }
 
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// 3. Channel — tokio::mpsc ChannelClient
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-fn bench_channel(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let client = rt.block_on(async { ChannelServer::spawn(make_router()) });
-    let body = order_json_body();
-
-    let mut group = c.benchmark_group("channel");
-    group.measurement_time(Duration::from_millis(500));
-
-    group.bench_function("health", |b| {
-        let client = &client;
-        b.to_async(&rt)
-            .iter(|| async { black_box(client.get("/health").await.unwrap()) })
-    });
-
-    group.bench_function("ohlc", |b| {
-        let client = &client;
-        b.to_async(&rt).iter(|| async {
-            black_box(
-                client
-                    .get("/v3/stock/snapshot/ohlc/AAPL?venue=nqb")
-                    .await
-                    .unwrap(),
-            )
-        })
-    });
-
-    group.bench_function("post_json", |b| {
-        let client = &client;
-        let body = body.clone();
-        b.to_async(&rt).iter(|| {
-            let body = body.clone();
-            async { black_box(client.post("/v3/stock/order", body).await.unwrap()) }
-        })
-    });
-
-    group.bench_function("large_64kb", |b| {
-        let client = &client;
-        b.to_async(&rt)
-            .iter(|| async { black_box(client.get("/large/64k").await.unwrap()) })
-    });
-
-    group.bench_function("large_1mb", |b| {
-        let client = &client;
-        b.to_async(&rt)
-            .iter(|| async { black_box(client.get("/large/1m").await.unwrap()) })
-    });
-
-    group.finish();
-}
-
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// 4. SHM — Shared Memory (shm feature)
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ====================================================
+// 3. SHM -- Shared Memory (shm feature)
+// ====================================================
 
 #[cfg(all(unix, feature = "shm"))]
 fn bench_shm(c: &mut Criterion) {
@@ -233,8 +149,6 @@ fn bench_shm(c: &mut Criterion) {
     let shm_name = "crossbar-bench";
     let body = order_json_body();
 
-    // Use spawn() so the ShmHandle can stop the server when dropped,
-    // preventing the runtime from hanging on drop.
     let _handle = rt.block_on(async { ShmServer::spawn(shm_name, make_router()).await.unwrap() });
 
     let client = Arc::new(rt.block_on(ShmClient::connect(shm_name)).unwrap());
@@ -286,9 +200,9 @@ fn bench_shm(c: &mut Criterion) {
     let _ = std::fs::remove_file("/dev/shm/crossbar-crossbar-bench");
 }
 
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// 4b. Pub/Sub — zero-copy SHM (shm feature)
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ====================================================
+// 3b. Pub/Sub -- zero-copy SHM (shm feature)
+// ====================================================
 
 #[cfg(all(unix, feature = "shm"))]
 fn bench_pubsub(c: &mut Criterion) {
@@ -296,7 +210,7 @@ fn bench_pubsub(c: &mut Criterion) {
     let ps_name = "crossbar-bench-ps";
     let cfg = PubSubConfig {
         sample_capacity: 1_048_576,
-        max_topics: 3, // only 3 topics registered → ~128 MiB instead of ~1 GiB
+        max_topics: 3, // only 3 topics registered
         ..PubSubConfig::default()
     };
     let mut pub_ = ShmPublisher::create(ps_name, cfg).unwrap();
@@ -313,11 +227,7 @@ fn bench_pubsub(c: &mut Criterion) {
     let payload_64kb = vec![42u8; 65_536];
     let payload_1mb = vec![42u8; 1_048_576];
 
-    // ── Zero-copy path: memcpy write + zero-copy read ──────
-    // Publisher: loan_to → memcpy payload into mmap → publish
-    // Subscriber: try_recv_ref → deref (pointer into mmap, no copy)
-    // The *write* is O(n) but the *read* is O(1) — just a pointer deref.
-    // Compare with pubsub_memcpy which copies on both sides.
+    // -- Zero-copy path: memcpy write + zero-copy read --
     {
         let mut group = c.benchmark_group("pubsub_zerocopy");
         group.measurement_time(Duration::from_secs(1));
@@ -359,7 +269,7 @@ fn bench_pubsub(c: &mut Criterion) {
         group.finish();
     }
 
-    // ── memcpy path: write_all full payload ────────────────
+    // -- memcpy path: write_all full payload --
     {
         let mut group = c.benchmark_group("pubsub_memcpy");
         group.measurement_time(Duration::from_secs(1));
@@ -435,139 +345,9 @@ fn bench_pubsub(c: &mut Criterion) {
     drop(pub_); // removes /dev/shm file
 }
 
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// 5. UDS — Unix Domain Socket (Unix only)
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-#[cfg(unix)]
-fn bench_uds(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let sock = "/tmp/crossbar-bench.sock";
-    let body = order_json_body();
-
-    rt.spawn({
-        let router = make_router();
-        let p = sock.to_string();
-        async move { UdsServer::bind(&p, router).await.unwrap() }
-    });
-    wait_for_uds(&rt, sock);
-
-    // UdsClient is wrapped in Arc because it is not Clone (uses internal Mutex).
-    let client = Arc::new(rt.block_on(UdsClient::connect(sock)).unwrap());
-
-    let mut group = c.benchmark_group("uds");
-    group.measurement_time(Duration::from_secs(1));
-
-    group.bench_function("health", |b| {
-        let client = client.clone();
-        b.to_async(&rt)
-            .iter(|| async { black_box(client.get("/health").await.unwrap()) })
-    });
-
-    group.bench_function("ohlc", |b| {
-        let client = client.clone();
-        b.to_async(&rt).iter(|| async {
-            black_box(
-                client
-                    .get("/v3/stock/snapshot/ohlc/AAPL?venue=nqb")
-                    .await
-                    .unwrap(),
-            )
-        })
-    });
-
-    group.bench_function("post_json", |b| {
-        let client = client.clone();
-        let body = body.clone();
-        b.to_async(&rt).iter(|| {
-            let body = body.clone();
-            async { black_box(client.post("/v3/stock/order", body).await.unwrap()) }
-        })
-    });
-
-    group.bench_function("large_64kb", |b| {
-        let client = client.clone();
-        b.to_async(&rt)
-            .iter(|| async { black_box(client.get("/large/64k").await.unwrap()) })
-    });
-
-    group.bench_function("large_1mb", |b| {
-        let client = client.clone();
-        b.to_async(&rt)
-            .iter(|| async { black_box(client.get("/large/1m").await.unwrap()) })
-    });
-
-    group.finish();
-
-    let _ = std::fs::remove_file(sock);
-}
-
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// 6. TCP — with NODELAY
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-fn bench_tcp(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let addr = "127.0.0.1:19877";
-    let body = order_json_body();
-
-    rt.spawn({
-        let router = make_router();
-        let a = addr.to_string();
-        async move { TcpServer::bind(&a, router).await.unwrap() }
-    });
-    wait_for_tcp(&rt, addr);
-
-    let client = Arc::new(rt.block_on(TcpClient::connect(addr)).unwrap());
-
-    let mut group = c.benchmark_group("tcp");
-    group.measurement_time(Duration::from_secs(1));
-
-    group.bench_function("health", |b| {
-        let client = client.clone();
-        b.to_async(&rt)
-            .iter(|| async { black_box(client.get("/health").await.unwrap()) })
-    });
-
-    group.bench_function("ohlc", |b| {
-        let client = client.clone();
-        b.to_async(&rt).iter(|| async {
-            black_box(
-                client
-                    .get("/v3/stock/snapshot/ohlc/AAPL?venue=nqb")
-                    .await
-                    .unwrap(),
-            )
-        })
-    });
-
-    group.bench_function("post_json", |b| {
-        let client = client.clone();
-        let body = body.clone();
-        b.to_async(&rt).iter(|| {
-            let body = body.clone();
-            async { black_box(client.post("/v3/stock/order", body).await.unwrap()) }
-        })
-    });
-
-    group.bench_function("large_64kb", |b| {
-        let client = client.clone();
-        b.to_async(&rt)
-            .iter(|| async { black_box(client.get("/large/64k").await.unwrap()) })
-    });
-
-    group.bench_function("large_1mb", |b| {
-        let client = client.clone();
-        b.to_async(&rt)
-            .iter(|| async { black_box(client.get("/large/1m").await.unwrap()) })
-    });
-
-    group.finish();
-}
-
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// 7. Throughput — bytes/sec measurements for large payloads
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ====================================================
+// 4. Throughput -- bytes/sec measurements for large payloads
+// ====================================================
 
 fn bench_throughput(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -585,31 +365,7 @@ fn bench_throughput(c: &mut Criterion) {
         (handle, client)
     };
 
-    // UDS client (separate socket from the uds group) -- Unix only
-    #[cfg(unix)]
-    let uds = {
-        let uds_sock = "/tmp/crossbar-bench-tp.sock";
-        rt.spawn({
-            let router = make_router();
-            let p = uds_sock.to_string();
-            async move { UdsServer::bind(&p, router).await.unwrap() }
-        });
-        wait_for_uds(&rt, uds_sock);
-        // UdsClient is wrapped in Arc because it is not Clone (uses internal Mutex).
-        Arc::new(rt.block_on(UdsClient::connect(uds_sock)).unwrap())
-    };
-
-    // TCP client (separate port from the tcp group)
-    let tcp_addr = "127.0.0.1:19878";
-    rt.spawn({
-        let router = make_router();
-        let a = tcp_addr.to_string();
-        async move { TcpServer::bind(&a, router).await.unwrap() }
-    });
-    wait_for_tcp(&rt, tcp_addr);
-    let tcp = Arc::new(rt.block_on(TcpClient::connect(tcp_addr)).unwrap());
-
-    // ── 64KB throughput ─────────────────────────────────────
+    // -- 64KB throughput --
     {
         let mut group = c.benchmark_group("throughput/64kb");
         group.throughput(Throughput::Bytes(65_536));
@@ -628,23 +384,10 @@ fn bench_throughput(c: &mut Criterion) {
                 .iter(|| async { black_box(shm.get("/large/64k").await.unwrap()) })
         });
 
-        #[cfg(unix)]
-        group.bench_function("uds", |b| {
-            let uds = uds.clone();
-            b.to_async(&rt)
-                .iter(|| async { black_box(uds.get("/large/64k").await.unwrap()) })
-        });
-
-        group.bench_function("tcp", |b| {
-            let tcp = tcp.clone();
-            b.to_async(&rt)
-                .iter(|| async { black_box(tcp.get("/large/64k").await.unwrap()) })
-        });
-
         group.finish();
     }
 
-    // ── 1MB throughput ──────────────────────────────────────
+    // -- 1MB throughput --
     {
         let mut group = c.benchmark_group("throughput/1mb");
         group.throughput(Throughput::Bytes(1_048_576));
@@ -663,37 +406,20 @@ fn bench_throughput(c: &mut Criterion) {
                 .iter(|| async { black_box(shm.get("/large/1m").await.unwrap()) })
         });
 
-        #[cfg(unix)]
-        group.bench_function("uds", |b| {
-            let uds = uds.clone();
-            b.to_async(&rt)
-                .iter(|| async { black_box(uds.get("/large/1m").await.unwrap()) })
-        });
-
-        group.bench_function("tcp", |b| {
-            let tcp = tcp.clone();
-            b.to_async(&rt)
-                .iter(|| async { black_box(tcp.get("/large/1m").await.unwrap()) })
-        });
-
         group.finish();
     }
 
     // Cleanup
     #[cfg(all(unix, feature = "shm"))]
     let _ = std::fs::remove_file("/dev/shm/crossbar-crossbar-bench-tp");
-    #[cfg(unix)]
-    let _ = std::fs::remove_file("/tmp/crossbar-bench-tp.sock");
 }
 
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ====================================================
 
 criterion_group!(
     benches_common,
     bench_dispatch,
     bench_memory,
-    bench_channel,
-    bench_tcp,
     bench_throughput,
 );
 
@@ -703,16 +429,8 @@ criterion_group!(benches_shm, bench_shm,);
 #[cfg(all(unix, feature = "shm"))]
 criterion_group!(benches_pubsub, bench_pubsub,);
 
-#[cfg(unix)]
-criterion_group!(benches_unix, bench_uds,);
-
 #[cfg(all(unix, feature = "shm"))]
-criterion_main!(benches_common, benches_shm, benches_pubsub, benches_unix);
+criterion_main!(benches_common, benches_shm, benches_pubsub);
 
-#[cfg(all(unix, not(feature = "shm")))]
-criterion_main!(benches_common, benches_unix);
-
-// On non-Unix, SHM groups are not defined (SHM requires Unix), so
-// fall through to common-only regardless of the shm feature flag.
-#[cfg(not(unix))]
+#[cfg(not(all(unix, feature = "shm")))]
 criterion_main!(benches_common);

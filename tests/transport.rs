@@ -1,13 +1,6 @@
 use crossbar::prelude::*;
-use std::sync::atomic::{AtomicU16, Ordering};
 
-// ── Helpers ────────────────────────────────────────────
-
-static PORT_COUNTER: AtomicU16 = AtomicU16::new(19_000);
-
-fn next_port() -> u16 {
-    PORT_COUNTER.fetch_add(1, Ordering::SeqCst)
-}
+// -- Helpers ----
 
 fn test_router() -> Router {
     Router::new()
@@ -42,13 +35,9 @@ fn test_router() -> Router {
         )
 }
 
-fn uds_path(name: &str) -> String {
-    format!("/tmp/crossbar-test-{name}-{}.sock", std::process::id())
-}
-
-// ═══════════════════════════════════════════════════════
+// ===============================================
 // MemoryClient
-// ═══════════════════════════════════════════════════════
+// ===============================================
 
 #[tokio::test]
 async fn memory_get() {
@@ -138,437 +127,9 @@ async fn memory_json_roundtrip() {
     assert_eq!(input, output);
 }
 
-// ═══════════════════════════════════════════════════════
-// ChannelClient/Server
-// ═══════════════════════════════════════════════════════
-
-#[tokio::test]
-async fn channel_get() {
-    let client = ChannelServer::spawn(test_router());
-    let resp = client.get("/health").await.unwrap();
-    assert_eq!(resp.status, 200);
-    assert_eq!(resp.body_str(), "ok");
-}
-
-#[tokio::test]
-async fn channel_post() {
-    let client = ChannelServer::spawn(test_router());
-    let resp = client.post("/echo", "channel data").await.unwrap();
-    assert_eq!(resp.status, 200);
-    assert_eq!(resp.body_str(), "channel data");
-}
-
-#[tokio::test]
-async fn channel_404() {
-    let client = ChannelServer::spawn(test_router());
-    let resp = client.get("/nope").await.unwrap();
-    assert_eq!(resp.status, 404);
-}
-
-#[tokio::test]
-async fn channel_server_drop() {
-    let client = ChannelServer::spawn(test_router());
-    // The server runs in a background task; drop the only handle.
-    // But ChannelClient owns the tx, so let's drop a clone scenario.
-    // Actually, the server drops when all clients drop. Let's verify a cloned client works.
-    let client2 = client.clone();
-    let resp = client2.get("/health").await.unwrap();
-    assert_eq!(resp.status, 200);
-    drop(client);
-    // client2 still works because the channel is still alive
-    let resp = client2.get("/health").await.unwrap();
-    assert_eq!(resp.status, 200);
-}
-
-#[tokio::test]
-async fn channel_empty_body() {
-    let client = ChannelServer::spawn(test_router());
-    let resp = client.post("/echo", "").await.unwrap();
-    assert_eq!(resp.status, 200);
-    assert!(resp.body.is_empty());
-}
-
-#[tokio::test]
-async fn channel_binary_roundtrip() {
-    let binary: Vec<u8> = (0..=255).collect();
-    let client = ChannelServer::spawn(test_router());
-    let resp = client.post("/echo", binary.clone()).await.unwrap();
-    assert_eq!(resp.body.as_ref(), binary.as_slice());
-}
-
-#[tokio::test]
-async fn channel_large_payload() {
-    let data = vec![b'Y'; 1_000_000];
-    let client = ChannelServer::spawn(test_router());
-    let resp = client.post("/echo", data.clone()).await.unwrap();
-    assert_eq!(resp.body.len(), 1_000_000);
-    assert_eq!(resp.body.as_ref(), data.as_slice());
-}
-
-#[tokio::test]
-async fn channel_json_roundtrip() {
-    #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
-    struct Payload {
-        value: f64,
-    }
-
-    let router = Router::new().route(
-        "/rpc",
-        post(|req: Request| async move {
-            let p: Payload = req.json_body().unwrap();
-            Json(Payload {
-                value: p.value * 2.0,
-            })
-        }),
-    );
-    let client = ChannelServer::spawn(router);
-    let body = serde_json::to_vec(&Payload { value: 21.0 }).unwrap();
-    let resp = client.post("/rpc", body).await.unwrap();
-    let out: Payload = serde_json::from_slice(&resp.body).unwrap();
-    assert_eq!(out.value, 42.0);
-}
-
-// ═══════════════════════════════════════════════════════
-// UdsClient/Server
-// ═══════════════════════════════════════════════════════
-
-#[cfg(unix)]
-#[tokio::test]
-async fn uds_get() {
-    let path = uds_path("uds_get");
-    let router = test_router();
-
-    tokio::spawn({
-        let path = path.clone();
-        async move { UdsServer::bind(&path, router).await.unwrap() }
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let client = UdsClient::connect(&path).await.unwrap();
-    let resp = client.get("/health").await.unwrap();
-    assert_eq!(resp.status, 200);
-    assert_eq!(resp.body_str(), "ok");
-
-    let _ = std::fs::remove_file(&path);
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn uds_post() {
-    let path = uds_path("uds_post");
-    let router = test_router();
-
-    tokio::spawn({
-        let path = path.clone();
-        async move { UdsServer::bind(&path, router).await.unwrap() }
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let client = UdsClient::connect(&path).await.unwrap();
-    let resp = client.post("/echo", "uds body").await.unwrap();
-    assert_eq!(resp.status, 200);
-    assert_eq!(resp.body_str(), "uds body");
-
-    let _ = std::fs::remove_file(&path);
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn uds_persistent_connection() {
-    let path = uds_path("uds_persist");
-    let router = test_router();
-
-    tokio::spawn({
-        let path = path.clone();
-        async move { UdsServer::bind(&path, router).await.unwrap() }
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let client = UdsClient::connect(&path).await.unwrap();
-
-    // Multiple requests on the same connection
-    for i in 0..10 {
-        let resp = client.post("/echo", format!("msg-{i}")).await.unwrap();
-        assert_eq!(resp.body_str(), format!("msg-{i}"));
-    }
-
-    let _ = std::fs::remove_file(&path);
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn uds_reconnect() {
-    let path = uds_path("uds_reconnect");
-    let router = test_router();
-
-    tokio::spawn({
-        let path = path.clone();
-        async move { UdsServer::bind(&path, router).await.unwrap() }
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    // First connection
-    let client1 = UdsClient::connect(&path).await.unwrap();
-    let resp = client1.get("/health").await.unwrap();
-    assert_eq!(resp.body_str(), "ok");
-    drop(client1);
-
-    // Second connection (reconnect)
-    let client2 = UdsClient::connect(&path).await.unwrap();
-    let resp = client2.get("/health").await.unwrap();
-    assert_eq!(resp.body_str(), "ok");
-
-    let _ = std::fs::remove_file(&path);
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn uds_empty_body() {
-    let path = uds_path("uds_empty");
-    let router = test_router();
-
-    tokio::spawn({
-        let path = path.clone();
-        async move { UdsServer::bind(&path, router).await.unwrap() }
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let client = UdsClient::connect(&path).await.unwrap();
-    let resp = client.post("/echo", "").await.unwrap();
-    assert_eq!(resp.status, 200);
-    assert!(resp.body.is_empty());
-
-    let _ = std::fs::remove_file(&path);
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn uds_binary_roundtrip() {
-    let path = uds_path("uds_binary");
-    let router = test_router();
-
-    tokio::spawn({
-        let path = path.clone();
-        async move { UdsServer::bind(&path, router).await.unwrap() }
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let binary: Vec<u8> = (0..=255).collect();
-    let client = UdsClient::connect(&path).await.unwrap();
-    let resp = client.post("/echo", binary.clone()).await.unwrap();
-    assert_eq!(resp.body.as_ref(), binary.as_slice());
-
-    let _ = std::fs::remove_file(&path);
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn uds_large_payload() {
-    let path = uds_path("uds_large");
-    let router = test_router();
-
-    tokio::spawn({
-        let path = path.clone();
-        async move { UdsServer::bind(&path, router).await.unwrap() }
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let data = vec![b'Z'; 1_000_000];
-    let client = UdsClient::connect(&path).await.unwrap();
-    let resp = client.post("/echo", data.clone()).await.unwrap();
-    assert_eq!(resp.body.len(), 1_000_000);
-
-    let _ = std::fs::remove_file(&path);
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn uds_404() {
-    let path = uds_path("uds_404");
-    let router = test_router();
-
-    tokio::spawn({
-        let path = path.clone();
-        async move { UdsServer::bind(&path, router).await.unwrap() }
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let client = UdsClient::connect(&path).await.unwrap();
-    let resp = client.get("/nope").await.unwrap();
-    assert_eq!(resp.status, 404);
-
-    let _ = std::fs::remove_file(&path);
-}
-
-// ═══════════════════════════════════════════════════════
-// TcpClient/Server
-// ═══════════════════════════════════════════════════════
-
-#[tokio::test]
-async fn tcp_get() {
-    let port = next_port();
-    let addr = format!("127.0.0.1:{port}");
-    let router = test_router();
-
-    tokio::spawn({
-        let addr = addr.clone();
-        async move { TcpServer::bind(&addr, router).await.unwrap() }
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let client = TcpClient::connect(&addr).await.unwrap();
-    let resp = client.get("/health").await.unwrap();
-    assert_eq!(resp.status, 200);
-    assert_eq!(resp.body_str(), "ok");
-}
-
-#[tokio::test]
-async fn tcp_post() {
-    let port = next_port();
-    let addr = format!("127.0.0.1:{port}");
-    let router = test_router();
-
-    tokio::spawn({
-        let addr = addr.clone();
-        async move { TcpServer::bind(&addr, router).await.unwrap() }
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let client = TcpClient::connect(&addr).await.unwrap();
-    let resp = client.post("/echo", "tcp body").await.unwrap();
-    assert_eq!(resp.status, 200);
-    assert_eq!(resp.body_str(), "tcp body");
-}
-
-#[tokio::test]
-async fn tcp_persistent_connection() {
-    let port = next_port();
-    let addr = format!("127.0.0.1:{port}");
-    let router = test_router();
-
-    tokio::spawn({
-        let addr = addr.clone();
-        async move { TcpServer::bind(&addr, router).await.unwrap() }
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let client = TcpClient::connect(&addr).await.unwrap();
-    for i in 0..10 {
-        let resp = client.post("/echo", format!("tcp-{i}")).await.unwrap();
-        assert_eq!(resp.body_str(), format!("tcp-{i}"));
-    }
-}
-
-#[tokio::test]
-async fn tcp_empty_body() {
-    let port = next_port();
-    let addr = format!("127.0.0.1:{port}");
-    let router = test_router();
-
-    tokio::spawn({
-        let addr = addr.clone();
-        async move { TcpServer::bind(&addr, router).await.unwrap() }
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let client = TcpClient::connect(&addr).await.unwrap();
-    let resp = client.post("/echo", "").await.unwrap();
-    assert_eq!(resp.status, 200);
-    assert!(resp.body.is_empty());
-}
-
-#[tokio::test]
-async fn tcp_binary_roundtrip() {
-    let port = next_port();
-    let addr = format!("127.0.0.1:{port}");
-    let router = test_router();
-
-    tokio::spawn({
-        let addr = addr.clone();
-        async move { TcpServer::bind(&addr, router).await.unwrap() }
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let binary: Vec<u8> = (0..=255).collect();
-    let client = TcpClient::connect(&addr).await.unwrap();
-    let resp = client.post("/echo", binary.clone()).await.unwrap();
-    assert_eq!(resp.body.as_ref(), binary.as_slice());
-}
-
-#[tokio::test]
-async fn tcp_large_payload() {
-    let port = next_port();
-    let addr = format!("127.0.0.1:{port}");
-    let router = test_router();
-
-    tokio::spawn({
-        let addr = addr.clone();
-        async move { TcpServer::bind(&addr, router).await.unwrap() }
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let data = vec![b'W'; 1_000_000];
-    let client = TcpClient::connect(&addr).await.unwrap();
-    let resp = client.post("/echo", data.clone()).await.unwrap();
-    assert_eq!(resp.body.len(), 1_000_000);
-    assert_eq!(resp.body.as_ref(), data.as_slice());
-}
-
-#[tokio::test]
-async fn tcp_404() {
-    let port = next_port();
-    let addr = format!("127.0.0.1:{port}");
-    let router = test_router();
-
-    tokio::spawn({
-        let addr = addr.clone();
-        async move { TcpServer::bind(&addr, router).await.unwrap() }
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let client = TcpClient::connect(&addr).await.unwrap();
-    let resp = client.get("/missing").await.unwrap();
-    assert_eq!(resp.status, 404);
-}
-
-#[tokio::test]
-async fn tcp_json_roundtrip() {
-    #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
-    struct Payload {
-        value: String,
-    }
-
-    let router = Router::new().route(
-        "/rpc",
-        post(|req: Request| async move {
-            let p: Payload = req.json_body().unwrap();
-            Json(Payload {
-                value: format!("echo:{}", p.value),
-            })
-        }),
-    );
-
-    let port = next_port();
-    let addr = format!("127.0.0.1:{port}");
-    tokio::spawn({
-        let addr = addr.clone();
-        async move { TcpServer::bind(&addr, router).await.unwrap() }
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let client = TcpClient::connect(&addr).await.unwrap();
-    let body = serde_json::to_vec(&Payload {
-        value: "test".into(),
-    })
-    .unwrap();
-    let resp = client.post("/rpc", body).await.unwrap();
-    let out: Payload = serde_json::from_slice(&resp.body).unwrap();
-    assert_eq!(out.value, "echo:test");
-}
-
-// ═══════════════════════════════════════════════════════
+// ===============================================
 // ShmClient/Server
-// ═══════════════════════════════════════════════════════
+// ===============================================
 
 #[cfg(all(unix, feature = "shm"))]
 fn shm_name(name: &str) -> String {
@@ -759,7 +320,7 @@ async fn shm_concurrent_requests() {
 /// Verify that a client timeout on a slow handler does not corrupt slots.
 ///
 /// The handler sleeps longer than the client's stale_timeout, so the client
-/// gives up. A subsequent request must still succeed — proving the
+/// gives up. A subsequent request must still succeed -- proving the
 /// timed-out slot was NOT unsafely freed while the server was still using it.
 #[cfg(all(unix, feature = "shm"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -781,7 +342,7 @@ async fn shm_slow_handler_timeout_no_corruption() {
 
     let _handle = ShmServer::spawn(&name, router).await.unwrap();
 
-    // Client with a very short timeout — will give up before /slow returns.
+    // Client with a very short timeout -- will give up before /slow returns.
     let client = ShmClient::connect_with_timeout(&name, std::time::Duration::from_millis(200))
         .await
         .unwrap();
@@ -795,7 +356,7 @@ async fn shm_slow_handler_timeout_no_corruption() {
     tokio::time::sleep(std::time::Duration::from_millis(800)).await;
 
     // Now make a fresh client with a generous timeout and verify the
-    // system is still healthy — no corruption from the timed-out slot.
+    // system is still healthy -- no corruption from the timed-out slot.
     let client2 = ShmClient::connect_with_timeout(&name, std::time::Duration::from_secs(5))
         .await
         .unwrap();
@@ -806,100 +367,102 @@ async fn shm_slow_handler_timeout_no_corruption() {
     cleanup_shm(&name);
 }
 
-// ═══════════════════════════════════════════════════════
-// Cross-transport consistency
-// ═══════════════════════════════════════════════════════
+// ===============================================
+// SHM slots-full error
+// ===============================================
 
-#[cfg(unix)]
-#[tokio::test]
-async fn all_transports_identical_responses() {
-    let router = test_router();
+/// Exhaust all SHM slots by holding responses, verify ShmSlotsFull error.
+#[cfg(all(unix, feature = "shm"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shm_slots_full_returns_error() {
+    let name = shm_name("shm_slots_full");
+    let config = ShmConfig {
+        slot_count: 2,
+        block_size: 4096,
+        stale_timeout: std::time::Duration::from_secs(10),
+        ..ShmConfig::default()
+    };
 
-    // Memory
-    let mem_client = MemoryClient::new(router.clone());
-    let mem_resp = mem_client.get("/health").await;
+    // Use a slow handler to keep slots occupied
+    let router = Router::new().route(
+        "/slow",
+        get(|| async {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            "done"
+        }),
+    );
 
-    // Channel
-    let chan_client = ChannelServer::spawn(router.clone());
-    let chan_resp = chan_client.get("/health").await.unwrap();
+    let _handle = ShmServer::spawn_with_config(&name, router, config)
+        .await
+        .unwrap();
 
-    // UDS
-    let uds_p = uds_path("cross_transport");
-    tokio::spawn({
-        let path = uds_p.clone();
-        let router = router.clone();
-        async move { UdsServer::bind(&path, router).await.unwrap() }
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    let uds_client = UdsClient::connect(&uds_p).await.unwrap();
-    let uds_resp = uds_client.get("/health").await.unwrap();
+    let client = std::sync::Arc::new(
+        ShmClient::connect_with_timeout(&name, std::time::Duration::from_secs(10))
+            .await
+            .unwrap(),
+    );
 
-    // TCP
-    let port = next_port();
-    let tcp_addr = format!("127.0.0.1:{port}");
-    tokio::spawn({
-        let addr = tcp_addr.clone();
-        let router = router.clone();
-        async move { TcpServer::bind(&addr, router).await.unwrap() }
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    let tcp_client = TcpClient::connect(&tcp_addr).await.unwrap();
-    let tcp_resp = tcp_client.get("/health").await.unwrap();
-
-    // All should return the same status and body
-    assert_eq!(mem_resp.status, 200);
-    assert_eq!(chan_resp.status, 200);
-    assert_eq!(uds_resp.status, 200);
-    assert_eq!(tcp_resp.status, 200);
-
-    assert_eq!(mem_resp.body_str(), "ok");
-    assert_eq!(chan_resp.body_str(), "ok");
-    assert_eq!(uds_resp.body_str(), "ok");
-    assert_eq!(tcp_resp.body_str(), "ok");
-
-    let _ = std::fs::remove_file(&uds_p);
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn all_transports_post_identical() {
-    let router = test_router();
-    let payload = "identical-payload";
-
-    let mem = MemoryClient::new(router.clone());
-    let mem_r = mem.post("/echo", payload).await;
-
-    let chan = ChannelServer::spawn(router.clone());
-    let chan_r = chan.post("/echo", payload).await.unwrap();
-
-    let uds_p = uds_path("cross_post");
-    tokio::spawn({
-        let p = uds_p.clone();
-        let r = router.clone();
-        async move { UdsServer::bind(&p, r).await.unwrap() }
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    let uds_c = UdsClient::connect(&uds_p).await.unwrap();
-    let uds_r = uds_c.post("/echo", payload).await.unwrap();
-
-    let port = next_port();
-    let tcp_a = format!("127.0.0.1:{port}");
-    tokio::spawn({
-        let a = tcp_a.clone();
-        let r = router.clone();
-        async move { TcpServer::bind(&a, r).await.unwrap() }
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    let tcp_c = TcpClient::connect(&tcp_a).await.unwrap();
-    let tcp_r = tcp_c.post("/echo", payload).await.unwrap();
-
-    for resp in [&mem_r, &chan_r, &uds_r, &tcp_r] {
-        assert_eq!(resp.status, 200);
-        assert_eq!(resp.body_str(), payload);
+    // Fire off requests that will block in the handler, occupying all slots
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let c = std::sync::Arc::clone(&client);
+        handles.push(tokio::spawn(async move {
+            let _ = c.get("/slow").await;
+        }));
     }
 
-    let _ = std::fs::remove_file(&uds_p);
+    // Give the server time to pick up both requests (transition to PROCESSING)
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Third request should fail -- all slots are occupied
+    let result = client.get("/slow").await;
+    assert!(
+        result.is_err(),
+        "expected error when all slots are occupied"
+    );
+
+    // Clean up
+    for h in handles {
+        h.abort();
+    }
+
+    cleanup_shm(&name);
 }
+
+/// Verify response body (Bytes) remains valid after the coordination slot
+/// transitions to FREE. The body is copied out of the slot before the slot
+/// is released, so the Bytes buffer must remain independently valid.
+#[cfg(all(unix, feature = "shm"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shm_body_valid_after_slot_free() {
+    let name = shm_name("shm_body_after_free");
+    let _handle = ShmServer::spawn(&name, test_router()).await.unwrap();
+
+    let client = ShmClient::connect(&name).await.unwrap();
+
+    // Get a response with a known body
+    let resp = client.post("/echo", "persistent-data").await.unwrap();
+    assert_eq!(resp.status, 200);
+
+    // The slot is now FREE (released by the client). The body should still be
+    // valid because it was copied out before the slot was freed.
+    let body_snapshot = resp.body.clone();
+
+    // Make more requests to reuse slots, potentially overwriting slot data
+    for _ in 0..10 {
+        let _ = client.get("/health").await.unwrap();
+    }
+
+    // The original body must still be valid
+    assert_eq!(resp.body_str(), "persistent-data");
+    assert_eq!(body_snapshot.as_ref(), b"persistent-data");
+
+    cleanup_shm(&name);
+}
+
+// ===============================================
+// Cross-transport consistency
+// ===============================================
 
 /// Verify that the shm transport returns the exact same response as MemoryClient.
 #[cfg(all(unix, feature = "shm"))]
@@ -940,153 +503,4 @@ async fn shm_matches_memory_responses() {
     assert_eq!(mem_404.status, shm_404.status);
 
     cleanup_shm(&name);
-}
-
-// ═══════════════════════════════════════════════════════
-// Headers survive wire roundtrip
-// ═══════════════════════════════════════════════════════
-
-/// Helper trait for method-chaining mutations on a value.
-trait Pipe: Sized {
-    fn pipe<F: FnOnce(Self) -> Self>(self, f: F) -> Self {
-        f(self)
-    }
-}
-
-impl Pipe for Request {}
-
-/// Verify that request and response headers are faithfully transmitted over TCP.
-#[tokio::test]
-async fn tcp_headers_roundtrip() {
-    // The handler echoes all request headers back as response headers under a
-    // "x-echo-" prefix, and additionally sets its own "x-server" header.
-    let router = Router::new().route(
-        "/headers",
-        get(|req: Request| async move {
-            let mut resp = Response::ok().with_body("headers-ok");
-            for (k, v) in &req.headers {
-                resp = resp.with_header(format!("x-echo-{k}"), v.clone());
-            }
-            resp = resp.with_header("x-server", "crossbar");
-            resp
-        }),
-    );
-
-    let port = next_port();
-    let addr = format!("127.0.0.1:{port}");
-    tokio::spawn({
-        let addr = addr.clone();
-        async move { TcpServer::bind(&addr, router).await.unwrap() }
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let client = TcpClient::connect(&addr).await.unwrap();
-    let req = Request::new(Method::Get, "/headers").pipe(|mut r| {
-        r.headers
-            .insert("x-request-id".to_string(), "abc123".to_string());
-        r.headers
-            .insert("content-type".to_string(), "text/plain".to_string());
-        r
-    });
-    let resp = client.request(req).await.unwrap();
-
-    assert_eq!(resp.status, 200);
-    assert_eq!(resp.body_str(), "headers-ok");
-    assert_eq!(
-        resp.headers.get("x-server").map(String::as_str),
-        Some("crossbar")
-    );
-    assert_eq!(
-        resp.headers.get("x-echo-x-request-id").map(String::as_str),
-        Some("abc123")
-    );
-    assert_eq!(
-        resp.headers.get("x-echo-content-type").map(String::as_str),
-        Some("text/plain")
-    );
-}
-
-/// Verify that response headers set by `Response::json` survive the TCP wire roundtrip.
-#[tokio::test]
-async fn tcp_json_content_type_header_roundtrip() {
-    let router = Router::new().route(
-        "/json-ct",
-        get(|| async {
-            #[derive(serde::Serialize)]
-            struct Data {
-                ok: bool,
-            }
-            Response::json(&Data { ok: true })
-        }),
-    );
-
-    let port = next_port();
-    let addr = format!("127.0.0.1:{port}");
-    tokio::spawn({
-        let addr = addr.clone();
-        async move { TcpServer::bind(&addr, router).await.unwrap() }
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let client = TcpClient::connect(&addr).await.unwrap();
-    let resp = client.get("/json-ct").await.unwrap();
-    assert_eq!(resp.status, 200);
-    assert_eq!(
-        resp.headers.get("content-type").map(String::as_str),
-        Some("application/json"),
-        "content-type header must survive the TCP wire roundtrip"
-    );
-}
-
-// ═══════════════════════════════════════════════════════
-// Frame-too-large rejection
-// ═══════════════════════════════════════════════════════
-
-/// Verify that `CrossbarError::FrameTooLarge` is returned when the declared
-/// response frame size exceeds `MAX_FRAME_SIZE`.
-///
-/// We spin up a raw TCP listener that sends back a crafted response header
-/// whose `body_len` exceeds the limit, then connect a [`TcpClient`] and
-/// verify the error variant.
-#[tokio::test]
-async fn tcp_frame_too_large_rejected() {
-    use crossbar::transport::MAX_FRAME_SIZE;
-    use tokio::io::AsyncWriteExt;
-
-    // Fake server: accepts one connection, reads and discards the request,
-    // then sends back a response frame with an oversized body_len field.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    tokio::spawn(async move {
-        use tokio::io::AsyncReadExt;
-        let (mut stream, _) = listener.accept().await.unwrap();
-
-        // Drain the incoming request frame (at least the 13-byte header).
-        let mut scratch = [0u8; 256];
-        let _ = stream.read(&mut scratch).await;
-
-        // Build a response header claiming body_len = MAX_FRAME_SIZE + 1.
-        let oversized = MAX_FRAME_SIZE as u64 + 1;
-        let mut resp_header = [0u8; 10];
-        resp_header[0..2].copy_from_slice(&200u16.to_le_bytes()); // status 200
-        resp_header[2..6].copy_from_slice(&(oversized as u32).to_le_bytes()); // body_len
-        resp_header[6..10].copy_from_slice(&0u32.to_le_bytes()); // headers_data_len = 0
-        stream.write_all(&resp_header).await.unwrap();
-        stream.flush().await.unwrap();
-
-        // Keep alive long enough for the client to read the header.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    });
-
-    let client = TcpClient::connect(&addr.to_string()).await.unwrap();
-    let result = client.get("/anything").await;
-
-    match result {
-        Err(CrossbarError::FrameTooLarge { size, max }) => {
-            assert_eq!(max, MAX_FRAME_SIZE);
-            assert!(size > MAX_FRAME_SIZE, "size={size} should exceed max={max}");
-        }
-        other => panic!("expected FrameTooLarge, got {other:?}"),
-    }
 }

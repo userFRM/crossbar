@@ -6,13 +6,17 @@ use bytes::Bytes;
 use memmap2::MmapMut;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
-// Magic bytes: "XBAR_SHM"
-pub const MAGIC: &[u8; 8] = b"XBAR_SHM";
-pub const VERSION: u32 = 1;
+// Magic bytes: "XBAR_V2\0"
+pub const MAGIC: &[u8; 8] = b"XBAR_V2\0";
+pub const VERSION: u32 = 2;
 pub const GLOBAL_HEADER_SIZE: usize = 128;
-pub const SLOT_HEADER_SIZE: usize = 64;
+pub const SLOT_SIZE: usize = 64;
+
+// Sentinel for "no block assigned"
+const NO_BLOCK: u32 = u32::MAX;
 
 // Slot states
 pub const FREE: u32 = 0;
@@ -24,20 +28,15 @@ pub const RESPONSE_READY: u32 = 3;
 /// [`REQUEST_READY`].
 pub const WRITING: u32 = 4;
 
-/// Minimum allowed `slot_data_capacity`.
-///
-/// Must be large enough to hold the error-response fallback payload
-/// (2-byte empty headers + error body). 64 bytes (one cache line)
-/// provides comfortable headroom.
-pub const MIN_SLOT_DATA_CAPACITY: u32 = 64;
-
 /// Configuration for shared memory transport.
 #[derive(Debug, Clone)]
 pub struct ShmConfig {
-    /// Number of request/response slots (default: 64).
+    /// Number of coordination slots (default: 64).
     pub slot_count: u32,
-    /// Maximum payload size per slot in bytes (default: 65536).
-    pub slot_data_capacity: u32,
+    /// Number of data blocks in the pool (default: slot_count * 3).
+    pub block_count: u32,
+    /// Size of each data block in bytes (default: 65536 = 64 KiB).
+    pub block_size: u32,
     /// Heartbeat interval (default: 100ms).
     pub heartbeat_interval: Duration,
     /// Timeout for considering server/client dead (default: 5s).
@@ -48,29 +47,16 @@ impl Default for ShmConfig {
     fn default() -> Self {
         Self {
             slot_count: 64,
-            slot_data_capacity: 65536,
+            block_count: 192, // 64 * 3
+            block_size: 65536,
             heartbeat_interval: Duration::from_millis(100),
             stale_timeout: Duration::from_secs(5),
         }
     }
 }
 
-fn align_up(val: usize, align: usize) -> usize {
-    (val + align - 1) & !(align - 1)
-}
-
-fn slot_stride(slot_data_capacity: u32) -> usize {
-    align_up(SLOT_HEADER_SIZE + slot_data_capacity as usize, 64)
-}
-
-fn region_size(config: &ShmConfig) -> usize {
-    GLOBAL_HEADER_SIZE + config.slot_count as usize * slot_stride(config.slot_data_capacity)
-}
-
 /// Derives the file path for a named shared memory region.
 pub fn shm_path(name: &str) -> PathBuf {
-    // Use /dev/shm on Linux for tmpfs-backed shared memory.
-    // On other platforms, fall back to /tmp.
     if cfg!(target_os = "linux") {
         PathBuf::from(format!("/dev/shm/crossbar-{name}"))
     } else {
@@ -78,39 +64,50 @@ pub fn shm_path(name: &str) -> PathBuf {
     }
 }
 
-/// Handle to a memory-mapped shared region.
+// -- Treiber stack helpers --
+
+#[inline]
+fn pack(gen: u32, idx: u32) -> u64 {
+    (gen as u64) << 32 | idx as u64
+}
+
+#[inline]
+fn unpack(val: u64) -> (u32, u32) {
+    ((val >> 32) as u32, val as u32)
+}
+
+fn region_size(config: &ShmConfig) -> usize {
+    GLOBAL_HEADER_SIZE
+        + config.slot_count as usize * SLOT_SIZE
+        + config.block_count as usize * config.block_size as usize
+}
+
+/// Handle to a V2 memory-mapped shared region with block pool.
 pub struct ShmRegion {
     mmap: MmapMut,
     pub slot_count: u32,
-    pub slot_data_capacity: u32,
-    slot_stride: usize,
+    pub block_count: u32,
+    pub block_size: u32,
     #[allow(dead_code)]
     pub path: PathBuf,
     #[allow(dead_code)]
     pub config: ShmConfig,
 }
 
-impl ShmRegion {
-    /// Creates a new shared memory region (server side).
-    ///
-    /// Returns [`CrossbarError::ShmInvalidRegion`] if `slot_data_capacity` is
-    /// below [`MIN_SLOT_DATA_CAPACITY`] (64 bytes).
-    pub fn create(name: &str, config: &ShmConfig) -> Result<Self, CrossbarError> {
-        if config.slot_data_capacity < MIN_SLOT_DATA_CAPACITY {
-            return Err(CrossbarError::ShmInvalidRegion(format!(
-                "slot_data_capacity {} is below minimum {}",
-                config.slot_data_capacity, MIN_SLOT_DATA_CAPACITY
-            )));
-        }
+// SAFETY: The mmap is process-shared memory protected by atomic operations.
+// All access to shared fields uses proper atomic orderings.
+unsafe impl Send for ShmRegion {}
+unsafe impl Sync for ShmRegion {}
 
+impl ShmRegion {
+    /// Creates a new V2 shared memory region (server side).
+    pub fn create(name: &str, config: &ShmConfig) -> Result<Self, CrossbarError> {
         let path = shm_path(name);
         let size = region_size(config);
-        let stride = slot_stride(config.slot_data_capacity);
 
         // Remove any stale file
         let _ = std::fs::remove_file(&path);
 
-        // Create and size the file
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -121,58 +118,65 @@ impl ShmRegion {
 
         file.set_len(size as u64).map_err(CrossbarError::Io)?;
 
-        // Memory-map it
         let mut mmap = unsafe { MmapMut::map_mut(&file) }.map_err(CrossbarError::Io)?;
 
         // Write global header
         let ptr = mmap.as_mut_ptr();
         unsafe {
-            // Magic
+            // 0x00: magic (8B)
             std::ptr::copy_nonoverlapping(MAGIC.as_ptr(), ptr, 8);
-            // Version
+            // 0x08: version (4B)
             std::ptr::copy_nonoverlapping(VERSION.to_le_bytes().as_ptr(), ptr.add(0x08), 4);
-            // slot_count
+            // 0x0C: slot_count (4B)
             std::ptr::copy_nonoverlapping(
                 config.slot_count.to_le_bytes().as_ptr(),
                 ptr.add(0x0C),
                 4,
             );
-            // slot_data_capacity
+            // 0x10: block_count (4B)
             std::ptr::copy_nonoverlapping(
-                config.slot_data_capacity.to_le_bytes().as_ptr(),
+                config.block_count.to_le_bytes().as_ptr(),
                 ptr.add(0x10),
                 4,
             );
-            // slot_stride
-            std::ptr::copy_nonoverlapping((stride as u32).to_le_bytes().as_ptr(), ptr.add(0x14), 4);
-            // server_pid
+            // 0x14: block_size (4B)
+            std::ptr::copy_nonoverlapping(
+                config.block_size.to_le_bytes().as_ptr(),
+                ptr.add(0x14),
+                4,
+            );
+            // 0x20: server_pid (8B)
             let pid = std::process::id() as u64;
             std::ptr::copy_nonoverlapping(pid.to_le_bytes().as_ptr(), ptr.add(0x20), 8);
-            // region_size
-            std::ptr::copy_nonoverlapping((size as u32).to_le_bytes().as_ptr(), ptr.add(0x28), 4);
         }
 
-        // Initialize heartbeat
         let region = ShmRegion {
             mmap,
             slot_count: config.slot_count,
-            slot_data_capacity: config.slot_data_capacity,
-            slot_stride: stride,
+            block_count: config.block_count,
+            block_size: config.block_size,
             path,
             config: config.clone(),
         };
+
+        // Initialize heartbeat
         region.update_heartbeat();
 
         // Initialize all slots to FREE
         for i in 0..config.slot_count {
-            let state = region.slot_state(i);
-            state.store(FREE, Ordering::Release);
+            region.slot_state(i).store(FREE, Ordering::Release);
+            // Set block indices to NO_BLOCK
+            region.set_request_block_idx(i, NO_BLOCK);
+            region.set_response_block_idx(i, NO_BLOCK);
         }
+
+        // Initialize free list: chain all blocks
+        region.init_free_list();
 
         Ok(region)
     }
 
-    /// Opens an existing shared memory region (client side).
+    /// Opens an existing V2 shared memory region (client side).
     pub fn open(name: &str) -> Result<Self, CrossbarError> {
         let path = shm_path(name);
 
@@ -184,7 +188,6 @@ impl ShmRegion {
 
         let mmap = unsafe { MmapMut::map_mut(&file) }.map_err(CrossbarError::Io)?;
 
-        // Validate header
         if mmap.len() < GLOBAL_HEADER_SIZE {
             return Err(CrossbarError::ShmInvalidRegion(
                 "region too small for header".into(),
@@ -193,37 +196,36 @@ impl ShmRegion {
 
         let ptr = mmap.as_ptr();
         unsafe {
-            // Check magic
             let mut magic = [0u8; 8];
             std::ptr::copy_nonoverlapping(ptr, magic.as_mut_ptr(), 8);
             if &magic != MAGIC {
                 return Err(CrossbarError::ShmInvalidRegion(
-                    "invalid magic bytes".into(),
+                    "invalid magic bytes (expected XBAR_V2)".into(),
                 ));
             }
 
-            // Check version
-            let mut ver_bytes = [0u8; 4];
-            std::ptr::copy_nonoverlapping(ptr.add(0x08), ver_bytes.as_mut_ptr(), 4);
-            let ver = u32::from_le_bytes(ver_bytes);
+            let mut buf4 = [0u8; 4];
+
+            std::ptr::copy_nonoverlapping(ptr.add(0x08), buf4.as_mut_ptr(), 4);
+            let ver = u32::from_le_bytes(buf4);
             if ver != VERSION {
                 return Err(CrossbarError::ShmInvalidRegion(format!(
                     "unsupported version {ver}, expected {VERSION}"
                 )));
             }
 
-            let mut buf4 = [0u8; 4];
-
             std::ptr::copy_nonoverlapping(ptr.add(0x0C), buf4.as_mut_ptr(), 4);
             let slot_count = u32::from_le_bytes(buf4);
 
             std::ptr::copy_nonoverlapping(ptr.add(0x10), buf4.as_mut_ptr(), 4);
-            let slot_data_capacity = u32::from_le_bytes(buf4);
+            let block_count = u32::from_le_bytes(buf4);
 
             std::ptr::copy_nonoverlapping(ptr.add(0x14), buf4.as_mut_ptr(), 4);
-            let stride = u32::from_le_bytes(buf4) as usize;
+            let block_size = u32::from_le_bytes(buf4);
 
-            let expected_size = GLOBAL_HEADER_SIZE + slot_count as usize * stride;
+            let expected_size = GLOBAL_HEADER_SIZE
+                + slot_count as usize * SLOT_SIZE
+                + block_count as usize * block_size as usize;
             if mmap.len() < expected_size {
                 return Err(CrossbarError::ShmInvalidRegion(format!(
                     "region size {} < expected {expected_size}",
@@ -234,16 +236,105 @@ impl ShmRegion {
             Ok(ShmRegion {
                 mmap,
                 slot_count,
-                slot_data_capacity,
-                slot_stride: stride,
+                block_count,
+                block_size,
                 path,
                 config: ShmConfig {
                     slot_count,
-                    slot_data_capacity,
+                    block_count,
+                    block_size,
                     ..ShmConfig::default()
                 },
             })
         }
+    }
+
+    // -- Pool allocator (Treiber stack) --
+
+    fn pool_head(&self) -> &AtomicU64 {
+        unsafe { &*(self.mmap.as_ptr().add(0x28) as *const AtomicU64) }
+    }
+
+    /// Initialize the free list: chain block 0 -> 1 -> 2 -> ... -> NO_BLOCK
+    fn init_free_list(&self) {
+        for i in 0..self.block_count {
+            let next = if i + 1 < self.block_count {
+                i + 1
+            } else {
+                NO_BLOCK
+            };
+            self.write_block_next_free(i, next);
+        }
+        // Head points to block 0 with generation 0
+        self.pool_head().store(pack(0, 0), Ordering::Release);
+    }
+
+    fn read_block_next_free(&self, idx: u32) -> u32 {
+        let ptr = self.block_ptr(idx);
+        unsafe {
+            let mut buf = [0u8; 4];
+            std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), 4);
+            u32::from_le_bytes(buf)
+        }
+    }
+
+    fn write_block_next_free(&self, idx: u32, next: u32) {
+        let ptr = self.block_ptr(idx);
+        unsafe {
+            std::ptr::copy_nonoverlapping(next.to_le_bytes().as_ptr(), ptr, 4);
+        }
+    }
+
+    /// Allocates a block from the pool. Returns the block index or None if exhausted.
+    pub fn alloc_block(&self) -> Option<u32> {
+        loop {
+            let head = self.pool_head().load(Ordering::Acquire);
+            let (gen, idx) = unpack(head);
+            if idx == NO_BLOCK {
+                return None;
+            }
+            let next_idx = self.read_block_next_free(idx);
+            let new_head = pack(gen.wrapping_add(1), next_idx);
+            if self
+                .pool_head()
+                .compare_exchange(head, new_head, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(idx);
+            }
+        }
+    }
+
+    /// Returns a block to the pool.
+    pub fn free_block(&self, idx: u32) {
+        loop {
+            let head = self.pool_head().load(Ordering::Acquire);
+            let (gen, old_head_idx) = unpack(head);
+            self.write_block_next_free(idx, old_head_idx);
+            let new_head = pack(gen.wrapping_add(1), idx);
+            if self
+                .pool_head()
+                .compare_exchange(head, new_head, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    /// Returns a raw pointer to the start of block `idx`.
+    pub fn block_ptr(&self, idx: u32) -> *mut u8 {
+        debug_assert!((idx as usize) < self.block_count as usize);
+        let offset = GLOBAL_HEADER_SIZE
+            + self.slot_count as usize * SLOT_SIZE
+            + idx as usize * self.block_size as usize;
+        unsafe { self.mmap.as_ptr().add(offset) as *mut u8 }
+    }
+
+    /// Returns a slice of the block's data region.
+    fn block_slice(&self, idx: u32, offset: usize, len: usize) -> &[u8] {
+        let ptr = self.block_ptr(idx);
+        unsafe { std::slice::from_raw_parts(ptr.add(offset), len) }
     }
 
     // -- Slot access --
@@ -253,21 +344,21 @@ impl ShmRegion {
         unsafe {
             self.mmap
                 .as_ptr()
-                .add(GLOBAL_HEADER_SIZE + idx as usize * self.slot_stride) as *mut u8
+                .add(GLOBAL_HEADER_SIZE + idx as usize * SLOT_SIZE) as *mut u8
         }
     }
 
-    /// Returns a reference to the slot's atomic state field.
+    /// Returns a reference to the slot's atomic state field (offset 0x00).
     pub fn slot_state(&self, idx: u32) -> &AtomicU32 {
         unsafe { &*(self.slot_base(idx) as *const AtomicU32) }
     }
 
-    /// Returns a reference to the slot's sequence counter.
+    /// Returns a reference to the slot's sequence counter (offset 0x04).
     pub fn slot_sequence(&self, idx: u32) -> &AtomicU32 {
         unsafe { &*(self.slot_base(idx).add(4) as *const AtomicU32) }
     }
 
-    /// Writes the client_id into a slot.
+    /// Writes the client_id into a slot (offset 0x08).
     pub fn set_slot_client_id(&self, idx: u32, client_id: u64) {
         unsafe {
             let ptr = self.slot_base(idx).add(0x08);
@@ -286,7 +377,7 @@ impl ShmRegion {
         }
     }
 
-    /// Updates the slot timestamp to now.
+    /// Updates the slot timestamp to now (offset 0x10).
     pub fn touch_slot(&self, idx: u32) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -308,219 +399,355 @@ impl ShmRegion {
         }
     }
 
-    // -- Request/Response I/O --
+    // -- Coordination slot metadata accessors --
 
-    /// Writes a request into a slot's data region.
-    ///
-    /// Slot metadata fields (method, uri_len, body_len, headers_data_len) are
-    /// also written. The data region is packed as: [uri][headers_data][body].
-    ///
-    /// Returns [`CrossbarError::HeaderOverflow`] if headers exceed the wire
-    /// protocol's u16 length limits.
-    pub fn write_request_to_slot(&self, idx: u32, req: &Request) -> Result<(), CrossbarError> {
-        let base = self.slot_base(idx);
-        let uri_bytes = req.uri.raw().as_bytes();
-        let headers_data = crate::transport::serialize_headers(&req.headers)?;
-
+    /// Sets the method byte in the coordination slot (offset 0x18).
+    fn set_slot_method(&self, idx: u32, method: u8) {
         unsafe {
-            // method (1 byte at offset 0x18)
-            *base.add(0x18) = u8::from(req.method);
-            // uri_len
-            std::ptr::copy_nonoverlapping(
-                (uri_bytes.len() as u32).to_le_bytes().as_ptr(),
-                base.add(0x1C),
-                4,
-            );
-            // body_len
-            std::ptr::copy_nonoverlapping(
-                (req.body.len() as u32).to_le_bytes().as_ptr(),
-                base.add(0x20),
-                4,
-            );
-            // headers_data_len
-            std::ptr::copy_nonoverlapping(
-                (headers_data.len() as u32).to_le_bytes().as_ptr(),
-                base.add(0x24),
-                4,
-            );
-
-            // Data region starts at SLOT_HEADER_SIZE (0x40)
-            let data = base.add(SLOT_HEADER_SIZE);
-            let mut off = 0;
-            std::ptr::copy_nonoverlapping(uri_bytes.as_ptr(), data.add(off), uri_bytes.len());
-            off += uri_bytes.len();
-            std::ptr::copy_nonoverlapping(headers_data.as_ptr(), data.add(off), headers_data.len());
-            off += headers_data.len();
-            std::ptr::copy_nonoverlapping(req.body.as_ptr(), data.add(off), req.body.len());
+            *self.slot_base(idx).add(0x18) = method;
         }
+    }
+
+    /// Reads the method byte from the coordination slot.
+    fn slot_method(&self, idx: u32) -> u8 {
+        unsafe { *self.slot_base(idx).add(0x18) }
+    }
+
+    fn read_slot_u32(&self, idx: u32, offset: usize) -> u32 {
+        unsafe {
+            let ptr = self.slot_base(idx).add(offset);
+            let mut buf = [0u8; 4];
+            std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), 4);
+            u32::from_le_bytes(buf)
+        }
+    }
+
+    fn write_slot_u32(&self, idx: u32, offset: usize, val: u32) {
+        unsafe {
+            let ptr = self.slot_base(idx).add(offset);
+            std::ptr::copy_nonoverlapping(val.to_le_bytes().as_ptr(), ptr, 4);
+        }
+    }
+
+    fn read_slot_u16(&self, idx: u32, offset: usize) -> u16 {
+        unsafe {
+            let ptr = self.slot_base(idx).add(offset);
+            let mut buf = [0u8; 2];
+            std::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), 2);
+            u16::from_le_bytes(buf)
+        }
+    }
+
+    fn write_slot_u16(&self, idx: u32, offset: usize, val: u16) {
+        unsafe {
+            let ptr = self.slot_base(idx).add(offset);
+            std::ptr::copy_nonoverlapping(val.to_le_bytes().as_ptr(), ptr, 2);
+        }
+    }
+
+    // Slot field accessors per V2 layout:
+    // 0x1C: uri_len (u32)
+    // 0x20: body_len (u32)
+    // 0x24: headers_data_len (u32)
+    // 0x28: request_block_idx (u32)
+    // 0x2C: response_block_idx (u32)
+    // 0x30: response_status (u16)
+    // 0x34: response_body_len (u32)
+    // 0x38: response_headers_data_len (u32)
+
+    pub fn set_uri_len(&self, idx: u32, val: u32) {
+        self.write_slot_u32(idx, 0x1C, val);
+    }
+    pub fn uri_len(&self, idx: u32) -> u32 {
+        self.read_slot_u32(idx, 0x1C)
+    }
+
+    pub fn set_body_len(&self, idx: u32, val: u32) {
+        self.write_slot_u32(idx, 0x20, val);
+    }
+    pub fn body_len(&self, idx: u32) -> u32 {
+        self.read_slot_u32(idx, 0x20)
+    }
+
+    pub fn set_headers_data_len(&self, idx: u32, val: u32) {
+        self.write_slot_u32(idx, 0x24, val);
+    }
+    pub fn headers_data_len(&self, idx: u32) -> u32 {
+        self.read_slot_u32(idx, 0x24)
+    }
+
+    pub fn set_request_block_idx(&self, idx: u32, val: u32) {
+        self.write_slot_u32(idx, 0x28, val);
+    }
+    pub fn request_block_idx(&self, idx: u32) -> u32 {
+        self.read_slot_u32(idx, 0x28)
+    }
+
+    pub fn set_response_block_idx(&self, idx: u32, val: u32) {
+        self.write_slot_u32(idx, 0x2C, val);
+    }
+    pub fn response_block_idx(&self, idx: u32) -> u32 {
+        self.read_slot_u32(idx, 0x2C)
+    }
+
+    pub fn set_response_status(&self, idx: u32, val: u16) {
+        self.write_slot_u16(idx, 0x30, val);
+    }
+    pub fn response_status(&self, idx: u32) -> u16 {
+        self.read_slot_u16(idx, 0x30)
+    }
+
+    pub fn set_response_body_len(&self, idx: u32, val: u32) {
+        self.write_slot_u32(idx, 0x34, val);
+    }
+    pub fn response_body_len(&self, idx: u32) -> u32 {
+        self.read_slot_u32(idx, 0x34)
+    }
+
+    pub fn set_response_headers_data_len(&self, idx: u32, val: u32) {
+        self.write_slot_u32(idx, 0x38, val);
+    }
+    pub fn response_headers_data_len(&self, idx: u32) -> u32 {
+        self.read_slot_u32(idx, 0x38)
+    }
+
+    // -- Request/Response block I/O --
+
+    /// Writes a request directly into a block.
+    /// Block layout: [uri bytes][headers_data][body bytes]
+    /// Coordination slot metadata fields are also written.
+    pub fn write_request_to_block(
+        &self,
+        slot_idx: u32,
+        block_idx: u32,
+        req: &Request,
+    ) -> Result<(), CrossbarError> {
+        let uri_bytes = req.uri.raw().as_bytes();
+        let block_cap = self.block_size as usize;
+        let block = self.block_ptr(block_idx);
+
+        // Write URI into block
+        let mut off = 0usize;
+        if off + uri_bytes.len() > block_cap {
+            return Err(CrossbarError::ShmMessageTooLarge {
+                size: uri_bytes.len(),
+                max: block_cap,
+            });
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(uri_bytes.as_ptr(), block.add(off), uri_bytes.len());
+        }
+        off += uri_bytes.len();
+
+        // Write headers directly into block
+        let remaining =
+            &mut unsafe { std::slice::from_raw_parts_mut(block.add(off), block_cap - off) };
+        let headers_len = crate::transport::serialize_headers_into(&req.headers, remaining)?;
+        off += headers_len;
+
+        // Write body into block
+        if off + req.body.len() > block_cap {
+            return Err(CrossbarError::ShmMessageTooLarge {
+                size: off + req.body.len(),
+                max: block_cap,
+            });
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(req.body.as_ptr(), block.add(off), req.body.len());
+        }
+
+        // Write metadata to coordination slot
+        self.set_slot_method(slot_idx, u8::from(req.method));
+        self.set_uri_len(slot_idx, uri_bytes.len() as u32);
+        self.set_body_len(slot_idx, req.body.len() as u32);
+        self.set_headers_data_len(slot_idx, headers_len as u32);
+        self.set_request_block_idx(slot_idx, block_idx);
+
         Ok(())
     }
 
-    /// Reads a request from a slot's data region.
-    ///
-    /// Validates that all length fields fit within [`slot_data_capacity`] before
-    /// creating any slices, preventing out-of-bounds reads from corrupted or
-    /// malicious shared memory data.
-    pub fn read_request_from_slot(&self, idx: u32) -> Result<Request, CrossbarError> {
-        let base = self.slot_base(idx);
-        let capacity = self.slot_data_capacity as usize;
+    /// Reads a request from a block. The body is zero-copy via `Bytes::from_owner`.
+    /// Block layout: [uri bytes][headers_data][body bytes]
+    pub fn read_request_from_block(
+        self: &Arc<Self>,
+        slot_idx: u32,
+    ) -> Result<Request, CrossbarError> {
+        let block_idx = self.request_block_idx(slot_idx);
+        let block_cap = self.block_size as usize;
 
-        unsafe {
-            let method_byte = *base.add(0x18);
-            let method = Method::try_from(method_byte).map_err(CrossbarError::InvalidMethod)?;
+        let method_byte = self.slot_method(slot_idx);
+        let method = Method::try_from(method_byte).map_err(CrossbarError::InvalidMethod)?;
+        let uri_len = self.uri_len(slot_idx) as usize;
+        let body_len = self.body_len(slot_idx) as usize;
+        let headers_data_len = self.headers_data_len(slot_idx) as usize;
 
-            let mut buf4 = [0u8; 4];
-            std::ptr::copy_nonoverlapping(base.add(0x1C), buf4.as_mut_ptr(), 4);
-            let uri_len = u32::from_le_bytes(buf4) as usize;
-
-            std::ptr::copy_nonoverlapping(base.add(0x20), buf4.as_mut_ptr(), 4);
-            let body_len = u32::from_le_bytes(buf4) as usize;
-
-            std::ptr::copy_nonoverlapping(base.add(0x24), buf4.as_mut_ptr(), 4);
-            let headers_data_len = u32::from_le_bytes(buf4) as usize;
-
-            // Bounds check: total payload must fit within the slot data region.
-            let total = uri_len
-                .checked_add(headers_data_len)
-                .and_then(|v| v.checked_add(body_len));
-            match total {
-                Some(t) if t <= capacity => {}
-                _ => {
-                    return Err(CrossbarError::ShmInvalidRegion(format!(
-                        "request payload lengths ({uri_len}+{headers_data_len}+{body_len}) exceed slot capacity ({capacity})"
-                    )));
-                }
+        // Bounds check
+        let total = uri_len
+            .checked_add(headers_data_len)
+            .and_then(|v| v.checked_add(body_len));
+        match total {
+            Some(t) if t <= block_cap => {}
+            _ => {
+                return Err(CrossbarError::ShmInvalidRegion(format!(
+                    "request payload ({uri_len}+{headers_data_len}+{body_len}) exceeds block size ({block_cap})"
+                )));
             }
-
-            let data = base.add(SLOT_HEADER_SIZE);
-            let mut off = 0;
-
-            // URI
-            let uri_slice = std::slice::from_raw_parts(data.add(off), uri_len);
-            let uri_str = std::str::from_utf8(uri_slice).map_err(|_| {
-                CrossbarError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "URI not valid UTF-8",
-                ))
-            })?;
-            off += uri_len;
-
-            // Headers
-            let headers_slice = std::slice::from_raw_parts(data.add(off), headers_data_len);
-            let headers = crate::transport::deserialize_headers(headers_slice)?;
-            off += headers_data_len;
-
-            // Body
-            let body_slice = std::slice::from_raw_parts(data.add(off), body_len);
-            let body = Bytes::copy_from_slice(body_slice);
-
-            let mut req = Request::new(method, uri_str).with_body(body);
-            req.headers = headers;
-            Ok(req)
         }
-    }
 
-    /// Writes a response into a slot's data region.
-    ///
-    /// If the response exceeds [`slot_data_capacity`] or its headers cannot be
-    /// serialized, a 500 error with an empty-header block is written instead.
-    /// The minimum capacity enforced by [`ShmRegion::create`] guarantees that
-    /// the fallback payload always fits.
-    pub fn write_response_to_slot(&self, idx: u32, resp: &Response) {
-        let base = self.slot_base(idx);
-        let capacity = self.slot_data_capacity as usize;
+        let mut off = 0usize;
 
-        // Hardcoded fallback: 2-byte empty headers ([0x00, 0x00] = 0 headers)
-        // + short error body. Always fits within MIN_SLOT_DATA_CAPACITY.
-        let fallback = || -> (u16, Vec<u8>, &'static [u8]) {
-            (500u16, vec![0u8, 0u8], b"response too large for shm slot")
+        // URI
+        let uri_slice = self.block_slice(block_idx, off, uri_len);
+        let uri_str = std::str::from_utf8(uri_slice).map_err(|_| {
+            CrossbarError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "URI not valid UTF-8",
+            ))
+        })?;
+        off += uri_len;
+
+        // Headers
+        let headers_slice = self.block_slice(block_idx, off, headers_data_len);
+        let headers = crate::transport::deserialize_headers(headers_slice)?;
+        off += headers_data_len;
+
+        // Body — zero-copy via Bytes::from_owner
+        let body = if body_len == 0 {
+            Bytes::new()
+        } else {
+            let guard = ShmBlockGuard {
+                region: Arc::clone(self),
+                block_idx,
+                offset: off,
+                len: body_len,
+            };
+            Bytes::from_owner(guard)
         };
 
-        let (status, headers_data, body) = match crate::transport::serialize_headers(&resp.headers)
-        {
-            Ok(hd) => {
-                let total = hd.len() + resp.body.len();
-                if total > capacity {
-                    fallback()
-                } else {
-                    (resp.status, hd, resp.body.as_ref())
-                }
-            }
-            Err(_) => fallback(),
-        };
+        let mut req = Request::new(method, uri_str).with_body(body);
+        req.headers = headers;
 
-        unsafe {
-            // response_status (2 bytes at 0x28)
-            std::ptr::copy_nonoverlapping(status.to_le_bytes().as_ptr(), base.add(0x28), 2);
-            // response_body_len
-            std::ptr::copy_nonoverlapping(
-                (body.len() as u32).to_le_bytes().as_ptr(),
-                base.add(0x2C),
-                4,
-            );
-            // response_headers_data_len
-            std::ptr::copy_nonoverlapping(
-                (headers_data.len() as u32).to_le_bytes().as_ptr(),
-                base.add(0x30),
-                4,
-            );
-
-            // Response data goes into the data region (overwrites request data)
-            let data = base.add(SLOT_HEADER_SIZE);
-            let mut off = 0;
-            std::ptr::copy_nonoverlapping(headers_data.as_ptr(), data.add(off), headers_data.len());
-            off += headers_data.len();
-            std::ptr::copy_nonoverlapping(body.as_ptr(), data.add(off), body.len());
+        // If body is empty, free the block immediately since we won't hold it
+        if body_len == 0 {
+            self.free_block(block_idx);
         }
+
+        Ok(req)
     }
 
-    /// Reads a response from a slot's data region.
+    /// Writes a response directly into a block.
+    /// Block layout: [headers_data][body bytes]
     ///
-    /// Validates that all length fields fit within [`slot_data_capacity`] before
-    /// creating any slices.
-    pub fn read_response_from_slot(&self, idx: u32) -> Result<Response, CrossbarError> {
-        let base = self.slot_base(idx);
-        let capacity = self.slot_data_capacity as usize;
+    /// If the response exceeds block capacity or headers fail to serialize,
+    /// a 500 fallback is written instead.
+    pub fn write_response_to_block(&self, slot_idx: u32, block_idx: u32, resp: &Response) {
+        let block_cap = self.block_size as usize;
+        let block = self.block_ptr(block_idx);
 
-        unsafe {
-            let mut buf2 = [0u8; 2];
-            std::ptr::copy_nonoverlapping(base.add(0x28), buf2.as_mut_ptr(), 2);
-            let status = u16::from_le_bytes(buf2);
+        // Try to write the actual response
+        let result = (|| -> Result<(u16, usize, usize), CrossbarError> {
+            let mut off = 0usize;
 
-            let mut buf4 = [0u8; 4];
-            std::ptr::copy_nonoverlapping(base.add(0x2C), buf4.as_mut_ptr(), 4);
-            let body_len = u32::from_le_bytes(buf4) as usize;
+            // Write headers directly into block
+            let remaining =
+                unsafe { std::slice::from_raw_parts_mut(block.add(off), block_cap - off) };
+            let headers_len = crate::transport::serialize_headers_into(&resp.headers, remaining)?;
+            off += headers_len;
 
-            std::ptr::copy_nonoverlapping(base.add(0x30), buf4.as_mut_ptr(), 4);
-            let headers_data_len = u32::from_le_bytes(buf4) as usize;
-
-            // Bounds check: total payload must fit within the slot data region.
-            let total = headers_data_len.checked_add(body_len);
-            match total {
-                Some(t) if t <= capacity => {}
-                _ => {
-                    return Err(CrossbarError::ShmInvalidRegion(format!(
-                        "response payload lengths ({headers_data_len}+{body_len}) exceed slot capacity ({capacity})"
-                    )));
-                }
+            // Write body
+            if off + resp.body.len() > block_cap {
+                return Err(CrossbarError::ShmMessageTooLarge {
+                    size: off + resp.body.len(),
+                    max: block_cap,
+                });
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(resp.body.as_ptr(), block.add(off), resp.body.len());
             }
 
-            let data = base.add(SLOT_HEADER_SIZE);
-            let mut off = 0;
+            Ok((resp.status, headers_len, resp.body.len()))
+        })();
 
-            let headers_slice = std::slice::from_raw_parts(data.add(off), headers_data_len);
-            let headers = crate::transport::deserialize_headers(headers_slice)?;
-            off += headers_data_len;
+        let (status, headers_data_len, body_len) = result.unwrap_or_else(|_| {
+            // Fallback: write a 500 error into the block
+            let fallback_headers = [0u8, 0u8]; // 0 headers
+            let fallback_body = b"response too large for shm block";
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    fallback_headers.as_ptr(),
+                    block,
+                    fallback_headers.len(),
+                );
+                std::ptr::copy_nonoverlapping(
+                    fallback_body.as_ptr(),
+                    block.add(fallback_headers.len()),
+                    fallback_body.len(),
+                );
+            }
+            (500u16, fallback_headers.len(), fallback_body.len())
+        });
 
-            let body_slice = std::slice::from_raw_parts(data.add(off), body_len);
-            let body = Bytes::copy_from_slice(body_slice);
+        // Write metadata to coordination slot
+        self.set_response_block_idx(slot_idx, block_idx);
+        self.set_response_status(slot_idx, status);
+        self.set_response_headers_data_len(slot_idx, headers_data_len as u32);
+        self.set_response_body_len(slot_idx, body_len as u32);
+    }
 
-            Ok(Response {
-                status,
-                headers,
-                body,
-            })
+    /// Reads a response from a block. The body is zero-copy via `Bytes::from_owner`.
+    /// Block layout: [headers_data][body bytes]
+    pub fn read_response_from_block(
+        self: &Arc<Self>,
+        slot_idx: u32,
+    ) -> Result<Response, CrossbarError> {
+        let block_idx = self.response_block_idx(slot_idx);
+        let block_cap = self.block_size as usize;
+
+        let status = self.response_status(slot_idx);
+        let body_len = self.response_body_len(slot_idx) as usize;
+        let headers_data_len = self.response_headers_data_len(slot_idx) as usize;
+
+        // Bounds check
+        let total = headers_data_len.checked_add(body_len);
+        match total {
+            Some(t) if t <= block_cap => {}
+            _ => {
+                return Err(CrossbarError::ShmInvalidRegion(format!(
+                    "response payload ({headers_data_len}+{body_len}) exceeds block size ({block_cap})"
+                )));
+            }
         }
+
+        let mut off = 0usize;
+
+        // Headers
+        let headers_slice = self.block_slice(block_idx, off, headers_data_len);
+        let headers = crate::transport::deserialize_headers(headers_slice)?;
+        off += headers_data_len;
+
+        // Body — zero-copy via Bytes::from_owner
+        let body = if body_len == 0 {
+            Bytes::new()
+        } else {
+            let guard = ShmBlockGuard {
+                region: Arc::clone(self),
+                block_idx,
+                offset: off,
+                len: body_len,
+            };
+            Bytes::from_owner(guard)
+        };
+
+        // If body is empty, free the block immediately
+        if body_len == 0 {
+            self.free_block(block_idx);
+        }
+
+        Ok(Response {
+            status,
+            headers,
+            body,
+        })
     }
 
     // -- Heartbeat --
@@ -556,10 +783,6 @@ impl ShmRegion {
     // -- Slot acquisition --
 
     /// Tries to acquire a FREE slot via CAS. Returns the slot index or None.
-    ///
-    /// The slot enters [`WRITING`] state — the caller must write the request
-    /// data and then transition the slot to [`REQUEST_READY`] so the server
-    /// knows the data is complete.
     pub fn try_acquire_slot(&self, client_id: u64) -> Option<u32> {
         for i in 0..self.slot_count {
             let state = self.slot_state(i);
@@ -577,15 +800,6 @@ impl ShmRegion {
     }
 
     /// Scans for stale slots and resets them to FREE.
-    ///
-    /// Only recovers client-owned states (WRITING, RESPONSE_READY) and
-    /// REQUEST_READY. PROCESSING slots are skipped because the server owns
-    /// them — if the server is alive (heartbeat is fresh) then a PROCESSING
-    /// slot is a legitimately running handler, regardless of how long it
-    /// takes. If the server dies, the heartbeat goes stale and clients will
-    /// get [`CrossbarError::ShmServerDead`] on their next request.
-    ///
-    /// Uses CAS to avoid racing with legitimate state transitions.
     pub fn recover_stale_slots(&self, stale_timeout: Duration) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -596,18 +810,60 @@ impl ShmRegion {
             let state = self.slot_state(i);
             let current = state.load(Ordering::Acquire);
 
-            // Skip FREE (nothing to do) and PROCESSING (server owns it).
             if current == FREE || current == PROCESSING {
                 continue;
             }
 
             let ts = self.slot_timestamp(i);
             if now.saturating_sub(ts) > stale_timeout.as_millis() as u64 {
-                // CAS instead of store: if the state changed since we
-                // loaded it, a legitimate transition happened and we
-                // must not clobber it.
-                let _ = state.compare_exchange(current, FREE, Ordering::AcqRel, Ordering::Acquire);
+                // CAS to avoid racing with legitimate transitions.
+                // If we succeed, free any blocks that were assigned to this slot.
+                if state
+                    .compare_exchange(current, FREE, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    // Free request block if assigned
+                    let req_block = self.request_block_idx(i);
+                    if req_block != NO_BLOCK {
+                        self.free_block(req_block);
+                        self.set_request_block_idx(i, NO_BLOCK);
+                    }
+                    // Free response block if assigned
+                    let resp_block = self.response_block_idx(i);
+                    if resp_block != NO_BLOCK {
+                        self.free_block(resp_block);
+                        self.set_response_block_idx(i, NO_BLOCK);
+                    }
+                }
             }
         }
+    }
+}
+
+/// Owns a block in the SHM pool. Frees the block back to the pool on drop.
+/// Used with `Bytes::from_owner` for zero-copy reads.
+pub struct ShmBlockGuard {
+    region: Arc<ShmRegion>,
+    block_idx: u32,
+    offset: usize,
+    len: usize,
+}
+
+// SAFETY: ShmBlockGuard holds an Arc<ShmRegion> which keeps the mmap alive.
+// The block is exclusively owned (not in the free list) until this guard drops.
+// The underlying data is immutable while the guard exists.
+unsafe impl Send for ShmBlockGuard {}
+unsafe impl Sync for ShmBlockGuard {}
+
+impl AsRef<[u8]> for ShmBlockGuard {
+    fn as_ref(&self) -> &[u8] {
+        let ptr = self.region.block_ptr(self.block_idx);
+        unsafe { std::slice::from_raw_parts(ptr.add(self.offset), self.len) }
+    }
+}
+
+impl Drop for ShmBlockGuard {
+    fn drop(&mut self) {
+        self.region.free_block(self.block_idx);
     }
 }

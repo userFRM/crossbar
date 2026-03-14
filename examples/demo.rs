@@ -1,8 +1,8 @@
 use crossbar::prelude::*;
 use serde::{Deserialize, Serialize};
 
-// ── Handlers ────────────────────────────────────────────
-// Same handlers serve over ALL transports — memory, channel, SHM, UDS, TCP.
+// -- Handlers ----
+// Same handlers serve over ALL transports -- memory and SHM.
 
 async fn health() -> &'static str {
     "ok"
@@ -60,15 +60,15 @@ async fn create_order(req: Request) -> Result<Json<OrderResponse>, (u16, &'stati
     }))
 }
 
-// ── Main ────────────────────────────────────────────────
+// -- Main ----
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
-    println!("  ╔═══════════════════════════════════════════════════════════╗");
-    println!("  ║  CROSSBAR — Transport-Polymorphic URI Router              ║");
-    println!("  ║  Same handlers. Same URIs. Any transport.                ║");
-    println!("  ╚═══════════════════════════════════════════════════════════╝");
+    println!("  +==========================================================+");
+    println!("  |  CROSSBAR -- Transport-Polymorphic URI Router             |");
+    println!("  |  Same handlers. Same URIs. Any transport.                |");
+    println!("  +==========================================================+");
     println!();
 
     // Build router once
@@ -87,8 +87,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "symbol": "AAPL", "side": "buy", "qty": 100
     }))?;
 
-    // ── 1. Memory ───────────────────────────────────────
-    println!("\n  ━━━ Memory (in-process, sub-us) ━━━");
+    // -- 1. Memory ---
+    println!("\n  --- Memory (in-process, sub-us) ---");
     let mem = MemoryClient::new(router.clone());
 
     let r = mem.get("/health").await;
@@ -111,28 +111,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let r = mem.get("/nonexistent").await;
     println!("    GET  /nonexistent -> {}", r.status);
 
-    // ── 2. Channel ──────────────────────────────────────
-    println!("\n  ━━━ Channel (tokio::mpsc, ~1-5 us) ━━━");
-    let chan = ChannelServer::spawn(router.clone());
-
-    let r = chan.get("/health").await.unwrap();
-    println!("    GET  /health -> {} {}", r.status, r.body_str());
-
-    let r = chan
-        .get("/v3/stock/snapshot/ohlc/TSLA?venue=arca")
-        .await
-        .unwrap();
-    println!(
-        "    GET  /v3/stock/snapshot/ohlc/TSLA -> {} {}",
-        r.status,
-        truncate(r.body_str(), 60)
-    );
-
-    // ── 3. SHM (shared memory, Linux/Unix) ──────────────
+    // -- 2. SHM (shared memory, Linux/Unix) ---
     #[cfg(all(unix, feature = "shm"))]
     let shm = {
         let shm_name = "demo";
-        println!("\n  ━━━ Shared Memory (/dev/shm) ━━━");
+        println!("\n  --- Shared Memory (/dev/shm) ---");
         {
             let r = router.clone();
             tokio::spawn(async move {
@@ -162,59 +145,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shm
     };
 
-    // ── 4. UDS (Unix only) ──────────────────────────────
-    #[cfg(unix)]
-    let uds = {
-        let uds_path = "/tmp/crossbar-demo.sock";
-        println!("\n  ━━━ Unix Domain Socket ({uds_path}) ━━━");
-        {
-            let r = router.clone();
-            let p = uds_path.to_string();
-            tokio::spawn(async move {
-                UdsServer::bind(&p, r).await.unwrap();
-            });
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-
-        let uds = UdsClient::connect(uds_path).await?;
-        let r = uds.get("/health").await?;
-        println!("    GET  /health -> {} {}", r.status, r.body_str());
-
-        let r = uds.get("/v3/stock/snapshot/ohlc/MSFT?venue=nqb").await?;
-        println!(
-            "    GET  /v3/stock/snapshot/ohlc/MSFT -> {} {}",
-            r.status,
-            truncate(r.body_str(), 60)
-        );
-
-        uds
-    };
-
-    // ── 5. TCP ──────────────────────────────────────────
-    let tcp_addr = "127.0.0.1:19876";
-    println!("\n  ━━━ TCP ({tcp_addr}, TCP_NODELAY) ━━━");
-    {
-        let r = router.clone();
-        let a = tcp_addr.to_string();
-        tokio::spawn(async move {
-            TcpServer::bind(&a, r).await.unwrap();
-        });
-    }
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-
-    let tcp = TcpClient::connect(tcp_addr).await?;
-    let r = tcp.get("/health").await?;
-    println!("    GET  /health -> {} {}", r.status, r.body_str());
-
-    let r = tcp.get("/v3/stock/snapshot/ohlc/GOOG?venue=bats").await?;
-    println!(
-        "    GET  /v3/stock/snapshot/ohlc/GOOG -> {} {}",
-        r.status,
-        truncate(r.body_str(), 60)
-    );
-
-    // ── Latency comparison ──────────────────────────────
-    println!("\n  ━━━ Latency Comparison ━━━");
+    // -- Latency comparison ---
+    println!("\n  --- Latency Comparison ---");
     println!("    Warming up...");
     let uri = "/v3/stock/snapshot/ohlc/AAPL?venue=nqb";
     let n_warmup = 500;
@@ -223,59 +155,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Warm up all transports
     for _ in 0..n_warmup {
         mem.get(uri).await;
-        chan.get(uri).await.unwrap();
         #[cfg(all(unix, feature = "shm"))]
         shm.get(uri).await.unwrap();
-        #[cfg(unix)]
-        uds.get(uri).await.unwrap();
-        tcp.get(uri).await.unwrap();
     }
 
     // Measure memory
     let stats_mem = bench_transport(n_measure, || mem.get(uri)).await;
 
-    // Measure channel
-    let stats_chan = bench_transport(n_measure, || async { chan.get(uri).await.unwrap() }).await;
-
     // Measure SHM
     #[cfg(all(unix, feature = "shm"))]
     let stats_shm = bench_transport(n_measure, || async { shm.get(uri).await.unwrap() }).await;
-
-    // Measure UDS (Unix only)
-    #[cfg(unix)]
-    let stats_uds = bench_transport(n_measure, || async { uds.get(uri).await.unwrap() }).await;
-
-    // Measure TCP
-    let stats_tcp = bench_transport(n_measure, || async { tcp.get(uri).await.unwrap() }).await;
 
     println!();
     println!(
         "    {:<10} {:>10} {:>10} {:>10} {:>10}",
         "Transport", "min", "avg", "p99", "max"
     );
-    println!("    {}", "─".repeat(54));
+    println!("    {}", "-".repeat(54));
     print_stats("Memory", &stats_mem);
-    print_stats("Channel", &stats_chan);
     #[cfg(all(unix, feature = "shm"))]
     print_stats("SHM", &stats_shm);
-    #[cfg(unix)]
-    print_stats("UDS", &stats_uds);
-    print_stats("TCP", &stats_tcp);
 
     println!();
-    println!("    One router. Five transports. Same URIs. Same handlers.");
+    println!("    One router. Two transports. Same URIs. Same handlers.");
     println!();
 
     // Cleanup
     #[cfg(all(unix, feature = "shm"))]
     let _ = std::fs::remove_file("/dev/shm/crossbar-demo");
-    #[cfg(unix)]
-    let _ = std::fs::remove_file("/tmp/crossbar-demo.sock");
 
     Ok(())
 }
 
-// ── Bench helpers ───────────────────────────────────────
+// -- Bench helpers ----
 
 struct Stats {
     min_ns: u128,

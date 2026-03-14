@@ -6,13 +6,9 @@
 
 use std::fmt;
 
-// ── CrossbarError ────────────────────────────────────────
+// -- CrossbarError ----
 
 /// The unified error type for all crossbar operations.
-///
-/// Returned by [`UdsClient`](crate::transport::UdsClient),
-/// [`TcpClient`](crate::transport::TcpClient), and
-/// [`ChannelClient`](crate::transport::ChannelClient) methods.
 ///
 /// # Examples
 ///
@@ -38,23 +34,6 @@ pub enum CrossbarError {
     /// [`Method`](crate::types::Method) variant.
     InvalidMethod(u8),
 
-    /// The server-side task was dropped before the request could be processed.
-    ///
-    /// Typically indicates the [`ChannelServer`](crate::transport::ChannelServer)
-    /// task has exited.
-    ServerDropped,
-
-    /// The connection was closed by the remote before a response was received.
-    ConnectionClosed,
-
-    /// A peer sent a frame larger than [`MAX_FRAME_SIZE`](crate::transport::MAX_FRAME_SIZE).
-    FrameTooLarge {
-        /// The declared frame size.
-        size: usize,
-        /// The configured maximum.
-        max: usize,
-    },
-
     /// The shared-memory server has stopped updating its heartbeat.
     #[cfg(feature = "shm")]
     ShmServerDead,
@@ -72,6 +51,10 @@ pub enum CrossbarError {
     #[cfg(feature = "shm")]
     ShmSlotsFull,
 
+    /// All blocks in the shared-memory pool are in use.
+    #[cfg(feature = "shm")]
+    ShmPoolExhausted,
+
     /// The shared-memory region has invalid magic, version, or metadata.
     #[cfg(feature = "shm")]
     ShmInvalidRegion(String),
@@ -87,15 +70,6 @@ impl fmt::Display for CrossbarError {
             CrossbarError::Serialize(e) => write!(f, "serialization error: {e}"),
             CrossbarError::Deserialize(e) => write!(f, "deserialization error: {e}"),
             CrossbarError::InvalidMethod(b) => write!(f, "invalid method byte: 0x{b:02x}"),
-            CrossbarError::ServerDropped => {
-                write!(f, "server dropped: the router task has exited")
-            }
-            CrossbarError::ConnectionClosed => {
-                write!(f, "connection closed by remote peer")
-            }
-            CrossbarError::FrameTooLarge { size, max } => {
-                write!(f, "frame too large: {size} bytes (max {max})")
-            }
             #[cfg(feature = "shm")]
             CrossbarError::ShmServerDead => {
                 write!(f, "shared-memory server is dead (heartbeat stale)")
@@ -110,6 +84,10 @@ impl fmt::Display for CrossbarError {
             #[cfg(feature = "shm")]
             CrossbarError::ShmSlotsFull => {
                 write!(f, "all shared-memory slots are in use")
+            }
+            #[cfg(feature = "shm")]
+            CrossbarError::ShmPoolExhausted => {
+                write!(f, "all shared-memory pool blocks are in use")
             }
             #[cfg(feature = "shm")]
             CrossbarError::ShmInvalidRegion(msg) => {
