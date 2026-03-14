@@ -77,7 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/health", get(health))
         .route("/echo", post(echo));
 
-    let mem = MemoryClient::new(router.clone());
+    let mem = InProcessClient::new(router.clone());
     let resp = mem.get("/health").await;
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body_str(), r#"{"status":"ok"}"#);
@@ -97,7 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 | Transport | Scope | Typical latency | Notes |
 | --- | --- | --- | --- |
-| `MemoryClient` | In-process | sub-µs | Direct router dispatch, no framing, no syscalls |
+| `InProcessClient` | In-process | sub-µs | Direct router dispatch, no framing, no syscalls |
 | `ChannelServer::spawn()` | Cross-task | 1-5 µs | Tokio `mpsc` + `oneshot`, good for intra-process RPC |
 | `ShmServer` / `ShmClient` | Cross-process | 2-5 µs | mmap-backed RPC via `/dev/shm`, requires `shm` feature and Unix |
 | `UdsServer` / `UdsClient` | Same host | 10-50 µs | Compact binary framing over Unix domain sockets |

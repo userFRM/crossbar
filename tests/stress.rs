@@ -13,12 +13,12 @@ fn echo_router() -> Router {
 }
 
 // ===============================================
-// 100 concurrent memory requests
+// 100 concurrent in-process requests
 // ===============================================
 
 #[tokio::test]
-async fn stress_memory_100_concurrent() {
-    let client = Arc::new(MemoryClient::new(echo_router()));
+async fn stress_inproc_100_concurrent() {
+    let client = Arc::new(InProcessClient::new(echo_router()));
 
     let mut handles = Vec::new();
     for i in 0..100 {
@@ -54,7 +54,7 @@ async fn stress_100_routes_dispatch() {
         );
     }
 
-    let client = MemoryClient::new(router.clone());
+    let client = InProcessClient::new(router.clone());
 
     // Test first, middle, and last routes
     for i in [0, 1, 50, 99, 100, 149] {
@@ -76,12 +76,12 @@ async fn stress_100_routes_dispatch() {
 }
 
 // ===============================================
-// Memory rapid sequential (1000)
+// In-process rapid sequential (1000)
 // ===============================================
 
 #[tokio::test]
-async fn stress_memory_rapid_1000() {
-    let client = MemoryClient::new(echo_router());
+async fn stress_inproc_rapid_1000() {
+    let client = InProcessClient::new(echo_router());
 
     for i in 0..1000 {
         let resp = client.get("/health").await;

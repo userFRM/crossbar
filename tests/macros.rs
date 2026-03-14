@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 
 // ── Helper ────────────────────────────────────────────
 
-fn memory(router: Router) -> MemoryClient {
-    MemoryClient::new(router)
+fn inproc(router: Router) -> InProcessClient {
+    InProcessClient::new(router)
 }
 
 // ═══════════════════════════════════════════════════════
@@ -29,7 +29,7 @@ async fn derive_into_response_json() {
     }
 
     let router = Router::new().route("/ohlc", get(ohlc));
-    let client = memory(router);
+    let client = inproc(router);
     let resp = client.get("/ohlc").await;
     assert_eq!(resp.status, 200);
     assert_eq!(
@@ -55,7 +55,7 @@ async fn get_by_symbol(#[path("symbol")] symbol: String) -> String {
 #[tokio::test]
 async fn handler_path_extractor() {
     let router = Router::new().route("/asset/:symbol", get(get_by_symbol));
-    let client = memory(router);
+    let client = inproc(router);
     let resp = client.get("/asset/BTCUSD").await;
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body_str(), "symbol=BTCUSD");
@@ -65,7 +65,7 @@ async fn handler_path_extractor() {
 async fn handler_path_extractor_missing_returns_400() {
     // Route has no :symbol param, so path_param returns None -> 400
     let router = Router::new().route("/plain", get(get_by_symbol));
-    let client = memory(router);
+    let client = inproc(router);
     let resp = client.get("/plain").await;
     assert_eq!(resp.status, 400);
     assert!(resp.body_str().contains("missing path param"));
@@ -84,7 +84,7 @@ async fn search(#[query("q")] q: String, #[query("limit")] limit: Option<String>
 #[tokio::test]
 async fn handler_query_extractors() {
     let router = Router::new().route("/search", get(search));
-    let client = memory(router);
+    let client = inproc(router);
 
     let resp = client.get("/search?q=rust&limit=5").await;
     assert_eq!(resp.status, 200);
@@ -94,7 +94,7 @@ async fn handler_query_extractors() {
 #[tokio::test]
 async fn handler_query_optional_missing() {
     let router = Router::new().route("/search", get(search));
-    let client = memory(router);
+    let client = inproc(router);
 
     let resp = client.get("/search?q=rust").await;
     assert_eq!(resp.status, 200);
@@ -104,7 +104,7 @@ async fn handler_query_optional_missing() {
 #[tokio::test]
 async fn handler_query_required_missing_returns_400() {
     let router = Router::new().route("/search", get(search));
-    let client = memory(router);
+    let client = inproc(router);
 
     let resp = client.get("/search").await;
     assert_eq!(resp.status, 400);
@@ -129,7 +129,7 @@ async fn create_order(#[body] order: CreateOrder) -> String {
 #[tokio::test]
 async fn handler_body_extractor() {
     let router = Router::new().route("/orders", post(create_order));
-    let client = memory(router);
+    let client = inproc(router);
 
     let resp = client
         .post("/orders", r#"{"symbol":"AAPL","quantity":100}"#)
@@ -141,7 +141,7 @@ async fn handler_body_extractor() {
 #[tokio::test]
 async fn handler_body_extractor_invalid_json_returns_400() {
     let router = Router::new().route("/orders", post(create_order));
-    let client = memory(router);
+    let client = inproc(router);
 
     let resp = client.post("/orders", "not json").await;
     assert_eq!(resp.status, 400);
@@ -173,7 +173,7 @@ async fn update_asset(
 #[tokio::test]
 async fn handler_mixed_extractors() {
     let router = Router::new().route("/assets/:symbol", post(update_asset));
-    let client = memory(router);
+    let client = inproc(router);
 
     let resp = client
         .post("/assets/ETHUSD?venue=binance", r#"{"price":3200.50}"#)
@@ -194,7 +194,7 @@ async fn passthrough(req: Request) -> String {
 #[tokio::test]
 async fn handler_request_passthrough() {
     let router = Router::new().route("/info", get(passthrough));
-    let client = memory(router);
+    let client = inproc(router);
 
     let resp = client.get("/info").await;
     assert_eq!(resp.status, 200);
@@ -225,7 +225,7 @@ async fn get_asset_info(
 #[tokio::test]
 async fn handler_with_derive_into_response_end_to_end() {
     let router = Router::new().route("/assets/:symbol", get(get_asset_info));
-    let client = memory(router);
+    let client = inproc(router);
 
     let resp = client.get("/assets/SOLUSD?venue=ftx").await;
     assert_eq!(resp.status, 200);
@@ -251,7 +251,7 @@ async fn optional_path(#[path("id")] id: Option<String>) -> String {
 #[tokio::test]
 async fn handler_optional_path_present() {
     let router = Router::new().route("/items/:id", get(optional_path));
-    let client = memory(router);
+    let client = inproc(router);
     let resp = client.get("/items/42").await;
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body_str(), "42");
@@ -261,7 +261,7 @@ async fn handler_optional_path_present() {
 async fn handler_optional_path_missing() {
     // No :id in the pattern, so path_param returns None -> Option is None
     let router = Router::new().route("/items", get(optional_path));
-    let client = memory(router);
+    let client = inproc(router);
     let resp = client.get("/items").await;
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body_str(), "none");

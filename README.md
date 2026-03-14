@@ -6,7 +6,7 @@
 
 **Define handlers once. Serve over any transport.**
 
-Crossbar is a transport-agnostic URI router for Rust. You write your request handlers once — then serve them over in-process memory or cross-process shared memory. Switch transports without changing a single line of handler code.
+Crossbar is a transport-agnostic URI router for Rust. You write your request handlers once — then serve them over in-process or cross-process shared memory. Switch transports without changing a single line of handler code.
 
 ```rust
 let router = Router::new()
@@ -15,7 +15,7 @@ let router = Router::new()
     .route("/echo", post(echo));
 
 // Same router, same handlers — pick your transport.
-MemoryClient::new(router.clone());                         // in-process,     ~150 ns
+InProcessClient::new(router.clone());                      // in-process,     ~150 ns
 ShmServer::spawn("myapp", router.clone()).await?;          // cross-process,  ~3-5 µs
 ```
 
@@ -48,7 +48,7 @@ Run the demo to see both transports in action with a latency comparison:
 cargo run --example demo --features shm
 ```
 
-The demo builds a single router and exercises it over both Memory and SHM transports, printing per-transport latency statistics (min, avg, p99, max).
+The demo builds a single router and exercises it over both in-process and SHM transports, printing per-transport latency statistics (min, avg, p99, max).
 
 ---
 
@@ -59,7 +59,7 @@ The demo builds a single router and exercises it over both Memory and SHM transp
 - **You need IPC with URI routing** — crossbar gives you REST-like patterns (`/tick/:symbol`) without HTTP overhead
 - **You're building a trading system** — sub-microsecond in-process dispatch, with cross-process SHM for co-located services
 - **You have co-located services** — game servers, microservice sidecars, or ML pipelines on the same host
-- **You want transport-agnostic testing** — swap SHM for `MemoryClient` and run integration tests without shared memory setup
+- **You want transport-agnostic testing** — swap SHM for `InProcessClient` and run integration tests without shared memory setup
 
 ### Don't use crossbar when
 
@@ -79,7 +79,7 @@ The demo builds a single router and exercises it over both Memory and SHM transp
 
 Every transport follows the same pattern: the **client** sends a `Request`, the **router** dispatches it to a handler, and the **server** returns a `Response`. The difference is how the bytes travel between client and server.
 
-### Memory — direct function call
+### In-process — direct function call
 
 ```
 Client                   Server
@@ -89,7 +89,7 @@ Client                   Server
   ◄── Response ────────────┘
 ```
 
-The simplest transport. `MemoryClient` holds an `Arc<Router>` and calls `router.dispatch(req)` directly — the same way you'd call any async function. There is no serialization, no framing, no I/O. The request and response stay in the same memory space and the same thread.
+The simplest transport. `InProcessClient` holds an `Arc<Router>` and calls `router.dispatch(req)` directly — the same way you'd call any async function. There is no serialization, no framing, no I/O. The request and response stay in the same memory space and the same thread.
 
 **Cost:** one async function call (~150 ns).
 
@@ -178,7 +178,7 @@ Crossbar adds URI-based routing on top of shared memory. Without crossbar, you'd
 graph TD
     R["Router"] --> H["Handler<br>async fn(Request) -> impl IntoResponse"]
 
-    H --> M["Memory<br>~150 ns"]
+    H --> M["In-process<br>~150 ns"]
     H --> SHM["SHM V2<br>~3-5 µs"]
 
     M -.- MP["In-process<br>direct fn call"]
@@ -196,7 +196,7 @@ graph TD
 
 | Transport | Typical latency | Boundary | Data path | Platform |
 |---|---|---|---|---|
-| **Memory** | ~150 ns | Same thread | Direct `Arc<Router>` call | All |
+| **In-process** | ~150 ns | Same thread | Direct `Arc<Router>` call | All |
 | **SHM** | ~3-5 µs | Cross-process | `mmap` + block pool + atomics + futex | Unix (`shm` feature) |
 
 > [!IMPORTANT]
@@ -255,8 +255,8 @@ let router = Router::new()
 
 ```rust
 // In-process (testing, embedded)
-let mem = MemoryClient::new(router.clone());
-let resp = mem.get("/health").await;
+let client = InProcessClient::new(router.clone());
+let resp = client.get("/health").await;
 
 // Shared memory (cross-process, same host)
 ShmServer::bind("myapp", router).await?;
@@ -266,8 +266,8 @@ let resp = client.get("/health").await?;
 ```
 
 > [!TIP]
-> Use `MemoryClient` in your test suite. It has zero network overhead and doesn't need
-> port allocation, so your tests run faster and never flake on CI due to port conflicts.
+> Use `InProcessClient` in your test suite. It has zero overhead and doesn't need
+> shared memory setup, so your tests run faster and never flake on CI.
 
 ---
 
@@ -399,7 +399,7 @@ if let Some(sample) = subscription.try_recv_ref() {
 Criterion benchmarks for both transports. Full results, methodology, and throughput data
 in [BENCHMARKS.md](BENCHMARKS.md).
 
-| Benchmark | Memory | SHM |
+| Benchmark | In-process | SHM |
 |---|---|---|
 | `/health` (2B response) | ~150 ns | ~3-5 µs |
 | JSON + path params | ~1.2 µs | ~4-6 µs |
@@ -425,7 +425,7 @@ crossbar/
     error.rs            CrossbarError enum
     transport/
       mod.rs            SHM serialization helpers
-      memory.rs         MemoryClient (direct dispatch)
+      inproc.rs         InProcessClient (direct dispatch)
       shm/
         mod.rs          ShmServer, ShmClient, ShmHandle
         region.rs       V2 memory-mapped region, block pool allocator
@@ -433,18 +433,18 @@ crossbar/
         pubsub.rs       ShmPublisher, ShmSubscriber (zero-copy pub/sub)
   crossbar-macros/      #[handler] and #[derive(IntoResponse)] proc macros
   examples/
-    demo.rs             Memory + SHM latency comparison
+    demo.rs             In-process + SHM latency comparison
     pubsub_publisher.rs SHM pub/sub publisher example
     pubsub_subscriber.rs SHM pub/sub subscriber example
   tests/
-    transport.rs        20 transport tests (Memory + SHM)
+    transport.rs        20 transport tests (in-process + SHM)
     stress.rs           6 stress/concurrency tests
     routing.rs          31 URI pattern matching tests
     handler.rs          28 handler trait tests
     macros.rs           13 proc macro tests
     types.rs            64 type/serialization tests
   benches/
-    transport.rs        Criterion benchmarks (dispatch, memory, shm, pubsub)
+    transport.rs        Criterion benchmarks (dispatch, inproc, shm, pubsub)
 ```
 
 > **168 tests** across the workspace. Run with `cargo test --workspace --features shm`.

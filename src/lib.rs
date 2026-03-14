@@ -1,7 +1,7 @@
 //! # Crossbar
 //!
 //! **Transport-polymorphic URI router** -- define your handlers once and serve
-//! them over in-process memory or shared memory, all with the same API.
+//! them over in-process or shared memory, all with the same API.
 //!
 //! Crossbar is designed for low-latency, high-throughput Rust applications
 //! (trading systems, game servers, inter-process bridges) that need to swap
@@ -32,7 +32,7 @@
 //!         .route("/echo", post(echo));
 //!
 //!     // -- In-process (zero overhead) ---
-//!     let mem = MemoryClient::new(router.clone());
+//!     let mem = InProcessClient::new(router.clone());
 //!     let resp = mem.get("/health").await;
 //!     assert_eq!(resp.status, 200);
 //!

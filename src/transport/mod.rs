@@ -1,4 +1,4 @@
-//! Transport adapters: memory and shared memory.
+//! Transport adapters: in-process and shared memory.
 //!
 //! Every transport exposes the same conceptual API: a **server** that binds to
 //! some address and dispatches incoming requests through a
@@ -7,14 +7,14 @@
 //!
 //! | Transport | Typical latency | Notes |
 //! |-----------|-----------------|-------|
-//! | [`MemoryClient`] | sub-us | In-process, bypasses framing entirely |
+//! | [`InProcessClient`] | sub-us | In-process, bypasses framing entirely |
 //! | `ShmClient` | 2-5 us | Shared memory via `/dev/shm` (`shm` feature) |
 
-mod memory;
+mod inproc;
 #[cfg(all(unix, feature = "shm"))]
 mod shm;
 
-pub use memory::MemoryClient;
+pub use inproc::InProcessClient;
 #[cfg(all(unix, feature = "shm"))]
 pub use shm::{
     PubSubConfig, ShmClient, ShmConfig, ShmHandle, ShmLoan, ShmPublisher, ShmSample, ShmSampleRef,

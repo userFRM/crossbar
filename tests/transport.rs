@@ -36,28 +36,28 @@ fn test_router() -> Router {
 }
 
 // ===============================================
-// MemoryClient
+// InProcessClient
 // ===============================================
 
 #[tokio::test]
-async fn memory_get() {
-    let client = MemoryClient::new(test_router());
+async fn inproc_get() {
+    let client = InProcessClient::new(test_router());
     let resp = client.get("/health").await;
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body_str(), "ok");
 }
 
 #[tokio::test]
-async fn memory_post_with_body() {
-    let client = MemoryClient::new(test_router());
-    let resp = client.post("/echo", "hello memory").await;
+async fn inproc_post_with_body() {
+    let client = InProcessClient::new(test_router());
+    let resp = client.post("/echo", "hello inproc").await;
     assert_eq!(resp.status, 200);
-    assert_eq!(resp.body_str(), "hello memory");
+    assert_eq!(resp.body_str(), "hello inproc");
 }
 
 #[tokio::test]
-async fn memory_json_response() {
-    let client = MemoryClient::new(test_router());
+async fn inproc_json_response() {
+    let client = InProcessClient::new(test_router());
     let resp = client.get("/json").await;
     assert_eq!(resp.status, 200);
     let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
@@ -66,33 +66,33 @@ async fn memory_json_response() {
 }
 
 #[tokio::test]
-async fn memory_404() {
-    let client = MemoryClient::new(test_router());
+async fn inproc_404() {
+    let client = InProcessClient::new(test_router());
     let resp = client.get("/nonexistent").await;
     assert_eq!(resp.status, 404);
 }
 
 #[tokio::test]
-async fn memory_empty_body() {
-    let client = MemoryClient::new(test_router());
+async fn inproc_empty_body() {
+    let client = InProcessClient::new(test_router());
     let resp = client.post("/echo", "").await;
     assert_eq!(resp.status, 200);
     assert!(resp.body.is_empty());
 }
 
 #[tokio::test]
-async fn memory_binary_body_roundtrip() {
+async fn inproc_binary_body_roundtrip() {
     let binary: Vec<u8> = (0..=255).collect();
-    let client = MemoryClient::new(test_router());
+    let client = InProcessClient::new(test_router());
     let resp = client.post("/echo", binary.clone()).await;
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body.as_ref(), binary.as_slice());
 }
 
 #[tokio::test]
-async fn memory_large_payload() {
+async fn inproc_large_payload() {
     let data = vec![b'X'; 1_000_000]; // 1 MB
-    let client = MemoryClient::new(test_router());
+    let client = InProcessClient::new(test_router());
     let resp = client.post("/echo", data.clone()).await;
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body.len(), 1_000_000);
@@ -100,7 +100,7 @@ async fn memory_large_payload() {
 }
 
 #[tokio::test]
-async fn memory_json_roundtrip() {
+async fn inproc_json_roundtrip() {
     #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
     struct Item {
         id: u64,
@@ -114,7 +114,7 @@ async fn memory_json_roundtrip() {
             Json(item)
         }),
     );
-    let client = MemoryClient::new(router);
+    let client = InProcessClient::new(router);
 
     let input = Item {
         id: 123,
@@ -464,14 +464,14 @@ async fn shm_body_valid_after_slot_free() {
 // Cross-transport consistency
 // ===============================================
 
-/// Verify that the shm transport returns the exact same response as MemoryClient.
+/// Verify that the shm transport returns the exact same response as InProcessClient.
 #[cfg(all(unix, feature = "shm"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn shm_matches_memory_responses() {
+async fn shm_matches_inproc_responses() {
     let router = test_router();
 
-    // Memory baseline
-    let mem_client = MemoryClient::new(router.clone());
+    // In-process baseline
+    let mem_client = InProcessClient::new(router.clone());
     let mem_get = mem_client.get("/health").await;
     let mem_post = mem_client.post("/echo", "identical-payload").await;
     let mem_json = mem_client.get("/json").await;

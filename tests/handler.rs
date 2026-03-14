@@ -2,8 +2,8 @@ use crossbar::prelude::*;
 
 // ── Helpers ────────────────────────────────────────────
 
-fn memory(router: Router) -> MemoryClient {
-    MemoryClient::new(router)
+fn inproc(router: Router) -> InProcessClient {
+    InProcessClient::new(router)
 }
 
 // ═══════════════════════════════════════════════════════
@@ -17,7 +17,7 @@ async fn handler_0_arg_returns_str() {
     }
 
     let router = Router::new().route("/test", get(handler));
-    let client = memory(router);
+    let client = inproc(router);
     let resp = client.get("/test").await;
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body_str(), "hello");
@@ -30,7 +30,7 @@ async fn handler_0_arg_returns_string() {
     }
 
     let router = Router::new().route("/test", get(handler));
-    let client = memory(router);
+    let client = inproc(router);
     let resp = client.get("/test").await;
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body_str(), "dynamic");
@@ -43,7 +43,7 @@ async fn handler_0_arg_returns_response() {
     }
 
     let router = Router::new().route("/test", post(handler));
-    let client = memory(router);
+    let client = inproc(router);
     let resp = client.post("/test", "").await;
     assert_eq!(resp.status, 201);
     assert_eq!(resp.body_str(), "created");
@@ -56,7 +56,7 @@ async fn handler_0_arg_returns_tuple() {
     }
 
     let router = Router::new().route("/test", get(handler));
-    let client = memory(router);
+    let client = inproc(router);
     let resp = client.get("/test").await;
     assert_eq!(resp.status, 202);
     assert_eq!(resp.body_str(), "accepted");
@@ -73,7 +73,7 @@ async fn handler_1_arg_echoes_body() {
     }
 
     let router = Router::new().route("/echo", post(handler));
-    let client = memory(router);
+    let client = inproc(router);
     let resp = client.post("/echo", "test data").await;
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body_str(), "test data");
@@ -86,7 +86,7 @@ async fn handler_1_arg_reads_path_param() {
     }
 
     let router = Router::new().route("/users/:id", get(handler));
-    let client = memory(router);
+    let client = inproc(router);
     let resp = client.get("/users/99").await;
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body_str(), "user:99");
@@ -99,7 +99,7 @@ async fn handler_1_arg_reads_query() {
     }
 
     let router = Router::new().route("/search", get(handler));
-    let client = memory(router);
+    let client = inproc(router);
     let resp = client.get("/search?q=hello").await;
     assert_eq!(resp.body_str(), "hello");
 }
@@ -124,7 +124,7 @@ async fn handler_returns_json() {
     }
 
     let router = Router::new().route("/user", get(handler));
-    let client = memory(router);
+    let client = inproc(router);
     let resp = client.get("/user").await;
     assert_eq!(resp.status, 200);
     let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
@@ -139,7 +139,7 @@ async fn handler_returns_json_array() {
     }
 
     let router = Router::new().route("/nums", get(handler));
-    let client = memory(router);
+    let client = inproc(router);
     let resp = client.get("/nums").await;
     let v: Vec<i32> = serde_json::from_slice(&resp.body).unwrap();
     assert_eq!(v, vec![1, 2, 3]);
@@ -157,7 +157,7 @@ async fn handler_returns_result_ok() {
     }
 
     let router = Router::new().route("/items/:id", get(handler));
-    let client = memory(router);
+    let client = inproc(router);
     let resp = client.get("/items/5").await;
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body_str(), "found:5");
@@ -170,7 +170,7 @@ async fn handler_returns_result_err() {
     }
 
     let router = Router::new().route("/fail", get(handler));
-    let client = memory(router);
+    let client = inproc(router);
     let resp = client.get("/fail").await;
     assert_eq!(resp.status, 400);
     assert_eq!(resp.body_str(), "bad input");
@@ -187,7 +187,7 @@ async fn handler_returns_status_tuple() {
     }
 
     let router = Router::new().route("/teapot", get(handler));
-    let client = memory(router);
+    let client = inproc(router);
     let resp = client.get("/teapot").await;
     assert_eq!(resp.status, 418);
     assert_eq!(resp.body_str(), "I'm a teapot");
@@ -200,7 +200,7 @@ async fn handler_returns_status_tuple_string() {
     }
 
     let router = Router::new().route("/status", get(handler));
-    let client = memory(router);
+    let client = inproc(router);
     let resp = client.get("/status").await;
     assert_eq!(resp.status, 503);
     assert_eq!(resp.body_str(), "service unavailable");
@@ -217,7 +217,7 @@ async fn handler_returns_owned_string() {
     }
 
     let router = Router::new().route("/computed", get(handler));
-    let client = memory(router);
+    let client = inproc(router);
     let resp = client.get("/computed").await;
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body_str(), "computed: 42");
@@ -234,7 +234,7 @@ async fn boxed_handler_clone_via_router() {
     let router = Router::new().route("/test", get(|| async { "cloned" }));
     let cloned = router.clone();
 
-    let client = memory(cloned);
+    let client = inproc(cloned);
     let resp = client.get("/test").await;
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body_str(), "cloned");
@@ -243,7 +243,7 @@ async fn boxed_handler_clone_via_router() {
 #[tokio::test]
 async fn boxed_handler_multiple_calls_via_router() {
     let router = Router::new().route("/test", get(|| async { "multi" }));
-    let client = memory(router);
+    let client = inproc(router);
 
     for _ in 0..5 {
         let resp = client.get("/test").await;
@@ -258,7 +258,7 @@ async fn boxed_handler_multiple_calls_via_router() {
 #[tokio::test]
 async fn closure_handler_0_arg() {
     let router = Router::new().route("/test", get(|| async { "closure" }));
-    let client = memory(router);
+    let client = inproc(router);
     let resp = client.get("/test").await;
     assert_eq!(resp.body_str(), "closure");
 }
@@ -269,7 +269,7 @@ async fn closure_handler_1_arg() {
         "/echo",
         post(|req: Request| async move { Response::ok().with_body(req.body.clone()) }),
     );
-    let client = memory(router);
+    let client = inproc(router);
     let resp = client.post("/echo", "data").await;
     assert_eq!(resp.body_str(), "data");
 }
@@ -294,7 +294,7 @@ async fn handler_deserializes_json_body() {
     }
 
     let router = Router::new().route("/add", post(handler));
-    let client = memory(router);
+    let client = inproc(router);
 
     let resp = client.post("/add", r#"{"x":3,"y":7}"#).await;
     assert_eq!(resp.body_str(), "sum=10");
@@ -311,7 +311,7 @@ async fn sync_handler_0_arg_returns_str() {
     }
 
     let router = Router::new().route("/test", get(sync_handler(handler)));
-    let client = memory(router);
+    let client = inproc(router);
     let resp = client.get("/test").await;
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body_str(), "sync-hello");
@@ -324,7 +324,7 @@ async fn sync_handler_0_arg_returns_string() {
     }
 
     let router = Router::new().route("/test", get(sync_handler(handler)));
-    let client = memory(router);
+    let client = inproc(router);
     let resp = client.get("/test").await;
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body_str(), "sync-42");
@@ -337,7 +337,7 @@ async fn sync_handler_0_arg_returns_tuple() {
     }
 
     let router = Router::new().route("/test", post(sync_handler(handler)));
-    let client = memory(router);
+    let client = inproc(router);
     let resp = client.post("/test", "").await;
     assert_eq!(resp.status, 201);
     assert_eq!(resp.body_str(), "created-sync");
@@ -350,7 +350,7 @@ async fn sync_handler_0_arg_returns_response() {
     }
 
     let router = Router::new().route("/test", get(sync_handler(handler)));
-    let client = memory(router);
+    let client = inproc(router);
     let resp = client.get("/test").await;
     assert_eq!(resp.status, 204);
 }
@@ -362,7 +362,7 @@ async fn sync_handler_1_arg_echoes_body() {
     }
 
     let router = Router::new().route("/echo", post(sync_handler_with_req(handler)));
-    let client = memory(router);
+    let client = inproc(router);
     let resp = client.post("/echo", "sync-data").await;
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body_str(), "sync-data");
@@ -375,7 +375,7 @@ async fn sync_handler_1_arg_reads_path_param() {
     }
 
     let router = Router::new().route("/users/:id", get(sync_handler_with_req(handler)));
-    let client = memory(router);
+    let client = inproc(router);
     let resp = client.get("/users/77").await;
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body_str(), "user:77");
@@ -388,7 +388,7 @@ async fn sync_handler_1_arg_reads_query() {
     }
 
     let router = Router::new().route("/search", get(sync_handler_with_req(handler)));
-    let client = memory(router);
+    let client = inproc(router);
     let resp = client.get("/search?q=sync-search").await;
     assert_eq!(resp.body_str(), "sync-search");
 }
@@ -405,7 +405,7 @@ async fn sync_handler_returns_json() {
     }
 
     let router = Router::new().route("/info", get(sync_handler(handler)));
-    let client = memory(router);
+    let client = inproc(router);
     let resp = client.get("/info").await;
     assert_eq!(resp.status, 200);
     let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
@@ -440,7 +440,7 @@ async fn mixed_sync_and_async_handlers() {
         .route("/sync/echo", post(sync_handler_with_req(sync_echo)))
         .route("/async/echo", post(async_echo));
 
-    let client = memory(router);
+    let client = inproc(router);
 
     let resp = client.get("/sync/health").await;
     assert_eq!(resp.body_str(), "sync-ok");

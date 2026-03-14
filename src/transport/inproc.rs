@@ -3,7 +3,7 @@ use crate::types::{Method, Request, Response};
 use bytes::Bytes;
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// MemoryClient — in-process, zero-overhead
+// InProcessClient — in-process, zero-overhead
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 /// In-process client that dispatches directly to the router with no framing.
@@ -21,21 +21,21 @@ use bytes::Bytes;
 ///
 /// # #[tokio::main] async fn main() {
 /// let router = Router::new().route("/ping", get(ping));
-/// let client = MemoryClient::new(router);
+/// let client = InProcessClient::new(router);
 /// let resp = client.get("/ping").await;
 /// assert_eq!(resp.status, 200);
 /// # }
 /// ```
 #[derive(Clone)]
-pub struct MemoryClient {
+pub struct InProcessClient {
     router: Router,
 }
 
-impl MemoryClient {
-    /// Wraps a [`Router`] in a [`MemoryClient`].
+impl InProcessClient {
+    /// Wraps a [`Router`] in an [`InProcessClient`].
     #[must_use]
     pub fn new(router: Router) -> Self {
-        MemoryClient { router }
+        InProcessClient { router }
     }
 
     /// Dispatches `req` directly through the router and returns the response.

@@ -2,7 +2,7 @@ use crossbar::prelude::*;
 use serde::{Deserialize, Serialize};
 
 // -- Handlers ----
-// Same handlers serve over ALL transports -- memory and SHM.
+// Same handlers serve over ALL transports -- in-process and SHM.
 
 async fn health() -> &'static str {
     "ok"
@@ -87,9 +87,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "symbol": "AAPL", "side": "buy", "qty": 100
     }))?;
 
-    // -- 1. Memory ---
-    println!("\n  --- Memory (in-process, sub-us) ---");
-    let mem = MemoryClient::new(router.clone());
+    // -- 1. In-process ---
+    println!("\n  --- In-process (sub-us) ---");
+    let mem = InProcessClient::new(router.clone());
 
     let r = mem.get("/health").await;
     println!("    GET  /health -> {} {}", r.status, r.body_str());
@@ -159,7 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shm.get(uri).await.unwrap();
     }
 
-    // Measure memory
+    // Measure in-process
     let stats_mem = bench_transport(n_measure, || mem.get(uri)).await;
 
     // Measure SHM
@@ -172,7 +172,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Transport", "min", "avg", "p99", "max"
     );
     println!("    {}", "-".repeat(54));
-    print_stats("Memory", &stats_mem);
+    print_stats("InProc", &stats_mem);
     #[cfg(all(unix, feature = "shm"))]
     print_stats("SHM", &stats_shm);
 

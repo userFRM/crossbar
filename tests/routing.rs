@@ -47,15 +47,15 @@ fn test_router() -> Router {
         .route("/echo", patch(|| async { (200u16, "patched") }))
 }
 
-fn memory(router: Router) -> MemoryClient {
-    MemoryClient::new(router)
+fn inproc(router: Router) -> InProcessClient {
+    InProcessClient::new(router)
 }
 
 // ── Basic route matching ───────────────────────────────
 
 #[tokio::test]
 async fn basic_route_exact_match_200() {
-    let client = memory(test_router());
+    let client = inproc(test_router());
     let resp = client.get("/health").await;
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body_str(), "ok");
@@ -63,7 +63,7 @@ async fn basic_route_exact_match_200() {
 
 #[tokio::test]
 async fn basic_route_items_get() {
-    let client = memory(test_router());
+    let client = inproc(test_router());
     let resp = client.get("/items").await;
     assert_eq!(resp.status, 200);
     // Should be JSON array
@@ -75,7 +75,7 @@ async fn basic_route_items_get() {
 
 #[tokio::test]
 async fn path_param_single() {
-    let client = memory(test_router());
+    let client = inproc(test_router());
     let resp = client.get("/items/42").await;
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body_str(), "item:42");
@@ -83,7 +83,7 @@ async fn path_param_single() {
 
 #[tokio::test]
 async fn path_param_string_value() {
-    let client = memory(test_router());
+    let client = inproc(test_router());
     let resp = client.get("/items/hello-world").await;
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body_str(), "item:hello-world");
@@ -91,7 +91,7 @@ async fn path_param_string_value() {
 
 #[tokio::test]
 async fn multiple_path_params() {
-    let client = memory(test_router());
+    let client = inproc(test_router());
     let resp = client.get("/market/binance/BTCUSDT").await;
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body_str(), "binance:BTCUSDT");
@@ -101,7 +101,7 @@ async fn multiple_path_params() {
 
 #[tokio::test]
 async fn query_params_extraction() {
-    let client = memory(test_router());
+    let client = inproc(test_router());
     let resp = client.get("/search?q=rust&page=3").await;
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body_str(), "q=rust&page=3");
@@ -109,7 +109,7 @@ async fn query_params_extraction() {
 
 #[tokio::test]
 async fn query_params_missing_values() {
-    let client = memory(test_router());
+    let client = inproc(test_router());
     let resp = client.get("/search").await;
     assert_eq!(resp.status, 200);
     // Both q and page should be empty strings via unwrap_or_default
@@ -118,7 +118,7 @@ async fn query_params_missing_values() {
 
 #[tokio::test]
 async fn query_params_partial() {
-    let client = memory(test_router());
+    let client = inproc(test_router());
     let resp = client.get("/search?q=hello").await;
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body_str(), "q=hello&page=");
@@ -128,7 +128,7 @@ async fn query_params_partial() {
 
 #[tokio::test]
 async fn percent_encoded_path_param() {
-    let client = memory(test_router());
+    let client = inproc(test_router());
     // %20 -> space in path param
     let resp = client.get("/items/hello%20world").await;
     assert_eq!(resp.status, 200);
@@ -139,7 +139,7 @@ async fn percent_encoded_path_param() {
 async fn percent_encoded_slash_in_path_param() {
     // %2F in a segment won't match because path splitting happens before decoding
     // The router splits on '/', so %2F stays as one segment and is decoded to '/'
-    let client = memory(test_router());
+    let client = inproc(test_router());
     let resp = client.get("/items/a%2Fb").await;
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body_str(), "item:a/b");
@@ -147,7 +147,7 @@ async fn percent_encoded_slash_in_path_param() {
 
 #[tokio::test]
 async fn percent_encoded_query_params() {
-    let client = memory(test_router());
+    let client = inproc(test_router());
     let resp = client.get("/search?q=hello%20world&page=1").await;
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body_str(), "q=hello world&page=1");
@@ -155,7 +155,7 @@ async fn percent_encoded_query_params() {
 
 #[tokio::test]
 async fn plus_as_space_in_query() {
-    let client = memory(test_router());
+    let client = inproc(test_router());
     let resp = client.get("/search?q=hello+world&page=1").await;
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body_str(), "q=hello world&page=1");
@@ -165,7 +165,7 @@ async fn plus_as_space_in_query() {
 
 #[tokio::test]
 async fn unmatched_route_returns_404() {
-    let client = memory(test_router());
+    let client = inproc(test_router());
     let resp = client.get("/nonexistent").await;
     assert_eq!(resp.status, 404);
     assert_eq!(resp.body_str(), "not found");
@@ -173,7 +173,7 @@ async fn unmatched_route_returns_404() {
 
 #[tokio::test]
 async fn unmatched_deep_path_404() {
-    let client = memory(test_router());
+    let client = inproc(test_router());
     let resp = client.get("/a/b/c/d/e").await;
     assert_eq!(resp.status, 404);
 }
@@ -182,7 +182,7 @@ async fn unmatched_deep_path_404() {
 
 #[tokio::test]
 async fn get_handler_does_not_match_post() {
-    let client = memory(test_router());
+    let client = inproc(test_router());
     // /health is only registered for GET
     let resp = client.post("/health", "body").await;
     assert_eq!(resp.status, 404);
@@ -190,7 +190,7 @@ async fn get_handler_does_not_match_post() {
 
 #[tokio::test]
 async fn post_handler_matches_post() {
-    let client = memory(test_router());
+    let client = inproc(test_router());
     let resp = client.post("/items", "new-item").await;
     assert_eq!(resp.status, 201);
     assert_eq!(resp.body_str(), "created:new-item");
@@ -200,7 +200,7 @@ async fn post_handler_matches_post() {
 
 #[tokio::test]
 async fn same_path_different_methods() {
-    let client = memory(test_router());
+    let client = inproc(test_router());
 
     // PUT /echo
     let resp = client
@@ -231,7 +231,7 @@ async fn first_match_wins() {
     let router = Router::new()
         .route("/test", get(|| async { "first" }))
         .route("/test", get(|| async { "second" }));
-    let client = memory(router);
+    let client = inproc(router);
     let resp = client.get("/test").await;
     assert_eq!(resp.body_str(), "first");
 }
@@ -241,7 +241,7 @@ async fn first_match_wins() {
 #[tokio::test]
 async fn trailing_slash_matches() {
     // The router filters empty segments, so "/health/" and "/health" should match the same
-    let client = memory(test_router());
+    let client = inproc(test_router());
     let resp = client.get("/health/").await;
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body_str(), "ok");
@@ -249,7 +249,7 @@ async fn trailing_slash_matches() {
 
 #[tokio::test]
 async fn leading_and_trailing_slashes() {
-    let client = memory(test_router());
+    let client = inproc(test_router());
     let resp = client.get("///health///").await;
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body_str(), "ok");
@@ -260,7 +260,7 @@ async fn leading_and_trailing_slashes() {
 #[tokio::test]
 async fn double_slash_in_path() {
     // /items//42 -> segments ["items", "42"] because empty segments are filtered
-    let client = memory(test_router());
+    let client = inproc(test_router());
     let resp = client.get("/items//42").await;
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body_str(), "item:42");
@@ -272,7 +272,7 @@ async fn double_slash_in_path() {
 async fn percent_encoded_unicode_path_param() {
     // Use percent-encoded UTF-8 bytes for unicode characters.
     // "café" = 63 61 66 c3 a9 => "caf%C3%A9"
-    let client = memory(test_router());
+    let client = inproc(test_router());
     let resp = client.get("/items/caf%C3%A9").await;
     assert_eq!(resp.status, 200);
     // percent_decode accumulates raw bytes and converts via String::from_utf8,
@@ -283,7 +283,7 @@ async fn percent_encoded_unicode_path_param() {
 #[tokio::test]
 async fn ascii_path_param_unicode_safe() {
     // ASCII path params work fine
-    let client = memory(test_router());
+    let client = inproc(test_router());
     let resp = client.get("/items/hello-world").await;
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body_str(), "item:hello-world");
@@ -323,8 +323,8 @@ async fn router_clone_shares_routes() {
     assert_eq!(router.routes_info(), clone.routes_info());
 
     // Both should work independently
-    let client1 = memory(router);
-    let client2 = memory(clone);
+    let client1 = inproc(router);
+    let client2 = inproc(clone);
 
     let r1 = client1.get("/health").await;
     let r2 = client2.get("/health").await;
@@ -337,7 +337,7 @@ async fn router_clone_shares_routes() {
 #[tokio::test]
 async fn root_path_route() {
     let router = Router::new().route("/", get(|| async { "root" }));
-    let client = memory(router);
+    let client = inproc(router);
     let resp = client.get("/").await;
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body_str(), "root");
@@ -346,7 +346,7 @@ async fn root_path_route() {
 #[tokio::test]
 async fn empty_router_returns_404() {
     let router = Router::new();
-    let client = memory(router);
+    let client = inproc(router);
     let resp = client.get("/anything").await;
     assert_eq!(resp.status, 404);
 }
@@ -357,7 +357,7 @@ async fn path_param_with_dots() {
         "/files/:filename",
         get(|req: Request| async move { req.path_param("filename").unwrap_or("?").to_string() }),
     );
-    let client = memory(router);
+    let client = inproc(router);
     let resp = client.get("/files/document.pdf").await;
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body_str(), "document.pdf");
@@ -369,7 +369,7 @@ async fn path_param_with_special_chars() {
         "/users/:name",
         get(|req: Request| async move { req.path_param("name").unwrap_or("?").to_string() }),
     );
-    let client = memory(router);
+    let client = inproc(router);
     let resp = client.get("/users/john-doe_123").await;
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body_str(), "john-doe_123");
@@ -387,7 +387,7 @@ async fn query_with_empty_value() {
             )
         }),
     );
-    let client = memory(router);
+    let client = inproc(router);
     let resp = client.get("/test?key=").await;
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body_str(), "key=");
@@ -405,7 +405,7 @@ async fn query_with_no_equals() {
             )
         }),
     );
-    let client = memory(router);
+    let client = inproc(router);
     // "flag" with no '=' => value should be ""
     let resp = client.get("/test?flag").await;
     assert_eq!(resp.status, 200);

@@ -58,12 +58,12 @@ fn order_json_body() -> Vec<u8> {
 }
 
 // ====================================================
-// 1. Dispatch -- router dispatch only (via MemoryClient, zero transport)
+// 1. Dispatch -- router dispatch only (via InProcessClient, zero transport)
 // ====================================================
 
 fn bench_dispatch(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let client = MemoryClient::new(make_router());
+    let client = InProcessClient::new(make_router());
 
     let mut group = c.benchmark_group("dispatch");
     group.measurement_time(Duration::from_millis(500));
@@ -91,15 +91,15 @@ fn bench_dispatch(c: &mut Criterion) {
 }
 
 // ====================================================
-// 2. Memory -- in-process MemoryClient
+// 2. In-process -- InProcessClient
 // ====================================================
 
-fn bench_memory(c: &mut Criterion) {
+fn bench_inproc(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let client = MemoryClient::new(make_router());
+    let client = InProcessClient::new(make_router());
     let body = order_json_body();
 
-    let mut group = c.benchmark_group("memory");
+    let mut group = c.benchmark_group("inproc");
     group.measurement_time(Duration::from_millis(500));
 
     group.bench_function("health", |b| {
@@ -352,8 +352,8 @@ fn bench_pubsub(c: &mut Criterion) {
 fn bench_throughput(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
-    // Memory client
-    let mem = MemoryClient::new(make_router());
+    // In-process client
+    let mem = InProcessClient::new(make_router());
 
     // SHM client (separate name from the shm group)
     #[cfg(all(unix, feature = "shm"))]
@@ -371,7 +371,7 @@ fn bench_throughput(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(65_536));
         group.measurement_time(Duration::from_secs(3));
 
-        group.bench_function("memory", |b| {
+        group.bench_function("inproc", |b| {
             let mem = &mem;
             b.to_async(&rt)
                 .iter(|| async { black_box(mem.get("/large/64k").await) })
@@ -393,7 +393,7 @@ fn bench_throughput(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(1_048_576));
         group.measurement_time(Duration::from_secs(3));
 
-        group.bench_function("memory", |b| {
+        group.bench_function("inproc", |b| {
             let mem = &mem;
             b.to_async(&rt)
                 .iter(|| async { black_box(mem.get("/large/1m").await) })
@@ -419,7 +419,7 @@ fn bench_throughput(c: &mut Criterion) {
 criterion_group!(
     benches_common,
     bench_dispatch,
-    bench_memory,
+    bench_inproc,
     bench_throughput,
 );
 

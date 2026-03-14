@@ -37,7 +37,7 @@ Pub/sub benchmarks use 1 MiB sample capacity with a 64-slot ring.
 
 ### What is measured
 
-The timing covers the **full client-side round-trip**: serialize request, transmit, route, execute handler, serialize response, receive. For Memory transport, this is a direct `Arc<Router>` function call. For SHM, this includes block allocation, memcpy writes, atomic state transitions, and zero-copy reads. For pub/sub, it covers publish (memcpy into mmap) + receive (pointer deref or copy).
+The timing covers the **full client-side round-trip**: serialize request, transmit, route, execute handler, serialize response, receive. For In-process transport, this is a direct `Arc<Router>` function call. For SHM, this includes block allocation, memcpy writes, atomic state transitions, and zero-copy reads. For pub/sub, it covers publish (memcpy into mmap) + receive (pointer deref or copy).
 
 ### What is NOT measured
 
@@ -49,7 +49,7 @@ The timing covers the **full client-side round-trip**: serialize request, transm
 
 ### Request/Response latency (single client, sequential requests)
 
-| Benchmark | Memory | SHM (V2) |
+| Benchmark | In-process | SHM (V2) |
 |---|---|---|
 | `/health` (2-byte response) | 149 ns | 54.1 µs |
 | JSON + path params (OHLC) | 1.17 µs | 55.6 µs |
@@ -76,7 +76,7 @@ subscriber — the naming reflects the publisher API used.
 
 ### Request/Response throughput (bytes/sec, large payloads)
 
-| Payload | Memory | SHM |
+| Payload | In-process | SHM |
 |---|---|---|
 | 64 KB | 50.2 GiB/s | 1.1 GiB/s |
 | 1 MB | 53.5 GiB/s | 13.6 GiB/s |
@@ -90,7 +90,7 @@ subscriber — the naming reflects the publisher API used.
 
 ## Interpretation
 
-**Memory** is a direct function call through `Arc<Router>` — no serialization, no copying,
+**In-process** is a direct function call through `Arc<Router>` — no serialization, no copying,
 no kernel involvement. This is the theoretical floor.
 
 **SHM RPC (V2)** uses `mmap` + block pool allocator + atomics + futex for cross-process
@@ -139,7 +139,7 @@ architecture requires the publisher to own the data externally and copy it in.
 
 These benchmarks measure **single-client sequential latency**. Under concurrent load:
 
-- Memory scales linearly with tokio worker threads
+- In-process scales linearly with tokio worker threads
 - SHM RPC supports concurrent requests across coordination slots with block pool contention managed by lock-free CAS
 - Pub/sub supports many concurrent subscribers reading the same ring buffer
 
@@ -150,7 +150,7 @@ These benchmarks measure **single-client sequential latency**. Under concurrent 
 cargo bench --features shm
 
 # Specific group
-cargo bench -- "memory/"
+cargo bench -- "inproc/"
 cargo bench -- "shm/"
 cargo bench -- "dispatch/"
 
