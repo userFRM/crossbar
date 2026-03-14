@@ -33,9 +33,9 @@ pub use inproc::InProcessClient;
 #[cfg(all(unix, feature = "shm"))]
 pub use shm::{
     BidiClient, BidiConfig, BidiServer, PoolPubSubConfig, PoolTopicHandle, PubSubConfig, ShmClient,
-    ShmConfig, ShmHandle, ShmLoan, ShmPoolPublisher, ShmPoolSampleGuard, ShmPoolSubscriber,
-    ShmPoolSubscription, ShmPublisher, ShmSample, ShmSampleRef, ShmServer, ShmSubscriber,
-    ShmSubscription, TopicHandle,
+    ShmConfig, ShmHandle, ShmLoan, ShmPoolLoan, ShmPoolPublisher, ShmPoolSampleGuard,
+    ShmPoolSubscriber, ShmPoolSubscription, ShmPublisher, ShmSample, ShmSampleRef, ShmServer,
+    ShmSubscriber, ShmSubscription, TopicHandle,
 };
 
 #[cfg(feature = "shm")]

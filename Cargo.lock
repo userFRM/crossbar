@@ -229,6 +229,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbar-ffi"
+version = "0.1.0"
+dependencies = [
+ "crossbar",
+]
+
+[[package]]
 name = "crossbar-macros"
 version = "0.1.0"
 dependencies = [

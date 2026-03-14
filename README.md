@@ -34,6 +34,25 @@ Both benchmarks use the same operations: `loan buffer` -> `write data` -> `publi
 
 ### Pub/sub — two processes, one topic
 
+```mermaid
+sequenceDiagram
+    participant P as Publisher
+    participant SHM as Shared Memory<br/>(mmap)
+    participant S as Subscriber
+
+    P->>SHM: alloc block from pool (CAS)
+    P->>SHM: write data via as_mut_slice()<br/>(born-in-SHM, no copy)
+    P->>SHM: publish() — write 8B descriptor to ring
+
+    Note over P,SHM: O(1) transfer · 64 ns
+
+    S->>SHM: try_recv() — read descriptor from ring
+    S->>SHM: increment refcount (CAS)
+    SHM->>S: safe Deref into mmap (zero-copy)
+
+    Note over S: guard dropped → block freed
+```
+
 **Publisher** writes price data directly into shared memory:
 
 ```rust
@@ -87,6 +106,26 @@ cargo run --example pubsub_subscriber --features shm
 
 When you need to call a function in another process by URI. Same patterns as any web framework — path params, query strings, JSON bodies — but over shared memory:
 
+```mermaid
+sequenceDiagram
+    participant C as Client Process
+    participant SHM as Shared Memory<br/>(mmap)
+    participant S as Server Process
+
+    C->>SHM: alloc block + write request
+    C->>SHM: state = REQUEST_READY
+
+    S->>SHM: scan finds REQUEST_READY (CAS)
+    S->>S: route match + handler dispatch
+    S->>SHM: alloc block + write response
+    S->>SHM: state = RESPONSE_READY
+
+    SHM->>C: spin detects RESPONSE_READY
+    C->>SHM: zero-copy read via Body::Mmap
+
+    Note over C,S: ~757 ns roundtrip
+```
+
 ```rust
 use crossbar::prelude::*;
 
@@ -122,9 +161,84 @@ let client = InProcessClient::new(router);
 let resp = client.get("/health").await;  // ~143 ns
 ```
 
+### Bidirectional — RPC + streaming events
+
+`BidiServer` combines RPC with server-push events. The server handles requests AND pushes events to clients on named topics:
+
+```mermaid
+sequenceDiagram
+    participant C as BidiClient
+    participant SHM as Shared Memory<br/>(mmap)
+    participant S as BidiServer
+
+    Note over C,S: RPC (client → server)
+    C->>SHM: client.get("/health")
+    SHM->>S: route + dispatch
+    S->>SHM: write response
+    SHM->>C: zero-copy read
+
+    Note over C,S: Server-push events (server → client)
+    S->>SHM: server.loan(&topic) + publish()
+    SHM->>C: sub.try_recv() — zero-copy
+```
+
+```rust
+use crossbar::prelude::*;
+
+// Server: handles RPC + pushes events
+let router = Router::new().route("/health", get(|| async { "ok" }));
+let mut server = BidiServer::spawn("myapp", router).await?;
+
+// Register topics and push events
+let price_topic = server.register("/prices/AAPL")?;
+let mut loan = server.loan(&price_topic);
+loan.set_data(b"152.50");
+loan.publish();
+
+// Client: makes RPC calls + receives events
+let client = BidiClient::connect("myapp").await?;
+let resp = client.get("/health").await?;              // RPC
+
+let mut sub = client.subscribe("/prices/AAPL")?;      // event stream
+if let Some(sample) = sub.try_recv() {
+    println!("price: {}", std::str::from_utf8(&*sample).unwrap());
+}
+```
+
 ---
 
 ## How it works
+
+```mermaid
+graph LR
+    subgraph "Process A"
+        PUB["Publisher"]
+        CLIENT["RPC Client"]
+        BIDI_C["Bidi Client"]
+    end
+
+    subgraph "Shared Memory (/dev/shm)"
+        POOL["Block Pool<br/>Treiber Stack"]
+        RING["Ring Buffer<br/>8B descriptors"]
+        SLOTS["Coordination Slots<br/>State Machine"]
+    end
+
+    subgraph "Process B"
+        SUB["Subscriber"]
+        SERVER["RPC Server<br/>+ URI Router"]
+        BIDI_S["Bidi Server"]
+    end
+
+    PUB -->|"loan + publish"| POOL
+    POOL -->|"descriptor"| RING
+    RING -->|"try_recv"| SUB
+
+    CLIENT -->|"request"| SLOTS
+    SLOTS -->|"response"| CLIENT
+    SLOTS -->|"dispatch"| SERVER
+
+    BIDI_C <-->|"RPC + events"| BIDI_S
+```
 
 Both pub/sub and RPC use the same underlying mechanism:
 
@@ -309,15 +423,16 @@ crossbar/
 
 ## Language bindings
 
-Crossbar's shared memory layout is a stable binary format. Any language that can `mmap` a file and do atomic operations can interoperate. Planned SDKs:
+Crossbar's shared memory layout is a stable binary format. Any language that can `mmap` a file and do atomic operations can interoperate.
 
-| Language | Status |
-|---|---|
-| Rust | done |
-| Python | planned |
-| C / C++ | planned |
-| Go | planned |
-| Zig | planned |
+| Language | Status | Location |
+|---|---|---|
+| Rust | done | `src/` |
+| C | done | `crossbar-ffi/` (cdylib + staticlib + header) |
+| C++ | done | `bindings/cpp/` (header-only RAII, C++17) |
+| Python | done | `bindings/python/` (ctypes) |
+| Go | done | `bindings/go/` (cgo) |
+| Zig | planned | — |
 
 ---
 

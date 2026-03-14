@@ -18,8 +18,8 @@ pub(crate) mod region;
 pub use bidi::{BidiClient, BidiConfig, BidiServer};
 #[allow(unused_imports)] // used by consumers, not internally
 pub use pool_pubsub::{
-    PoolPubSubConfig, PoolTopicHandle, ShmPoolPublisher, ShmPoolSampleGuard, ShmPoolSubscriber,
-    ShmPoolSubscription,
+    PoolPubSubConfig, PoolTopicHandle, ShmPoolLoan, ShmPoolPublisher, ShmPoolSampleGuard,
+    ShmPoolSubscriber, ShmPoolSubscription,
 };
 pub use pubsub::{
     PubSubConfig, ShmLoan, ShmPublisher, ShmSample, ShmSampleRef, ShmSubscriber, ShmSubscription,

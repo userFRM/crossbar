@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crossbar-macros"]
+members = [".", "crossbar-macros", "crossbar-ffi"]
 
 [package]
 name = "crossbar"

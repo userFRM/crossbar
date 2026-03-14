@@ -1,0 +1,12 @@
+[package]
+name = "crossbar-ffi"
+version = "0.1.0"
+edition = "2021"
+description = "C FFI bindings for crossbar zero-copy IPC"
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+crossbar = { path = "..", features = ["shm"] }
