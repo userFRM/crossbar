@@ -320,8 +320,17 @@ impl ShmRegion {
             let block_size = u32::from_le_bytes(buf4);
 
             let expected_size = GLOBAL_HEADER_SIZE
-                + slot_count as usize * SLOT_SIZE
-                + block_count as usize * block_size as usize;
+                .checked_add(
+                    (slot_count as usize)
+                        .checked_mul(SLOT_SIZE)
+                        .ok_or_else(|| {
+                            CrossbarError::ShmInvalidRegion("layout size overflows (slots)".into())
+                        })?,
+                )
+                .and_then(|s| {
+                    s.checked_add((block_count as usize).checked_mul(block_size as usize)?)
+                })
+                .ok_or_else(|| CrossbarError::ShmInvalidRegion("layout size overflows".into()))?;
             if mmap.len() < expected_size {
                 return Err(CrossbarError::ShmInvalidRegion(format!(
                     "region size {} < expected {expected_size}",

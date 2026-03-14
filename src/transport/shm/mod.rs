@@ -398,6 +398,20 @@ impl PollerWake {
         };
         n > 0
     }
+
+    /// Block until a wake signal arrives or `timeout_ms` elapses.
+    fn wait(&self, timeout_ms: i32) {
+        use std::os::fd::AsRawFd;
+        let mut pfd = libc::pollfd {
+            fd: self.fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: poll with a single fd is well-defined.
+        unsafe {
+            libc::poll(&mut pfd, 1, timeout_ms);
+        }
+    }
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
@@ -432,6 +446,20 @@ impl PollerWake {
         // SAFETY: reading from a pipe is well-defined.
         let n = unsafe { libc::read(self.read_fd.as_raw_fd(), buf.as_mut_ptr().cast(), 64) };
         n > 0
+    }
+
+    /// Block until a wake signal arrives or `timeout_ms` elapses.
+    fn wait(&self, timeout_ms: i32) {
+        use std::os::fd::AsRawFd;
+        let mut pfd = libc::pollfd {
+            fd: self.read_fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: poll with a single fd is well-defined.
+        unsafe {
+            libc::poll(&mut pfd, 1, timeout_ms);
+        }
     }
 }
 
@@ -576,6 +604,23 @@ impl ShmClient {
         region: &Arc<ShmRegion>,
         slot_idx: u32,
     ) -> Result<Response, CrossbarError> {
+        // CAS to claim the slot — prevents race with stale recovery.
+        // PROCESSING is skipped by recover_stale_slots and not targeted
+        // by try_acquire_slot, so this is a safe intermediate state.
+        if region
+            .slot_state(slot_idx)
+            .compare_exchange(
+                RESPONSE_READY,
+                PROCESSING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            // Stale recovery already reclaimed this slot
+            return Err(CrossbarError::ShmServerDead);
+        }
+
         let resp_block_idx = region.response_block_idx(slot_idx);
         let resp = if resp_block_idx == u32::MAX {
             let status = region.response_status(slot_idx);
@@ -622,9 +667,9 @@ impl ShmClient {
             }
 
             if inflight.is_empty() {
-                // Nothing to poll — park until a new request arrives or stop.
-                // Use park_timeout so the stop flag is checked periodically.
-                std::thread::park_timeout(Duration::from_millis(10));
+                // Nothing to poll — block on the wake fd until a new request
+                // arrives or 10ms elapses (so the stop flag is checked).
+                wake.wait(10);
                 continue;
             }
 
@@ -761,10 +806,14 @@ impl ShmClient {
         // Now safe to extract/allocate the block.
         let (req_block_idx, direct_body_len) = if let Body::ShmDirect(ref mut guard) = req.body {
             // Verify the block belongs to this client's region (provenance check)
-            assert!(
-                Arc::ptr_eq(&guard.region, &self.region),
-                "ShmDirect body belongs to a different SHM region"
-            );
+            if !Arc::ptr_eq(&guard.region, &self.region) {
+                self.region
+                    .slot_state(slot_idx)
+                    .store(FREE, Ordering::Release);
+                return Err(CrossbarError::ShmInvalidRegion(
+                    "ShmDirect body belongs to a different SHM region".into(),
+                ));
+            }
             (guard.take_block_idx(), Some(guard.body_len))
         } else {
             match self.region.alloc_block() {
