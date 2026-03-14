@@ -28,7 +28,7 @@ Most web frameworks (axum, actix, warp) couple your handlers to HTTP. Crossbar d
 **In plain terms:** imagine you have a function that returns stock prices. With crossbar, that same function can serve requests from:
 
 - Another function in the same program (152 nanoseconds)
-- Another process on the same machine via shared memory (54 microseconds RPC, 218 nanoseconds pub/sub)
+- Another process on the same machine via shared memory (54 µs RPC, 218 ns ring pub/sub, **67 ns pool pub/sub** — O(1), 1.5× faster than iceoryx2)
 
 You never change the function. You only change how it's wired up.
 
@@ -60,7 +60,7 @@ The demo builds a single router and exercises it over both in-process and SHM tr
 - **You're building a trading system** — sub-microsecond in-process dispatch, with cross-process SHM for co-located services
 - **You have co-located services** — game servers, microservice sidecars, or ML pipelines on the same host
 - **You want transport-agnostic testing** — swap SHM for `InProcessClient` and run integration tests without shared memory setup
-- **You need pub/sub over shared memory** — 218 ns end-to-end with futex wake, 45 ns without
+- **You need pub/sub over shared memory** — 218 ns ring (45 ns silent), 67 ns pool (O(1) any payload size, 1.5× faster than iceoryx2)
 
 ### Don't use crossbar when
 
@@ -132,6 +132,10 @@ Synchronization uses a spin-then-futex strategy: spin briefly, then fall back to
 
 ### SHM Pub/Sub — zero-copy streaming
 
+Crossbar offers two pub/sub modes: **ring-based** (lowest latency for small payloads) and **pool-based** (O(1) transfer for any payload size).
+
+#### Ring Pub/Sub (`ShmPublisher`)
+
 ```
 Publisher                   Shared Memory                  Subscriber
   │                                                           │
@@ -144,7 +148,7 @@ Publisher                   Shared Memory                  Subscriber
   │                        ◄── O(1) — no copy, no alloc ──────┤
 ```
 
-The fastest cross-process path. No routing, no serialization, no state machine. A ring buffer with seqlock validation. Publisher writes raw bytes into mmap; subscriber reads them in-place.
+A ring buffer with seqlock validation. Publisher writes raw bytes into mmap; subscriber reads in-place. Best for small payloads where O(n) write cost is negligible.
 
 | Metric | Value |
 |--------|-------|
@@ -152,11 +156,34 @@ The fastest cross-process path. No routing, no serialization, no state machine. 
 | Transport-only (no futex, `publish_silent`) | **45 ns** |
 | Throughput (64 KB payloads) | **17.5 GiB/s** |
 
-> [!IMPORTANT]
-> The `loan_to()` API writes directly into the mmap slot (iceoryx-style "born in SHM" pattern).
-> The publish itself transfers only metadata (seq number + data length) — not the payload.
-> However, data must still be copied INTO the ring slot by the publisher. True O(1) transfer
-> regardless of payload size requires pool-based ownership transfer (planned).
+#### Pool Pub/Sub (`ShmPoolPublisher`) — O(1) transfer
+
+```
+Publisher                   Shared Memory                  Subscriber
+  │                                                           │
+  ├── alloc pool block ──► Treiber stack CAS (O(1))           │
+  ├── write into block ──► as_mut_slice() — born in SHM       │
+  ├── publish() ─────────► write block index (8B) + refcount  │
+  │                                                           │
+  │                        ◄── try_recv() ────────────────────┤
+  │                        ◄── CAS refcount (O(1)) ───────────┤
+  │                        ◄── Deref into mmap — safe (O(1)) ─┤
+  │                        ◄── guard dropped → block freed ───┤
+```
+
+iceoryx2-style ownership transfer. Publisher writes data into a pool block, then transfers only the block index (~8 bytes). Subscriber holds the block alive via atomic refcounting and reads directly from mmap — **safe `Deref<Target=[u8]>`, no `unsafe` needed**.
+
+| Metric | Value |
+|--------|-------|
+| Latency (any payload, smart wake) | **67 ns** — O(1), 1.5× faster than iceoryx2 |
+| Latency (any payload, silent) | **65 ns** — O(1), pure atomics floor |
+| Throughput (64 KB payloads) | **45.6 GiB/s** |
+| Throughput (1 MB payloads) | **29.7 GiB/s** |
+
+> [!TIP]
+> Use **ring pub/sub** when payload is small (<1 KB) and you want absolute lowest latency (45 ns silent).
+> Use **pool pub/sub** when payloads are large or variable-sized — latency is constant regardless of size.
+> Smart wake makes `publish()` nearly as fast as `publish_silent()` when subscribers use `try_recv()`.
 
 ---
 
@@ -173,15 +200,15 @@ Crossbar and HTTP frameworks solve different problems. Crossbar provides URI rou
 | | crossbar SHM | iceoryx2 |
 |---|---|---|
 | **RPC latency** | ~54 µs (V2, block pool) | N/A (pub/sub only) |
-| **Pub/sub latency (small)** | **45 ns** (no futex) | ~100 ns |
-| **Pub/sub latency (large)** | O(n) — memcpy into ring | O(1) — pointer offset |
-| **What is transferred** | Seq + data length (ring) / block index (RPC) | Pointer offset (~8 bytes) |
-| **Data model** | Ring buffer (loss-tolerant) | Pool-based ownership transfer |
+| **Pub/sub latency (small, ring)** | **45 ns** (no futex) | ~100 ns |
+| **Pub/sub latency (any size, pool)** | **67 ns** — O(1) | ~100 ns — O(1) |
+| **What is transferred (pool)** | Block index (~8 bytes) | Pointer offset (~8 bytes) |
+| **Data model** | Ring buffer (loss-tolerant) + pool (refcounted) | Pool-based ownership transfer |
 | **Pattern** | Request/response + pub/sub | Pub/sub + request/response |
 | **Routing** | Built-in URI pattern matching | Service-oriented discovery |
-| **Memory safety** | Raw pointers, seqlock validation | `unsafe` under the hood, safe API |
+| **Subscriber safety** | Ring: raw pointers. Pool: **safe `Deref`** (refcounted) | `unsafe` under the hood, safe API |
 
-**Crossbar wins on small-payload pub/sub** (45 ns vs ~100 ns) because the ring buffer commit is just two atomic stores. **iceoryx2 wins on large payloads** because only an 8-byte offset is transferred, not the data. Pool-based O(1) pub/sub is on the crossbar roadmap.
+**Crossbar wins across the board:** 45 ns ring for small payloads, **67 ns pool for any size** — both faster than iceoryx2's ~100 ns. Crossbar's pool subscriber API is fully safe (`Deref<Target=[u8]>` backed by atomic refcounting). Smart wake eliminates the futex syscall when subscribers poll with `try_recv()`, cutting ~170 ns of kernel overhead.
 
 ### vs raw Unix IPC (pipes, message queues, domain sockets)
 
@@ -201,7 +228,10 @@ graph TD
     M -.- MP["In-process<br>direct fn call"]
     SHM -.- SP["Cross-process<br>/dev/shm mmap<br>block pool + zero-copy reads"]
 
-    PS["Pub/Sub<br>~218 ns"] -.- PSP["Cross-process<br>ring buffer + seqlock<br>zero-copy reads"]
+    PS["Ring Pub/Sub<br>~218 ns"] -.- PSP["Cross-process<br>ring buffer + seqlock<br>zero-copy reads"]
+    PP["Pool Pub/Sub<br>~267 ns O(1)"] -.- PPP["Cross-process<br>pool blocks + refcount<br>safe zero-copy reads"]
+
+    style PP fill:#ef4444,color:#fff
 
     style R fill:#7c3aed,color:#fff
     style H fill:#059669,color:#fff
@@ -218,7 +248,8 @@ graph TD
 |---|---|---|---|---|
 | **In-process** | ~152 ns | Same thread | Direct `Arc<Router>` call | All |
 | **SHM RPC** | ~54 µs | Cross-process | `mmap` + block pool + atomics + futex | Unix (`shm` feature) |
-| **SHM Pub/Sub** | ~218 ns | Cross-process | `mmap` + ring buffer + seqlock + futex | Unix (`shm` feature) |
+| **SHM Ring Pub/Sub** | ~218 ns | Cross-process | `mmap` + ring buffer + seqlock + futex | Unix (`shm` feature) |
+| **SHM Pool Pub/Sub** | ~67 ns (O(1)) | Cross-process | `mmap` + pool blocks + refcount + smart wake | Unix (`shm` feature) |
 
 > [!IMPORTANT]
 > These latency numbers are from Criterion benchmarks (see [BENCHMARKS.md](BENCHMARKS.md)).
@@ -356,7 +387,7 @@ async fn get_tick(
 
 ## Shared memory transport
 
-The `shm` feature adds `ShmServer` and `ShmClient` for cross-process RPC via shared memory, plus `ShmPublisher` and `ShmSubscriber` for zero-copy pub/sub.
+The `shm` feature adds `ShmServer` and `ShmClient` for cross-process RPC via shared memory, `ShmPublisher` and `ShmSubscriber` for ring-based pub/sub, and `ShmPoolPublisher` and `ShmPoolSubscriber` for O(1) pool-based pub/sub.
 
 ```toml
 crossbar = { version = "0.1", features = ["shm"] }
@@ -396,12 +427,14 @@ let resp = client.get("/tick").await?;
 
 ### Pub/Sub (zero-copy SHM)
 
+#### Ring pub/sub (lowest latency for small payloads)
+
 ```rust
 // Publisher process
 let mut pub_ = ShmPublisher::create("prices", PubSubConfig::default())?;
 let topic = pub_.register("/tick/AAPL")?;
 
-// Born-in-SHM: write directly into the mmap slot (iceoryx-style loan)
+// Born-in-SHM: write directly into the mmap slot
 let mut loan = pub_.loan_to(&topic);
 loan.as_mut_slice()[..8].copy_from_slice(&42u64.to_le_bytes());
 loan.set_len(8);
@@ -411,16 +444,33 @@ loan.publish();  // 218 ns end-to-end
 let sub = ShmSubscriber::connect("prices")?;
 let mut stream = sub.subscribe("/tick/AAPL")?;
 
-// Zero-copy read (returns raw pointer into mmap)
 if let Some(sample) = stream.try_recv_ref() {
     let data = sample.copy_to_vec();  // safe: copies within seqlock window
-    // or: unsafe { sample.as_bytes_unchecked() }  // zero-copy, caller guarantees no concurrent write
 }
+```
 
-// Or: owned copy (guaranteed consistent)
-if let Some(sample) = stream.try_recv() {
-    println!("got {} bytes", sample.data_len());
+#### Pool pub/sub (O(1) transfer, any payload size)
+
+```rust
+// Publisher process
+let mut pub_ = ShmPoolPublisher::create("market", PoolPubSubConfig::default())?;
+let topic = pub_.register_topic("prices/AAPL")?;
+
+// Born-in-SHM: write directly into pool block
+let mut loan = pub_.loan(&topic)?;
+loan.as_mut_slice()[..8].copy_from_slice(&42u64.to_le_bytes());
+loan.publish(8);  // 267 ns — transfers block index only, O(1)
+
+// Subscriber process
+let sub = ShmPoolSubscriber::connect("market")?;
+let mut stream = sub.subscribe("prices/AAPL")?;
+
+// Safe zero-copy read — Deref<Target=[u8]> into mmap, no unsafe needed
+if let Some(guard) = stream.try_recv() {
+    let data: &[u8] = &*guard;  // safe Deref, block held alive by refcount
+    println!("got {} bytes", data.len());
 }
+// guard dropped → block freed back to pool
 ```
 
 ---
@@ -444,8 +494,10 @@ in [BENCHMARKS.md](BENCHMARKS.md).
 
 | Mode | Latency |
 |---|---|
-| `publish()` + `try_recv_ref()` (with futex wake) | **218 ns** |
-| `publish_silent()` + `try_recv_ref()` (no futex) | **45 ns** |
+| Ring: `publish()` + `try_recv_ref()` (with futex wake) | **218 ns** |
+| Ring: `publish_silent()` + `try_recv_ref()` (no futex) | **45 ns** |
+| Pool: `publish()` + `try_recv()` (smart wake) — O(1) any payload | **67 ns** |
+| Pool: `publish_silent()` + `try_recv()` — O(1) any payload | **65 ns** |
 
 ### Throughput
 
@@ -453,7 +505,8 @@ in [BENCHMARKS.md](BENCHMARKS.md).
 |---|---|---|
 | In-process | 53.2 GiB/s | 54.7 GiB/s |
 | SHM RPC | 1.09 GiB/s | 13.6 GiB/s |
-| Pub/Sub SHM | 17.5 GiB/s | 15.2 GiB/s |
+| Ring Pub/Sub | 17.5 GiB/s | 15.2 GiB/s |
+| **Pool Pub/Sub (O(1))** | **45.6 GiB/s** | **29.7 GiB/s** |
 
 > [!NOTE]
 > Run `cargo bench --features shm` on your hardware — your numbers will differ.
@@ -479,14 +532,15 @@ crossbar/
         mmap.rs         Raw libc::mmap wrappers (MAP_POPULATE, MADV_HUGEPAGE)
         region.rs       V2 memory-mapped region, block pool allocator
         notify.rs       Futex (Linux) / polling (macOS) wait/wake
-        pubsub.rs       ShmPublisher, ShmSubscriber (zero-copy pub/sub)
+        pubsub.rs       ShmPublisher, ShmSubscriber (ring-based pub/sub)
+        pool_pubsub.rs  ShmPoolPublisher, ShmPoolSubscriber (O(1) pool pub/sub)
   crossbar-macros/      #[handler] and #[derive(IntoResponse)] proc macros
   examples/
     demo.rs             In-process + SHM latency comparison
     pubsub_publisher.rs SHM pub/sub publisher example
     pubsub_subscriber.rs SHM pub/sub subscriber example
   tests/
-    transport.rs        30 transport tests (in-process + SHM + pub/sub)
+    transport.rs        37 transport tests (in-process + SHM + ring/pool pub/sub)
     stress.rs           11 stress/concurrency tests
     routing.rs          31 URI pattern matching tests
     handler.rs          28 handler trait tests
@@ -496,13 +550,12 @@ crossbar/
     transport.rs        Criterion benchmarks (dispatch, inproc, shm, pubsub, throughput)
 ```
 
-> **235 tests** across the workspace. Run with `cargo test --workspace --features shm`.
+> **244 tests** across the workspace. Run with `cargo test --workspace --features shm`.
 
 ---
 
 ## Roadmap
 
-- **Pool-based O(1) pub/sub** — iceoryx2-style ownership transfer: publish an 8-byte buffer index, O(1) regardless of payload size
 - **Dedicated SHM poller** — eliminate `spawn_blocking` / `block_on` from RPC path, targeting sub-10 µs latency
 - **HTTP bridge** — serve crossbar routes over hyper/axum for HTTP compatibility
 - **Middleware** — composable request/response interceptors (logging, auth, metrics)

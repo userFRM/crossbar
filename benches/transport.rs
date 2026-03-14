@@ -517,6 +517,41 @@ fn bench_pool_pubsub(c: &mut Criterion) {
     let payload_64kb = vec![42u8; 65_536];
     let payload_1mb = vec![42u8; 1_048_576];
 
+    // -- Transport overhead: publish + recv, minimal data --
+    // Measures the pure coordination cost independent of payload size.
+    {
+        let mut group = c.benchmark_group("pool_pubsub_transport_only");
+        group.measurement_time(Duration::from_secs(1));
+
+        // Smart wake: publish() skips futex_wake when no subscriber is blocked
+        // in recv(). Since benchmark uses try_recv(), waiters=0 — no futex syscall.
+        // This is the apples-to-apples iceoryx2 comparison.
+        group.bench_function("smart_wake", |b| {
+            b.iter(|| {
+                let mut loan = pub_.loan(&h_8b);
+                loan.as_mut_slice()[..8].copy_from_slice(&42u64.to_le_bytes());
+                loan.set_len(8);
+                loan.publish(); // smart: no futex since try_recv, not recv
+                let g = s_8b.try_recv().unwrap();
+                black_box(&*g);
+            })
+        });
+
+        // Silent: no notification at all — pure atomics overhead floor.
+        group.bench_function("silent_no_wake", |b| {
+            b.iter(|| {
+                let mut loan = pub_.loan(&h_8b);
+                loan.as_mut_slice()[..8].copy_from_slice(&42u64.to_le_bytes());
+                loan.set_len(8);
+                loan.publish_silent();
+                let g = s_8b.try_recv().unwrap();
+                black_box(&*g);
+            })
+        });
+
+        group.finish();
+    }
+
     // -- O(1) transfer: born-in-SHM + safe Deref read --
     {
         let mut group = c.benchmark_group("pool_pubsub_o1");
