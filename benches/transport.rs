@@ -517,8 +517,8 @@ fn bench_pool_pubsub(c: &mut Criterion) {
     let payload_64kb = vec![42u8; 65_536];
     let payload_1mb = vec![42u8; 1_048_576];
 
-    // -- Transport overhead: publish + recv, minimal data --
-    // Measures the pure coordination cost independent of payload size.
+    // -- Minimal roundtrip: publish 8B + recv --
+    // Measures end-to-end pub/sub with negligible payload write (8 bytes).
     {
         let mut group = c.benchmark_group("pool_pubsub_transport_only");
         group.measurement_time(Duration::from_secs(1));

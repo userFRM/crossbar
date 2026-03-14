@@ -36,7 +36,7 @@
 //!     let resp = mem.get("/health").await;
 //!     assert_eq!(resp.status, 200);
 //!
-//!     // -- shared memory (shm feature, ~2-5 us) ---
+//!     // -- shared memory (shm feature) ---
 //!     // Enable with: cargo add crossbar --features shm
 //!     // ShmServer::bind("myapp", router.clone()).await?;
 //!     // let shm = ShmClient::connect("myapp").await?;

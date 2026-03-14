@@ -314,6 +314,48 @@ impl ShmRegion {
         }
     }
 
+    // -- Server notification flag (global header offset 0x30) --
+
+    /// Returns a reference to the server notification flag.
+    ///
+    /// The flag lives at offset `0x30` in the global header (reserved space).
+    /// It is zero when idle; the client stores `1` and wakes the server's
+    /// futex to signal that a new request is pending.
+    #[allow(clippy::cast_ptr_alignment)] // offset 0x30 is 4-byte aligned within the header
+    fn server_notify_atomic(&self) -> &AtomicU32 {
+        unsafe { &*self.mmap.as_ptr().add(0x30).cast::<AtomicU32>() }
+    }
+
+    /// Signals the server that at least one slot has transitioned to
+    /// `REQUEST_READY`. Called by the client immediately after the slot
+    /// state store.
+    ///
+    /// Stores `1` into the flag then issues a `futex_wake` so the server's
+    /// `wait_for_work` wakes up without waiting for the spin timeout.
+    pub fn notify_server(&self) {
+        let flag = self.server_notify_atomic();
+        flag.store(1, Ordering::Release);
+        super::notify::wake_one(flag);
+    }
+
+    /// Blocks the server thread until the notification flag becomes non-zero,
+    /// then clears it and returns.
+    ///
+    /// Uses `futex_wait` (Linux) or short-sleep polling (other Unix) so the
+    /// server thread does not burn CPU while idle.  The timeout is capped at
+    /// 1 ms so the server still wakes promptly when the stop flag is set.
+    pub fn wait_for_work(&self) {
+        let flag = self.server_notify_atomic();
+        // Fast path: already signalled (no syscall needed).
+        if flag.load(Ordering::Acquire) != 0 {
+            flag.store(0, Ordering::Release);
+            return;
+        }
+        // Slow path: wait up to 1 ms for the client to signal.
+        super::notify::wait_until_not(flag, 0, std::time::Duration::from_millis(1)).ok();
+        flag.store(0, Ordering::Release);
+    }
+
     // -- Pool allocator (Treiber stack) --
 
     #[allow(clippy::cast_ptr_alignment)] // offset 0x28 is 8-byte aligned within the header
@@ -354,6 +396,7 @@ impl ShmRegion {
     /// Allocates a block from the pool.
     ///
     /// Returns the block index, or `None` if all blocks are in use.
+    #[inline]
     pub fn alloc_block(&self) -> Option<u32> {
         loop {
             let head = self.pool_head().load(Ordering::Acquire);
@@ -378,6 +421,7 @@ impl ShmRegion {
     /// # Panics
     ///
     /// Panics if `idx` is out of bounds (>= `block_count`).
+    #[inline]
     pub fn free_block(&self, idx: u32) {
         assert!(
             (idx as usize) < self.block_count as usize,
@@ -403,6 +447,7 @@ impl ShmRegion {
     /// # Panics
     ///
     /// Panics if `idx` is out of bounds (>= `block_count`).
+    #[inline]
     pub fn block_ptr(&self, idx: u32) -> *mut u8 {
         assert!(
             (idx as usize) < self.block_count as usize,
@@ -434,6 +479,7 @@ impl ShmRegion {
     }
 
     /// Returns a reference to the slot's atomic state field (offset 0x00).
+    #[inline]
     #[allow(clippy::cast_ptr_alignment)] // slot_base is 64-byte aligned
     pub fn slot_state(&self, idx: u32) -> &AtomicU32 {
         unsafe { &*self.slot_base(idx).cast::<AtomicU32>() }

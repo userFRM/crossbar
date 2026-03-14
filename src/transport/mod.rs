@@ -1,14 +1,21 @@
 //! Transport adapters: in-process and shared memory.
 //!
-//! Every transport exposes the same conceptual API: a **server** that binds to
-//! some address and dispatches incoming requests through a
-//! [`Router`](crate::router::Router), and a **client** that sends
-//! [`Request`]s and receives [`Response`]s.
+//! Crossbar supports two transport families:
+//!
+//! **Request/Response** — a server dispatches incoming requests through a
+//! [`Router`](crate::router::Router), a client sends [`Request`]s and
+//! receives [`Response`]s.
 //!
 //! | Transport | Typical latency | Notes |
 //! |-----------|-----------------|-------|
-//! | [`InProcessClient`] | sub-us | In-process, bypasses framing entirely |
-//! | `ShmClient` | 2-5 us | Shared memory via `/dev/shm` (`shm` feature) |
+//! | [`InProcessClient`] | ~152 ns | Direct dispatch, no serialization |
+//! | `ShmClient` | ~54 µs | Cross-process via `/dev/shm` (`shm` feature) |
+//!
+//! **Pub/Sub** — zero-copy O(1) streaming over shared memory.
+//!
+//! | Transport | Latency | Notes |
+//! |-----------|---------|-------|
+//! | `ShmPoolPublisher` / `ShmPoolSubscriber` | 67 ns | O(1) transfer, safe reads |
 
 mod inproc;
 #[cfg(all(unix, feature = "shm"))]

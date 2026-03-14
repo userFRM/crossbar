@@ -254,7 +254,7 @@ impl ShmServer {
                             region.set_response_block_idx(slot_idx, u32::MAX);
                         }
                         state.store(RESPONSE_READY, Ordering::Release);
-                        notify::wake_one(state);
+                        // No wake needed — client poller spins, not futex-waits.
                         continue;
                     };
 
@@ -274,20 +274,30 @@ impl ShmServer {
                         region.set_response_block_idx(slot_idx, u32::MAX);
                     }
                     state.store(RESPONSE_READY, Ordering::Release);
-                    notify::wake_one(state);
+                    // No wake needed — client poller spins, not futex-waits.
                 }
             }
 
             if !found_work {
-                std::thread::sleep(Duration::from_micros(1));
+                region.wait_for_work();
             }
         }
     }
 }
 
-/// Shared-memory IPC client (V2 — block pool, zero-copy reads).
+/// An in-flight request submitted to the poller thread.
+struct InflightRequest {
+    slot_idx: u32,
+    tx: Option<tokio::sync::oneshot::Sender<Result<Response, CrossbarError>>>,
+    deadline: std::time::Instant,
+}
+
+/// Shared-memory IPC client (V2 — dedicated poller, zero-copy reads).
 ///
 /// Attaches to an existing shared memory region created by [`ShmServer`].
+/// Uses a dedicated background thread to poll for responses instead of
+/// `spawn_blocking`, eliminating ~15-20 µs of tokio threadpool overhead
+/// per request.
 ///
 /// # Examples
 ///
@@ -305,11 +315,26 @@ pub struct ShmClient {
     region: Arc<ShmRegion>,
     client_id: u64,
     stale_timeout: Duration,
+    poller_tx: std::sync::mpsc::Sender<InflightRequest>,
+    poller_stop: Arc<std::sync::atomic::AtomicBool>,
+    poller_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for ShmClient {
+    fn drop(&mut self) {
+        self.poller_stop
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(handle) = self.poller_thread.take() {
+            handle.thread().unpark();
+            let _ = handle.join();
+        }
+    }
 }
 
 impl ShmClient {
     /// Connects to an existing shared memory region.
     ///
+    /// Spawns a dedicated poller thread for low-latency response polling.
     /// Uses the default stale timeout of 5 seconds. For a custom timeout, use
     /// [`ShmClient::connect_with_timeout`].
     ///
@@ -347,11 +372,119 @@ impl ShmClient {
                 .unwrap_or_default()
                 .as_nanos() as u64);
 
+        let region = Arc::new(region);
+        let poller_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (poller_tx, poller_rx) = std::sync::mpsc::channel::<InflightRequest>();
+
+        // Spawn dedicated poller thread
+        let poller_region = Arc::clone(&region);
+        let poller_stop_clone = Arc::clone(&poller_stop);
+        let poller_thread = std::thread::Builder::new()
+            .name("crossbar-poller".into())
+            .spawn(move || {
+                Self::poller_loop(poller_region, poller_rx, poller_stop_clone);
+            })
+            .map_err(CrossbarError::Io)?;
+
         Ok(ShmClient {
-            region: Arc::new(region),
+            region,
             client_id,
             stale_timeout,
+            poller_tx,
+            poller_stop,
+            poller_thread: Some(poller_thread),
         })
+    }
+
+    /// Dedicated response poller — runs on its own OS thread.
+    ///
+    /// Spins/yields checking in-flight slots for RESPONSE_READY, avoiding
+    /// the ~15-20 µs `spawn_blocking` overhead entirely.
+    fn poller_loop(
+        region: Arc<ShmRegion>,
+        rx: std::sync::mpsc::Receiver<InflightRequest>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let mut inflight: Vec<InflightRequest> = Vec::with_capacity(16);
+
+        while !stop.load(Ordering::Relaxed) {
+            // Drain new requests (non-blocking)
+            while let Ok(req) = rx.try_recv() {
+                inflight.push(req);
+            }
+
+            if inflight.is_empty() {
+                // Nothing to poll — park until a new request arrives or stop
+                std::thread::park_timeout(Duration::from_millis(10));
+                continue;
+            }
+
+            // Poll all in-flight slots
+            let mut any_completed = false;
+            inflight.retain_mut(|req| {
+                let state = region.slot_state(req.slot_idx);
+                let current = state.load(Ordering::Acquire);
+
+                if current == RESPONSE_READY {
+                    any_completed = true;
+
+                    // Read response — O(1) zero-copy body via Body::Mmap
+                    let resp_block_idx = region.response_block_idx(req.slot_idx);
+                    let resp = if resp_block_idx == u32::MAX {
+                        let status = region.response_status(req.slot_idx);
+                        Ok(Response::with_status(status))
+                    } else {
+                        region.read_response_from_block(req.slot_idx)
+                    };
+
+                    // Clear block indices before releasing slot
+                    region.set_request_block_idx(req.slot_idx, NO_BLOCK);
+                    region.set_response_block_idx(req.slot_idx, NO_BLOCK);
+                    state.store(FREE, Ordering::Release);
+
+                    if let Some(tx) = req.tx.take() {
+                        let _ = tx.send(resp);
+                    }
+                    return false; // remove from inflight
+                }
+
+                // Check timeout
+                if std::time::Instant::now() >= req.deadline {
+                    // Try to reclaim the slot
+                    if state
+                        .compare_exchange(REQUEST_READY, FREE, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        let req_block = region.request_block_idx(req.slot_idx);
+                        if req_block != NO_BLOCK {
+                            region.free_block(req_block);
+                        }
+                        region.set_request_block_idx(req.slot_idx, NO_BLOCK);
+                        region.set_response_block_idx(req.slot_idx, NO_BLOCK);
+                    }
+                    // If CAS failed, server owns slot — stale recovery cleans up
+                    if let Some(tx) = req.tx.take() {
+                        let _ = tx.send(Err(CrossbarError::ShmServerDead));
+                    }
+                    return false;
+                }
+
+                // Unexpected state
+                if current != PROCESSING && current != REQUEST_READY {
+                    if let Some(tx) = req.tx.take() {
+                        let _ = tx.send(Err(CrossbarError::ShmServerDead));
+                    }
+                    return false;
+                }
+
+                true // keep polling
+            });
+
+            if !any_completed && !inflight.is_empty() {
+                // Responses pending but not ready — brief yield
+                core::hint::spin_loop();
+            }
+        }
     }
 
     /// Sends a request via shared memory and waits for the response.
@@ -374,20 +507,24 @@ impl ShmClient {
             .alloc_block()
             .ok_or(CrossbarError::ShmPoolExhausted)?;
 
-        // Acquire a slot (with brief retry)
+        // Acquire a slot (with backoff retry)
         let slot_idx = {
-            let mut attempts = 0;
+            let mut attempts = 0u32;
             loop {
                 if let Some(idx) = self.region.try_acquire_slot(self.client_id) {
                     break idx;
                 }
                 attempts += 1;
-                if attempts > 1000 {
-                    // Return the block before failing
+                if attempts > 5000 {
                     self.region.free_block(req_block_idx);
                     return Err(CrossbarError::ShmSlotsFull);
                 }
-                tokio::task::yield_now().await;
+                if attempts < 64 {
+                    tokio::task::yield_now().await;
+                } else {
+                    // Back off to let the server process and free slots
+                    tokio::time::sleep(Duration::from_micros(50)).await;
+                }
             }
         };
 
@@ -396,7 +533,6 @@ impl ShmClient {
             .region
             .write_request_to_block(slot_idx, req_block_idx, &req)
         {
-            // Free the block and release the slot on failure
             self.region.free_block(req_block_idx);
             self.region
                 .slot_state(slot_idx)
@@ -404,72 +540,28 @@ impl ShmClient {
             return Err(e);
         }
 
-        // Transition to REQUEST_READY so the server picks it up
+        // Transition to REQUEST_READY and notify server
         let state_atom = self.region.slot_state(slot_idx);
         state_atom.store(REQUEST_READY, Ordering::Release);
-        notify::wake_one(state_atom);
+        self.region.notify_server();
 
-        // Wait for response — spawn_blocking to avoid blocking tokio
-        let region = Arc::clone(&self.region);
-        let stale_timeout = self.stale_timeout;
-        let resp = tokio::task::spawn_blocking(move || {
-            let state = region.slot_state(slot_idx);
-            let deadline = std::time::Instant::now() + stale_timeout;
+        // Submit to dedicated poller thread (not spawn_blocking)
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.poller_tx
+            .send(InflightRequest {
+                slot_idx,
+                tx: Some(tx),
+                deadline: std::time::Instant::now() + self.stale_timeout,
+            })
+            .map_err(|_| CrossbarError::ShmServerDead)?;
 
-            loop {
-                let current = state.load(Ordering::Acquire);
-                if current == RESPONSE_READY {
-                    break;
-                }
-                if std::time::Instant::now() >= deadline {
-                    if state
-                        .compare_exchange(REQUEST_READY, FREE, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
-                    {
-                        // We reclaimed the slot — free the request block.
-                        let req_block = region.request_block_idx(slot_idx);
-                        if req_block != NO_BLOCK {
-                            region.free_block(req_block);
-                        }
-                        region.set_request_block_idx(slot_idx, NO_BLOCK);
-                        region.set_response_block_idx(slot_idx, NO_BLOCK);
-                    }
-                    // If CAS failed the server owns the slot (PROCESSING);
-                    // leave it for stale recovery to clean up.
-                    return Err(CrossbarError::ShmServerDead);
-                }
-                if current == PROCESSING || current == REQUEST_READY {
-                    notify::wait_until_not(state, current, Duration::from_millis(50)).ok();
-                } else {
-                    return Err(CrossbarError::ShmServerDead);
-                }
-            }
+        // Wake the poller thread
+        if let Some(ref handle) = self.poller_thread {
+            handle.thread().unpark();
+        }
 
-            // Read response — O(1) zero-copy body via Body::Mmap
-            let resp_block_idx = region.response_block_idx(slot_idx);
-            let resp = if resp_block_idx == u32::MAX {
-                // Server couldn't allocate a response block (503 fallback)
-                let status = region.response_status(slot_idx);
-                Ok(Response::with_status(status))
-            } else {
-                region.read_response_from_block(slot_idx)
-            };
-
-            // Clear block indices before releasing the slot so that stale
-            // recovery cannot observe stale indices and double-free the blocks.
-            region.set_request_block_idx(slot_idx, NO_BLOCK);
-            region.set_response_block_idx(slot_idx, NO_BLOCK);
-
-            // Release slot
-            state.store(FREE, Ordering::Release);
-            notify::wake_one(state);
-
-            resp
-        })
-        .await
-        .map_err(|_| CrossbarError::ShmServerDead)??;
-
-        Ok(resp)
+        // Await response — non-blocking in tokio
+        rx.await.map_err(|_| CrossbarError::ShmServerDead)?
     }
 
     /// Convenience method for `GET` requests.

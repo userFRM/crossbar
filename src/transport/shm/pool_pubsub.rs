@@ -5,7 +5,7 @@
 //!
 //! Unlike ring-based pub/sub (where data is copied into ring slots), pool-backed
 //! pub/sub allocates independent buffers from a shared pool and transfers only
-//! a 12-byte descriptor (block index + data length) regardless of payload size.
+//! an 8-byte descriptor (block index + data length) regardless of payload size.
 //!
 //! The subscriber gets a **safe** zero-copy reference (`ShmPoolSampleGuard`) that
 //! holds the block alive via atomic refcounting. No `unsafe` needed to read data —
@@ -306,7 +306,7 @@ impl PoolRegion {
 ///
 /// Uses a shared block pool (Treiber stack) for data storage and a ring of
 /// block indices for publication. Transfer cost is O(1) regardless of payload
-/// size — only 12 bytes (block index + data length) are written to the ring.
+/// size — only 8 bytes (block index + data length) are written to the ring.
 ///
 /// # Examples
 ///
@@ -319,7 +319,7 @@ impl PoolRegion {
 /// let mut loan = pub_.loan(&topic);
 /// loan.as_mut_slice()[..8].copy_from_slice(&42u64.to_le_bytes());
 /// loan.set_len(8);
-/// loan.publish(); // O(1) — writes 12 bytes to ring
+/// loan.publish(); // O(1) — writes 8 bytes to ring
 /// ```
 pub struct ShmPoolPublisher {
     region: Arc<PoolRegion>,
@@ -347,6 +347,30 @@ impl ShmPoolPublisher {
     /// Returns [`CrossbarError::Io`] if the backing file cannot be created,
     /// or [`CrossbarError::ShmInvalidRegion`] if another publisher is active.
     pub fn create(name: &str, config: PoolPubSubConfig) -> Result<Self, CrossbarError> {
+        // Validate config to prevent panics from invalid values
+        if config.block_size < BLOCK_DATA_OFFSET as u32 + 1 {
+            return Err(CrossbarError::ShmInvalidRegion(format!(
+                "block_size must be at least {} (got {})",
+                BLOCK_DATA_OFFSET + 1,
+                config.block_size
+            )));
+        }
+        if config.ring_depth == 0 {
+            return Err(CrossbarError::ShmInvalidRegion(
+                "ring_depth must be at least 1".to_string(),
+            ));
+        }
+        if config.block_count == 0 {
+            return Err(CrossbarError::ShmInvalidRegion(
+                "block_count must be at least 1".to_string(),
+            ));
+        }
+        if config.max_topics == 0 {
+            return Err(CrossbarError::ShmInvalidRegion(
+                "max_topics must be at least 1".to_string(),
+            ));
+        }
+
         let path = shm_path(name);
         let lpath = lock_path(name);
 
@@ -462,15 +486,27 @@ impl ShmPoolPublisher {
                 unsafe { &*(self.region.mmap.as_ptr().add(off + TE_ACTIVE) as *const AtomicU32) };
 
             if active.load(Ordering::Acquire) == 1 {
-                // Check if same URI already registered
+                // Check if same URI already registered (hash + byte comparison)
                 let existing_hash = unsafe {
                     (self.region.mmap.as_ptr().add(off + TE_URI_HASH) as *const u64).read()
                 };
                 if existing_hash == hash {
-                    return Ok(PoolTopicHandle {
-                        topic_idx: i,
-                        publisher_id: self.id,
-                    });
+                    let existing_len = unsafe {
+                        (self.region.mmap.as_ptr().add(off + TE_URI_LEN) as *const u32).read()
+                    } as usize;
+                    let existing_bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            self.region.mmap.as_ptr().add(off + TE_URI),
+                            existing_len,
+                        )
+                    };
+                    if existing_len == uri.len() && existing_bytes == uri.as_bytes() {
+                        return Ok(PoolTopicHandle {
+                            topic_idx: i,
+                            publisher_id: self.id,
+                        });
+                    }
+                    // Hash collision — different URI, keep searching
                 }
                 continue;
             }
@@ -495,6 +531,17 @@ impl ShmPoolPublisher {
         Err(CrossbarError::ShmInvalidRegion(
             "maximum topics reached".into(),
         ))
+    }
+
+    /// Updates the publisher heartbeat. Call this periodically during idle
+    /// periods (when not calling [`loan`](Self::loan)) to prevent subscribers
+    /// from treating the publisher as dead.
+    ///
+    /// `loan()` updates the heartbeat automatically every 1024 calls, so you
+    /// only need this if the publisher may be idle longer than `stale_timeout`.
+    pub fn heartbeat(&mut self) {
+        self.region.update_heartbeat();
+        self.last_heartbeat = std::time::Instant::now();
     }
 
     /// Loans a block from the pool for writing. Write your data, then call
@@ -574,7 +621,7 @@ impl Drop for ShmPoolPublisher {
 /// A mutable view into a pool block in shared memory.
 ///
 /// Write your data (any format), then call [`publish`](Self::publish) to
-/// transfer ownership to subscribers. The transfer is O(1) — only 12 bytes
+/// transfer ownership to subscribers. The transfer is O(1) — only 8 bytes
 /// (block index + data length) are written to the ring, regardless of how
 /// much data you wrote into the block.
 ///
@@ -629,7 +676,7 @@ impl<'a> ShmPoolLoan<'a> {
     }
 
     /// Publishes the block and wakes any blocked subscribers.
-    /// O(1) — writes 12 bytes to the ring regardless of payload size.
+    /// O(1) — writes 8 bytes to the ring regardless of payload size.
     #[inline]
     pub fn publish(self) {
         self.commit(true);
@@ -842,6 +889,19 @@ impl ShmPoolSubscriber {
             let stored_hash =
                 unsafe { (self.region.mmap.as_ptr().add(off + TE_URI_HASH) as *const u64).read() };
             if stored_hash != hash {
+                continue;
+            }
+            // Verify URI bytes match (not just hash) to prevent collision aliasing
+            let stored_len =
+                unsafe { (self.region.mmap.as_ptr().add(off + TE_URI_LEN) as *const u32).read() }
+                    as usize;
+            if stored_len != uri.len() {
+                continue;
+            }
+            let stored_bytes = unsafe {
+                std::slice::from_raw_parts(self.region.mmap.as_ptr().add(off + TE_URI), stored_len)
+            };
+            if stored_bytes != uri.as_bytes() {
                 continue;
             }
 
