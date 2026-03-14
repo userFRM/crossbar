@@ -4,165 +4,100 @@
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org)
 
-**High-performance IPC framework for Rust.** Two data paths over shared memory: **pub/sub** for streaming (67 ns) and **RPC** for request/response with URI routing (~757 ns). All latency numbers measured in-process via Criterion; real cross-process latency includes kernel scheduling.
-
----
-
-## What is crossbar?
-
-Crossbar moves data between processes on the same machine. It provides two ways to do this, each designed for a different use case:
-
-```mermaid
-graph LR
-    subgraph "Your Application"
-        H["Handlers / Business Logic"]
-    end
-
-    subgraph "Crossbar"
-        PS["Pub/Sub<br/>streaming · 67 ns"]
-        RPC["RPC<br/>request/response · ~757 ns"]
-        R["URI Router"]
-    end
-
-    H --> PS
-    H --> R --> RPC
-
-    subgraph "Shared Memory (/dev/shm)"
-        SHM["mmap · zero-copy"]
-    end
-
-    PS --> SHM
-    RPC --> SHM
-
-    style PS fill:#059669,color:#fff
-    style RPC fill:#7c3aed,color:#fff
-    style R fill:#7c3aed,color:#fff
-    style SHM fill:#f59e0b,color:#000
-```
-
-| | Pub/Sub | RPC |
-|---|---|---|
-| **Purpose** | Stream raw bytes between processes | Request/response with URI routing |
-| **Latency** | **67 ns** | **~757 ns** |
-| **Pattern** | Publisher → Subscriber(s) | Client → Router → Handler → Response |
-| **Data format** | Raw `&[u8]` (you decide the format) | Structured `Request` / `Response` |
-| **Routing** | Topic string (e.g. `"prices/AAPL"`) | URI patterns (e.g. `/tick/:symbol`) |
-| **When to use** | Market data, sensor feeds, streaming | REST-like APIs, command/control |
+**Zero-copy IPC for Rust with REST-like routing.** Define endpoints with URI patterns and path params — as simple as building a web API, but over shared memory with constant-latency O(1) transport.
 
 > [!NOTE]
-> Crossbar is **not** an HTTP framework. It uses shared memory (`/dev/shm`) for
-> inter-process communication on the same host. If you need HTTP, use
+> Crossbar is **not** an HTTP server. It moves data between processes on the same
+> machine via shared memory (`/dev/shm`). Think of it as axum semantics
+> (routes, handlers, extractors) without the network stack. If you need HTTP, use
 > [axum](https://github.com/tokio-rs/axum).
 
 ---
 
-## Pub/Sub — zero-copy streaming (67 ns)
+## Performance
 
-The fastest way to move data between processes. Publisher writes bytes directly into shared memory, then transfers ownership to subscribers by writing an 8-byte descriptor to a ring buffer. Subscribers read the data in-place via safe `Deref` — no copies, no `unsafe`.
+![crossbar vs iceoryx2 benchmark comparison](assets/benchmark_comparison.svg)
 
-```mermaid
-sequenceDiagram
-    participant P as Publisher
-    participant SHM as Shared Memory<br/>(mmap)
-    participant S as Subscriber
+**Left:** O(1) transport proof — we write a fixed 8 bytes into backing buffers from 64 B to 1 MB. Latency is flat for both frameworks. The transfer (writing an 8-byte descriptor to a ring) is always O(1). Crossbar is **3.7x faster** (64 ns vs 237 ns).
 
-    P->>SHM: alloc block from pool (CAS)
-    P->>SHM: write data via as_mut_slice()<br/>(born-in-SHM, no copy)
-    P->>SHM: publish() — write 8B descriptor to ring
+**Right:** End-to-end with full payload — both write the entire payload into SHM before transfer. At small sizes, crossbar's lower overhead wins. At 64 KB+, both converge to the same speed because `memcpy` dominates.
 
-    Note over P,SHM: 67 ns total (8B payload)
+Both benchmarks use the same operations: `loan buffer` -> `write data` -> `publish` -> `receive` -> `deref`. Apples-to-apples, same process, same Criterion harness.
 
-    S->>SHM: try_recv() — read descriptor from ring
-    S->>SHM: increment refcount (CAS)
-    SHM->>S: safe Deref into mmap (O(1), no copy)
-
-    Note over S: guard dropped → refcount decremented → block freed
-```
-
-### Code
-
-```rust
-use crossbar::prelude::*;
-
-// Publisher process
-let mut pub_ = ShmPoolPublisher::create("market", PoolPubSubConfig::default())?;
-let topic = pub_.register("prices/AAPL")?;
-
-let mut loan = pub_.loan(&topic);                       // alloc block
-loan.as_mut_slice()[..8].copy_from_slice(&price_bytes);  // write directly into SHM
-loan.set_len(8);
-loan.publish();                                          // 67 ns — O(1) transfer
-```
-
-```rust
-// Subscriber process
-let sub = ShmPoolSubscriber::connect("market")?;
-let mut stream = sub.subscribe("prices/AAPL")?;
-
-if let Some(guard) = stream.try_recv() {
-    let data: &[u8] = &*guard;    // safe Deref — reads directly from mmap
-    println!("price: {}", f64::from_le_bytes(data[..8].try_into().unwrap()));
-}
-// guard dropped → block freed back to pool
-```
-
-### Performance
-
-| Payload | Latency | Throughput |
-|---|---|---|
-| 8 B | **67 ns** | — |
-| 64 KB | 1.40 µs | **45.6 GiB/s** |
-| 1 MB | 32.6 µs | **29.7 GiB/s** |
-
-The 67 ns is the end-to-end cost for 8 bytes. The *transfer* (writing the 8B descriptor to the ring) is always O(1) regardless of payload size. Larger payloads add the cost of writing data into the SHM block (O(n)).
-
-### Why 67 ns? (1.5x faster than iceoryx2)
-
-| Optimization | Savings |
-|---|---|
-| **Smart wake** — checks atomic waiters counter (~2 ns) instead of `futex_wake` syscall (~170 ns) | ~170 ns |
-| **Counter-based heartbeat** — checks clock every 1024 loans, not every call | ~20 ns/call |
-| **Inline hot paths** — `alloc_block`, `commit`, `try_recv` are `#[inline]` | cache locality |
-| **Minimal coordination** — seqlock + refcount + Treiber stack, no service discovery | structural |
+> **Benchmark system:** Intel i7-10700KF @ 3.80 GHz, Linux 6.8, rustc stable.
+> iceoryx2 claims ~100 ns on an i7-13700H — our 237 ns measurement reflects our
+> older hardware. Run on yours: `cargo bench --features shm -- "head_to_head"`
 
 ---
 
-## RPC — request/response with URI routing (~757 ns)
+## Quick start
 
-When you need to call a function in another process by URI. Define handlers with path patterns, register them on a router, serve over shared memory.
+### Pub/sub — two processes, one topic
 
-```mermaid
-sequenceDiagram
-    participant C as Client Process
-    participant SHM as Shared Memory<br/>(mmap)
-    participant S as Server Process
+**Publisher** writes price data directly into shared memory:
 
-    C->>SHM: alloc block (CAS) + write request
-    C->>SHM: state = REQUEST_READY + smart wake
+```rust
+// publisher.rs
+use crossbar::prelude::*;
 
-    Note over C: inline spin (~2 µs window)
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut pub_ = ShmPoolPublisher::create("market", PoolPubSubConfig::default())?;
+    let topic = pub_.register("prices/AAPL")?;
 
-    S->>SHM: hint-based scan finds REQUEST_READY
-    S->>S: dispatch_fast(req)<br/>zero-alloc route match + try-poll
-    S->>SHM: alloc block + write response
-    S->>SHM: state = RESPONSE_READY
+    loop {
+        let price: f64 = get_price(); // your data source
 
-    SHM->>C: spin detects RESPONSE_READY<br/>zero-copy body via Body::Mmap
-
-    Note over C,S: Total: ~757 ns (/health)<br/>No channels, no tokio, no futex on hot path
+        let mut loan = pub_.loan(&topic);                        // alloc block from pool
+        loan.as_mut_slice()[..8].copy_from_slice(&price.to_le_bytes()); // write into SHM
+        loan.set_len(8);
+        loan.publish();                                          // transfer ownership — O(1)
+    }
+}
 ```
 
-### Code
+**Subscriber** reads the data in-place — zero copies, no `unsafe`:
+
+```rust
+// subscriber.rs
+use crossbar::prelude::*;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let sub = ShmPoolSubscriber::connect("market")?;
+    let mut stream = sub.subscribe("prices/AAPL")?;
+
+    loop {
+        if let Some(guard) = stream.try_recv() {
+            let data: &[u8] = &*guard;  // safe Deref — reads directly from mmap
+            let price = f64::from_le_bytes(data[..8].try_into().unwrap());
+            println!("AAPL: {price:.2}");
+        }
+        // guard dropped -> block freed back to pool
+    }
+}
+```
+
+Run both in separate terminals:
+
+```sh
+cargo run --example pubsub_publisher --features shm
+cargo run --example pubsub_subscriber --features shm
+```
+
+### RPC — request/response with URI routing
+
+When you need to call a function in another process by URI. Same patterns as any web framework — path params, query strings, JSON bodies — but over shared memory:
 
 ```rust
 use crossbar::prelude::*;
 
-// Define handlers — same as any web framework
+// Define handlers — same as building a REST API
 async fn health() -> &'static str { "ok" }
 
-async fn get_tick(req: Request) -> Json<serde_json::Value> {
+async fn get_tick(req: Request) -> Response {
     let symbol = req.path_param("symbol").unwrap_or("???");
-    Json(serde_json::json!({ "symbol": symbol, "price": 152.50 }))
+    // Use any serializer: sonic_rs, serde_json, simd-json, rkyv, raw bytes...
+    let body = format!(r#"{{"symbol":"{}","price":152.50}}"#, symbol);
+    Response::ok().with_body(body)
 }
 
 // Server process
@@ -171,75 +106,59 @@ let router = Router::new()
     .route("/tick/:symbol", get(get_tick));
 ShmServer::spawn("myapp", router).await?;
 
-// Client process
+// Client process (can be a different binary)
 let client = ShmClient::connect("myapp").await?;
 let resp = client.get("/tick/AAPL").await?;
 ```
 
-### Why ~757 ns?
+RPC latency is ~757 ns for `/health`. The data transfer is O(1) (same mechanism as pub/sub). The extra cost is coordination — slot state machine, route matching, request/response serialization. The body is opaque `&[u8]` — bring your own serializer.
 
-The data transfer is O(1) (block offsets + zero-copy reads via `Body::Mmap`). The ~757 ns is the coordination overhead — CAS operations, slot metadata writes, and route matching:
+### In-process (for testing)
 
-| Step | Cost |
-|---|---|
-| Block pool alloc (Treiber stack CAS) | ~50 ns |
-| Slot acquisition (CAS + hint scan) | ~80 ns |
-| Request serialization into block | ~100 ns |
-| Smart wake (atomic store, no syscall) | ~5 ns |
-| Server: hint scan + CAS + dispatch_fast | ~300 ns |
-| Response serialization into block | ~80 ns |
-| Client: spin detection + zero-copy read | ~100 ns |
-
-**Why 71x faster than the naive approach (~54 µs):**
-
-| Optimization | Savings |
-|---|---|
-| **Inline spin** — client spins on slot state, catches fast handlers without channels | ~4 µs (eliminates poller + oneshot + eventfd) |
-| **Dedicated OS threads** — server poll loop off tokio, no `spawn_blocking` | ~15-20 µs |
-| **Smart wake** — skip `futex_wake` syscall when server is busy | ~170 ns |
-| **Try-poll dispatch** — poll handler with noop waker, skip `block_on` | ~200 ns |
-| **Hint-based scanning** — client + server skip to last-known slot | ~300 ns |
-| **Zero-alloc route matching** — literal patterns skip HashMap/Vec | ~50 ns |
-| **Counter heartbeat** — check liveness every 1024 requests | ~20 ns |
-| **`CLOCK_MONOTONIC_COARSE`** — ~6 ns timestamps instead of ~25 ns | ~19 ns |
-
-### In-process shortcut
-
-For testing or same-process dispatch, `InProcessClient` calls the router directly — no shared memory, no serialization:
+Skip shared memory entirely — call handlers directly:
 
 ```rust
-let client = InProcessClient::new(router.clone());
+let client = InProcessClient::new(router);
 let resp = client.get("/health").await;  // ~143 ns
 ```
 
 ---
 
-## Installation
+## How it works
 
-```toml
-[dependencies]
-crossbar = "0.1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-```
+Both pub/sub and RPC use the same underlying mechanism:
 
-For shared memory (Unix only):
+1. **Allocate** a block from a lock-free pool (Treiber stack CAS)
+2. **Write** data directly into the mmap'd block (born-in-SHM)
+3. **Transfer** ownership by writing an 8-byte descriptor (O(1))
+4. **Read** on the other side via safe `Deref` into mmap (O(1), zero-copy)
+5. **Free** the block back to the pool when the guard is dropped
 
-```toml
-crossbar = { version = "0.1", features = ["shm"] }
-```
+This is the same pattern as [iceoryx2](https://github.com/eclipse-iceoryx/iceoryx2). Both use ring buffers for pub/sub and shared memory pools for block allocation. The difference is what sits *above* the transport:
+
+| | crossbar | iceoryx2 |
+|---|---|---|
+| **Transport** | **64 ns** | ~237 ns (our hw) / ~100 ns (theirs) |
+| **Pool allocator** | Treiber stack (lock-free CAS) | Lock-free pool |
+| **Above transport** | URI router with path params | Service discovery + POSIX config |
+| **API style** | REST-like (routes, handlers, extractors) | Typed pub/sub channels |
+| **RPC / routing** | Built-in | Not included |
+| **`no_std`** | No | Yes |
+| **Cross-language** | Planned (Python, C++, Go) | Yes (C/C++, Python) |
+| **Platforms** | Linux, macOS | Linux, macOS, Windows, QNX, ... |
+
+Crossbar is faster because it skips iceoryx2's service discovery and POSIX configuration layer — it goes straight from user code to atomics. The tradeoff: iceoryx2 supports more platforms and languages today.
 
 ---
 
 ## Handler system
 
-### Async handlers
+### Async and sync handlers
 
 ```rust
 async fn health() -> &'static str { "ok" }
 async fn echo(req: Request) -> Vec<u8> { req.body.to_vec() }
 ```
-
-### Sync handlers
 
 ```rust
 let router = Router::new()
@@ -286,62 +205,15 @@ async fn get_tick(
 
 ---
 
-## Benchmarks
+## Installation
 
-Full methodology and results in [BENCHMARKS.md](BENCHMARKS.md). Run on your hardware:
-
-```sh
-cargo bench --features shm
+```toml
+[dependencies]
+crossbar = { version = "0.1", features = ["shm"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
-### Pub/Sub
-
-| Mode | Latency |
-|---|---|
-| `publish()` + `try_recv()` (smart wake) | **67 ns** |
-| `publish_silent()` + `try_recv()` | **65 ns** |
-
-| Payload | Throughput |
-|---|---|
-| 64 KB | **45.6 GiB/s** |
-| 1 MB | **29.7 GiB/s** |
-
-### RPC
-
-| Benchmark | In-process | SHM | SHM overhead |
-|---|---|---|---|
-| `/health` (2B) | 143 ns | **757 ns** | 614 ns |
-| OHLC (JSON + path params) | 937 ns | 1.63 µs | 693 ns |
-| POST JSON body | 1.26 µs | 1.86 µs | 600 ns |
-| 64 KB response | 1.28 µs | 1.96 µs | 680 ns |
-| 1 MB response | 18.3 µs | 18.9 µs | 600 ns |
-
-The SHM overhead is a flat **~600-700 ns** regardless of payload size. The *transfer* (writing a block offset to the coordination slot) is always O(1). Larger payloads add the cost of writing data *into* the SHM block (O(n) memcpy). For 1 MB, SHM is nearly the same as in-process because the handler's `Vec` creation dominates and `Body::Mmap` zero-copy avoids the clone that in-process dispatch does.
-
----
-
-## How crossbar compares
-
-### vs iceoryx2
-
-[iceoryx2](https://github.com/eclipse-iceoryx/iceoryx2) is a `no_std` zero-copy shared memory middleware. Both frameworks use the same core pattern: transfer a pointer/offset over shared memory instead of copying data. Crossbar's pub/sub is an apples-to-apples comparison.
-
-| | crossbar pub/sub | iceoryx2 |
-|---|---|---|
-| **O(1) latency** | **67 ns** | ~100 ns |
-| **Descriptor size** | 8 bytes | ~8 bytes |
-| **Subscriber reads** | Safe `Deref` (refcounted) | Safe API |
-| **`no_std`** | No | Yes |
-| **Cross-language** | No | Yes (C/C++) |
-| **RPC / routing** | Yes (separate path) | No |
-
-### vs axum / actix-web
-
-Crossbar provides URI routing without HTTP. If your service talks to browsers, use axum. If your services talk to each other on the same host, crossbar removes HTTP overhead.
-
-### vs raw Unix IPC
-
-Crossbar adds URI-based routing and zero-copy pub/sub on top of shared memory. Without it, you'd build your own message framing, request dispatching, and serialization.
+The `shm` feature enables shared memory transport (Unix only). Without it, only `InProcessClient` is available.
 
 ---
 
@@ -354,8 +226,8 @@ Crossbar adds URI-based routing and zero-copy pub/sub on top of shared memory. W
 | `max_topics` | 16 | Maximum concurrent topics |
 | `block_count` | 256 | Pool blocks available |
 | `block_size` | 64 KiB | Bytes per block (usable: block_size - 8) |
-| `ring_depth` | 8 | Samples remembered before overwrite |
-| `heartbeat_interval` | 100 ms | How often publisher signals liveness |
+| `ring_depth` | 8 | Samples before overwrite |
+| `heartbeat_interval` | 100 ms | Publisher liveness signal |
 | `stale_timeout` | 5 s | Publisher considered dead after this |
 
 ### RPC (`ShmConfig`)
@@ -365,8 +237,40 @@ Crossbar adds URI-based routing and zero-copy pub/sub on top of shared memory. W
 | `slot_count` | 64 | Concurrent in-flight requests |
 | `block_count` | 192 | Pool blocks for request/response data |
 | `block_size` | 64 KiB | Bytes per block |
-| `heartbeat_interval` | 100 ms | Server liveness signal interval |
+| `heartbeat_interval` | 100 ms | Server liveness signal |
 | `stale_timeout` | 5 s | Server considered dead after this |
+
+---
+
+## Benchmarks
+
+Full methodology and results in [BENCHMARKS.md](BENCHMARKS.md).
+
+### Pub/Sub latency
+
+| Mode | Latency |
+|---|---|
+| `publish()` + `try_recv()` (smart wake) | **67 ns** |
+| `publish_silent()` + `try_recv()` | **65 ns** |
+
+### Pub/Sub throughput
+
+| Payload | Throughput |
+|---|---|
+| 64 KB | **45.6 GiB/s** |
+| 1 MB | **29.7 GiB/s** |
+
+### RPC latency
+
+| Benchmark | In-process | SHM | SHM overhead |
+|---|---|---|---|
+| `/health` (2B) | 143 ns | **757 ns** | 614 ns |
+| OHLC (JSON + path params) | 937 ns | 1.63 us | 693 ns |
+| POST JSON body | 1.26 us | 1.86 us | 600 ns |
+| 64 KB response | 1.28 us | 1.96 us | 680 ns |
+| 1 MB response | 18.3 us | 18.9 us | 600 ns |
+
+The SHM overhead is a flat **~600-700 ns** regardless of payload size. Larger payloads add the cost of writing data *into* the SHM block, but the *transfer* is always O(1).
 
 ---
 
@@ -388,16 +292,32 @@ crossbar/
         mmap.rs         Raw mmap wrappers (MAP_POPULATE, MADV_HUGEPAGE)
         region.rs       Memory-mapped region, block pool allocator
         notify.rs       Futex (Linux) / polling (macOS) wait/wake
-        pubsub.rs       ShmPublisher, ShmSubscriber (ring-based pub/sub)
+        pubsub.rs       ShmPublisher, ShmSubscriber (seqlock-based pub/sub)
         pool_pubsub.rs  ShmPoolPublisher, ShmPoolSubscriber (O(1) pool pub/sub)
         bidi.rs         BidiServer, BidiClient (RPC + server-push events)
   crossbar-macros/      #[handler] and #[derive(IntoResponse)] proc macros
   examples/
     demo.rs             In-process + SHM latency comparison
+    pubsub_publisher.rs Cross-process pub/sub publisher
+    pubsub_subscriber.rs Cross-process pub/sub subscriber
   tests/                Integration and stress tests
   benches/
-    transport.rs        Criterion benchmarks
+    transport.rs        Criterion benchmarks (including iceoryx2 head-to-head)
 ```
+
+---
+
+## Language bindings
+
+Crossbar's shared memory layout is a stable binary format. Any language that can `mmap` a file and do atomic operations can interoperate. Planned SDKs:
+
+| Language | Status |
+|---|---|
+| Rust | done |
+| Python | planned |
+| C / C++ | planned |
+| Go | planned |
+| Zig | planned |
 
 ---
 
