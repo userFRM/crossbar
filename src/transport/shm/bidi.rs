@@ -203,6 +203,14 @@ impl BidiClient {
         self.rpc.request(req).await
     }
 
+    /// Allocates a pool block for writing request body directly into SHM.
+    ///
+    /// See [`ShmClient::alloc_request_block`] for details.
+    #[must_use]
+    pub fn alloc_request_block(&self) -> Option<crate::types::ShmResponseLoan> {
+        self.rpc.alloc_request_block()
+    }
+
     /// Subscribes to a server-pushed event topic.
     ///
     /// Returns a [`ShmPoolSubscription`] that can be polled with

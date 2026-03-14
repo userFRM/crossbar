@@ -211,20 +211,20 @@ fn bench_shm_born_in_shm(c: &mut Criterion) {
     let shm_name = "crossbar-bench-born";
 
     // Handlers that write directly into pool blocks (no heap alloc, no memcpy)
+    // Born-in-SHM response handler (reused for both GET and POST)
+    let born_64k = |req: Request| async move {
+        if let Some(mut loan) = req.alloc_response_block() {
+            let cap = loan.capacity().min(65_536);
+            loan.as_mut_slice()[..cap].fill(42);
+            loan.set_len(cap);
+            black_box(Response::ok().with_body(loan))
+        } else {
+            Response::ok().with_body(vec![42u8; 65_536])
+        }
+    };
     let router = Router::new()
-        .route(
-            "/born/64k",
-            get(|req: Request| async move {
-                if let Some(mut loan) = req.alloc_response_block() {
-                    let cap = loan.capacity().min(65_536);
-                    loan.as_mut_slice()[..cap].fill(42);
-                    loan.set_len(cap);
-                    black_box(Response::ok().with_body(loan))
-                } else {
-                    Response::ok().with_body(vec![42u8; 65_536])
-                }
-            }),
-        )
+        .route("/born/64k", get(born_64k))
+        .route("/born/64k", post(born_64k))
         .route(
             "/born/2b",
             get(|req: Request| async move {
@@ -236,6 +236,10 @@ fn bench_shm_born_in_shm(c: &mut Criterion) {
                     Response::ok().with_body("ok")
                 }
             }),
+        )
+        .route(
+            "/born/2b",
+            post(|_req: Request| async move { Response::ok().with_body("ok") }),
         );
 
     let _handle = rt.block_on(async { ShmServer::spawn(shm_name, router).await.unwrap() });
@@ -250,10 +254,35 @@ fn bench_shm_born_in_shm(c: &mut Criterion) {
             .iter(|| async { black_box(client.get("/born/2b").await.unwrap()) })
     });
 
-    group.bench_function("64KB", |b| {
+    group.bench_function("resp_64KB", |b| {
         let client = client.clone();
         b.to_async(&rt)
             .iter(|| async { black_box(client.get("/born/64k").await.unwrap()) })
+    });
+
+    // Born-in-SHM request: client writes body directly into pool block
+    // Body capped at 60KB to leave room for URI + headers in the block
+    group.bench_function("req_60KB", |b| {
+        let client = client.clone();
+        b.to_async(&rt).iter(|| async {
+            let mut loan = client.alloc_request_block().unwrap();
+            let cap = loan.capacity().min(61_440);
+            loan.as_mut_slice()[..cap].fill(42);
+            loan.set_len(cap);
+            black_box(client.post("/born/2b", loan).await.unwrap())
+        })
+    });
+
+    // Full roundtrip: both request AND response born-in-SHM
+    group.bench_function("full_60KB", |b| {
+        let client = client.clone();
+        b.to_async(&rt).iter(|| async {
+            let mut loan = client.alloc_request_block().unwrap();
+            let cap = loan.capacity().min(61_440);
+            loan.as_mut_slice()[..cap].fill(42);
+            loan.set_len(cap);
+            black_box(client.post("/born/64k", loan).await.unwrap())
+        })
     });
 
     group.finish();

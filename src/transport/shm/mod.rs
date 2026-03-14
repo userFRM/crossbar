@@ -700,17 +700,35 @@ impl ShmClient {
         }
     }
 
+    /// Allocates a pool block for writing request body directly into SHM.
+    ///
+    /// Returns `None` if the pool is exhausted. Use the returned loan to write
+    /// data directly into the SHM block, then convert it to a `Body` and attach
+    /// to a `Request`. This eliminates the heap→SHM copy on the request path.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use crossbar::prelude::*;
+    /// # async fn example(client: &ShmClient) -> Result<(), CrossbarError> {
+    /// if let Some(mut loan) = client.alloc_request_block() {
+    ///     loan.as_mut_slice()[..4].copy_from_slice(b"data");
+    ///     loan.set_len(4);
+    ///     let resp = client.post("/path", loan).await?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn alloc_request_block(&self) -> Option<crate::types::ShmResponseLoan> {
+        crate::types::ShmResponseLoan::new(&self.region)
+    }
+
     /// Sends a request via shared memory and waits for the response.
     ///
-    /// # Errors
-    ///
-    /// Returns [`CrossbarError::ShmServerDead`] if the server heartbeat is
-    /// stale or the response times out, [`CrossbarError::ShmPoolExhausted`]
-    /// if no data blocks are available, [`CrossbarError::ShmSlotsFull`] if
-    /// all coordination slots are occupied, or
-    /// [`CrossbarError::ShmMessageTooLarge`] if the request exceeds block
-    /// capacity.
-    pub async fn request(&self, req: Request) -> Result<Response, CrossbarError> {
+    /// If the request body is [`Body::ShmDirect`], the body is already in
+    /// the pool block and no copy is performed — O(1) transfer.
+    pub async fn request(&self, mut req: Request) -> Result<Response, CrossbarError> {
         // Counter-based heartbeat: only check every 1024 requests (~20 ns saved)
         let count = self
             .request_count
@@ -720,11 +738,21 @@ impl ShmClient {
             self.region.check_heartbeat(self.stale_timeout)?;
         }
 
-        // Allocate a request block from the pool
-        let req_block_idx = self
-            .region
-            .alloc_block()
-            .ok_or(CrossbarError::ShmPoolExhausted)?;
+        // Check if body is born-in-SHM (already in a pool block)
+        let direct_block = if let Body::ShmDirect(ref mut guard) = req.body {
+            Some((guard.take_block_idx(), guard.body_len))
+        } else {
+            None
+        };
+
+        // Allocate a request block from the pool (unless born-in-SHM)
+        let req_block_idx = if let Some((block_idx, _)) = direct_block {
+            block_idx
+        } else {
+            self.region
+                .alloc_block()
+                .ok_or(CrossbarError::ShmPoolExhausted)?
+        };
 
         // Acquire a slot — try once without Instant::now() (saves ~25 ns)
         let slot_idx = if let Some(idx) = self.region.try_acquire_slot(self.client_id) {
@@ -737,7 +765,9 @@ impl ShmClient {
                     break idx;
                 }
                 if std::time::Instant::now() >= deadline {
-                    self.region.free_block(req_block_idx);
+                    if direct_block.is_none() {
+                        self.region.free_block(req_block_idx);
+                    }
                     return Err(CrossbarError::ShmSlotsFull);
                 }
                 tokio::task::yield_now().await;
@@ -745,10 +775,21 @@ impl ShmClient {
         };
 
         // Write request into block (state is WRITING from try_acquire_slot)
-        if let Err(e) = self
-            .region
-            .write_request_to_block(slot_idx, req_block_idx, &req)
-        {
+        let write_result = if let Some((_, body_len)) = direct_block {
+            // Born-in-SHM: body already at offset 0, just append URI + headers
+            self.region.write_request_direct(
+                slot_idx,
+                req_block_idx,
+                body_len,
+                req.method,
+                req.uri.raw(),
+                &req.headers,
+            )
+        } else {
+            self.region
+                .write_request_to_block(slot_idx, req_block_idx, &req)
+        };
+        if let Err(e) = write_result {
             self.region.free_block(req_block_idx);
             self.region
                 .slot_state(slot_idx)

@@ -1323,6 +1323,110 @@ fn pool_pubsub_sequential_consistency() {
     assert!(last.is_some(), "should have received at least one sample");
 }
 
+// ─── Born-in-SHM requests (client side) ────────────────────────────────────
+
+#[cfg(all(unix, feature = "shm"))]
+#[tokio::test]
+async fn shm_born_in_shm_request() {
+    let name = &shm_name("born-req");
+    let router = Router::new().route(
+        "/echo",
+        post(|req: Request| async move { Response::ok().with_body(req.body.clone()) }),
+    );
+    let _handle = ShmServer::spawn(name, router).await.unwrap();
+    let client = ShmClient::connect(name).await.unwrap();
+
+    // Write request body directly into SHM pool block
+    let mut loan = client.alloc_request_block().unwrap();
+    let data = b"born-in-shm-request-body";
+    loan.as_mut_slice()[..data.len()].copy_from_slice(data);
+    loan.set_len(data.len());
+
+    let resp = client.post("/echo", loan).await.unwrap();
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body_str(), "born-in-shm-request-body");
+}
+
+#[cfg(all(unix, feature = "shm"))]
+#[tokio::test]
+async fn shm_born_in_shm_request_large() {
+    let name = &shm_name("born-req-lg");
+    let router = Router::new().route(
+        "/echo",
+        post(|req: Request| async move {
+            // Respond with born-in-SHM body too
+            if let Some(mut loan) = req.alloc_response_block() {
+                let body = req.body.as_ref();
+                let len = body.len().min(loan.capacity());
+                loan.as_mut_slice()[..len].copy_from_slice(&body[..len]);
+                loan.set_len(len);
+                Response::ok().with_body(loan)
+            } else {
+                Response::ok().with_body(req.body.clone())
+            }
+        }),
+    );
+    let _handle = ShmServer::spawn(name, router).await.unwrap();
+    let client = ShmClient::connect(name).await.unwrap();
+
+    // Write 32KB directly into SHM
+    let mut loan = client.alloc_request_block().unwrap();
+    let cap = loan.capacity().min(32_768);
+    for (i, byte) in loan.as_mut_slice().iter_mut().enumerate().take(cap) {
+        *byte = (i & 0xFF) as u8;
+    }
+    loan.set_len(cap);
+
+    let resp = client.post("/echo", loan).await.unwrap();
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body.len(), cap);
+    // Verify data integrity
+    for (i, &byte) in resp.body.as_ref().iter().enumerate() {
+        assert_eq!(byte, (i & 0xFF) as u8, "mismatch at byte {i}");
+    }
+}
+
+#[cfg(all(unix, feature = "shm"))]
+#[tokio::test]
+async fn shm_born_in_shm_full_roundtrip() {
+    // Both request and response are born-in-SHM: zero intermediate copies
+    let name = &shm_name("born-full");
+    let router = Router::new().route(
+        "/transform",
+        post(|req: Request| async move {
+            if let Some(mut loan) = req.alloc_response_block() {
+                // XOR each byte with 0xFF (transform in-place conceptually)
+                let body = req.body.as_ref();
+                let len = body.len().min(loan.capacity());
+                let buf = loan.as_mut_slice();
+                for i in 0..len {
+                    buf[i] = body[i] ^ 0xFF;
+                }
+                loan.set_len(len);
+                Response::ok().with_body(loan)
+            } else {
+                Response::ok()
+            }
+        }),
+    );
+    let _handle = ShmServer::spawn(name, router).await.unwrap();
+    let client = ShmClient::connect(name).await.unwrap();
+
+    // Born-in-SHM request
+    let mut loan = client.alloc_request_block().unwrap();
+    for (i, byte) in loan.as_mut_slice().iter_mut().enumerate().take(256) {
+        *byte = i as u8;
+    }
+    loan.set_len(256);
+
+    let resp = client.post("/transform", loan).await.unwrap();
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body.len(), 256);
+    for (i, &byte) in resp.body.as_ref().iter().enumerate() {
+        assert_eq!(byte, (i as u8) ^ 0xFF, "mismatch at byte {i}");
+    }
+}
+
 // ─── Bidirectional (RPC + Events) ──────────────────────────────────────────
 
 #[cfg(all(unix, feature = "shm"))]

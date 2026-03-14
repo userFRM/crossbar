@@ -724,14 +724,29 @@ impl ShmRegion {
         req: &Request,
     ) -> Result<(), CrossbarError> {
         let uri_bytes = req.uri.raw().as_bytes();
+        let body_len = req.body.len();
         let block_cap = self.block_size as usize;
         let block = self.block_ptr(block_idx);
 
-        // Write URI into block
+        // Block layout: [body][uri][headers] — body first for born-in-SHM compat
         let mut off = 0usize;
+
+        // Write body into block
+        if body_len > block_cap {
+            return Err(CrossbarError::ShmMessageTooLarge {
+                size: body_len,
+                max: block_cap,
+            });
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(req.body.as_ptr(), block.add(off), body_len);
+        }
+        off += body_len;
+
+        // Write URI after body
         if off + uri_bytes.len() > block_cap {
             return Err(CrossbarError::ShmMessageTooLarge {
-                size: uri_bytes.len(),
+                size: off + uri_bytes.len(),
                 max: block_cap,
             });
         }
@@ -740,27 +755,61 @@ impl ShmRegion {
         }
         off += uri_bytes.len();
 
-        // Write headers directly into block
-        let remaining =
-            &mut unsafe { std::slice::from_raw_parts_mut(block.add(off), block_cap - off) };
+        // Write headers after URI
+        let remaining = unsafe { std::slice::from_raw_parts_mut(block.add(off), block_cap - off) };
         let headers_len = crate::transport::serialize_headers_into(&req.headers, remaining)?;
-        off += headers_len;
-
-        // Write body into block
-        if off + req.body.len() > block_cap {
-            return Err(CrossbarError::ShmMessageTooLarge {
-                size: off + req.body.len(),
-                max: block_cap,
-            });
-        }
-        unsafe {
-            std::ptr::copy_nonoverlapping(req.body.as_ptr(), block.add(off), req.body.len());
-        }
 
         // Write metadata to coordination slot
         self.set_slot_method(slot_idx, u8::from(req.method));
         self.set_uri_len(slot_idx, uri_bytes.len() as u32);
-        self.set_body_len(slot_idx, req.body.len() as u32);
+        self.set_body_len(slot_idx, body_len as u32);
+        self.set_headers_data_len(slot_idx, headers_len as u32);
+        self.set_request_block_idx(slot_idx, block_idx);
+
+        Ok(())
+    }
+
+    /// Finalizes a born-in-SHM request: the body is already in the block
+    /// at offset 0, so only URI and headers are appended after the body.
+    ///
+    /// Block layout: `[body bytes (already written)][uri][headers_data]`.
+    #[inline]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn write_request_direct(
+        &self,
+        slot_idx: u32,
+        block_idx: u32,
+        body_len: usize,
+        method: Method,
+        uri: &str,
+        headers: &std::collections::HashMap<String, String>,
+    ) -> Result<(), CrossbarError> {
+        let uri_bytes = uri.as_bytes();
+        let block_cap = self.block_size as usize;
+        let block = self.block_ptr(block_idx);
+
+        let mut off = body_len;
+
+        // Write URI after body
+        if off + uri_bytes.len() > block_cap {
+            return Err(CrossbarError::ShmMessageTooLarge {
+                size: off + uri_bytes.len(),
+                max: block_cap,
+            });
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(uri_bytes.as_ptr(), block.add(off), uri_bytes.len());
+        }
+        off += uri_bytes.len();
+
+        // Write headers after URI
+        let remaining = unsafe { std::slice::from_raw_parts_mut(block.add(off), block_cap - off) };
+        let headers_len = crate::transport::serialize_headers_into(headers, remaining)?;
+
+        // Write metadata to coordination slot
+        self.set_slot_method(slot_idx, u8::from(method));
+        self.set_uri_len(slot_idx, uri_bytes.len() as u32);
+        self.set_body_len(slot_idx, body_len as u32);
         self.set_headers_data_len(slot_idx, headers_len as u32);
         self.set_request_block_idx(slot_idx, block_idx);
 
@@ -770,7 +819,7 @@ impl ShmRegion {
     /// Reads a request from a block.
     ///
     /// The body is zero-copy via `Body::Mmap`.
-    /// Block layout: `[uri bytes][headers_data][body bytes]`.
+    /// Block layout: `[body bytes][uri bytes][headers_data]`.
     ///
     /// # Errors
     ///
@@ -804,7 +853,6 @@ impl ShmRegion {
         match total {
             Some(t) if t <= block_cap => {}
             _ => {
-                // Free the block before returning — caller won't see it again.
                 self.free_block(block_idx);
                 return Err(CrossbarError::ShmInvalidRegion(format!(
                     "request payload ({uri_len}+{headers_data_len}+{body_len}) exceeds block size ({block_cap})"
@@ -812,10 +860,20 @@ impl ShmRegion {
             }
         }
 
-        let mut off = 0usize;
+        // Body at offset 0 — zero-copy via Body::Mmap
+        let body = if body_len == 0 {
+            Body::Empty
+        } else {
+            Body::Mmap(ShmBodyGuard {
+                region: Arc::clone(self),
+                block_idx,
+                offset: 0,
+                len: body_len,
+            })
+        };
 
-        // URI
-        let uri_slice = self.block_slice(block_idx, off, uri_len);
+        // URI after body
+        let uri_slice = self.block_slice(block_idx, body_len, uri_len);
         let Ok(uri_str) = std::str::from_utf8(uri_slice) else {
             self.free_block(block_idx);
             return Err(CrossbarError::Io(std::io::Error::new(
@@ -823,29 +881,20 @@ impl ShmRegion {
                 "URI not valid UTF-8",
             )));
         };
-        off += uri_len;
 
-        // Headers
-        let headers_slice = self.block_slice(block_idx, off, headers_data_len);
-        let headers = match crate::transport::deserialize_headers(headers_slice) {
-            Ok(h) => h,
-            Err(e) => {
-                self.free_block(block_idx);
-                return Err(e);
-            }
-        };
-        off += headers_data_len;
-
-        // Body — zero-copy via Body::Mmap
-        let body = if body_len == 0 {
-            Body::Empty
+        // Headers after URI
+        let headers_off = body_len + uri_len;
+        let headers = if headers_data_len == 0 {
+            std::collections::HashMap::new()
         } else {
-            Body::Mmap(ShmBodyGuard {
-                region: Arc::clone(self),
-                block_idx,
-                offset: off,
-                len: body_len,
-            })
+            let headers_slice = self.block_slice(block_idx, headers_off, headers_data_len);
+            match crate::transport::deserialize_headers(headers_slice) {
+                Ok(h) => h,
+                Err(e) => {
+                    self.free_block(block_idx);
+                    return Err(e);
+                }
+            }
         };
 
         let mut req = Request::new(method, uri_str).with_body(body);
