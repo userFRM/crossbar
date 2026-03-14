@@ -174,6 +174,10 @@ impl ShmServer {
         Ok(())
     }
 
+    /// Starts heartbeat and stale-recovery threads.
+    ///
+    /// Uses bare OS threads instead of tokio tasks — the server does not
+    /// require a tokio runtime for its background work.
     fn start_background_tasks(
         region: &Arc<ShmRegion>,
         config: &ShmConfig,
@@ -182,22 +186,28 @@ impl ShmServer {
         let hb_region = Arc::clone(region);
         let hb_interval = config.heartbeat_interval;
         let hb_stop = Arc::clone(&stop);
-        tokio::spawn(async move {
-            while !hb_stop.load(Ordering::Acquire) {
-                hb_region.update_heartbeat();
-                tokio::time::sleep(hb_interval).await;
-            }
-        });
+        std::thread::Builder::new()
+            .name("crossbar-heartbeat".into())
+            .spawn(move || {
+                while !hb_stop.load(Ordering::Acquire) {
+                    hb_region.update_heartbeat();
+                    std::thread::sleep(hb_interval);
+                }
+            })
+            .expect("failed to spawn heartbeat thread");
 
         let recovery_region = Arc::clone(region);
         let stale_timeout = config.stale_timeout;
         let rec_stop = stop;
-        tokio::spawn(async move {
-            while !rec_stop.load(Ordering::Acquire) {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                recovery_region.recover_stale_slots(stale_timeout);
-            }
-        });
+        std::thread::Builder::new()
+            .name("crossbar-recovery".into())
+            .spawn(move || {
+                while !rec_stop.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_secs(1));
+                    recovery_region.recover_stale_slots(stale_timeout);
+                }
+            })
+            .expect("failed to spawn recovery thread");
     }
 
     fn start_server_loop(
@@ -206,9 +216,12 @@ impl ShmServer {
         stop: Arc<std::sync::atomic::AtomicBool>,
     ) {
         let rt_handle = tokio::runtime::Handle::current();
-        tokio::task::spawn_blocking(move || {
-            Self::poll_loop(&region, &router, &rt_handle, &stop);
-        });
+        std::thread::Builder::new()
+            .name("crossbar-server".into())
+            .spawn(move || {
+                Self::poll_loop(&region, &router, &rt_handle, &stop);
+            })
+            .expect("failed to spawn server thread");
     }
 
     /// Dispatches a request, bypassing tokio when the handler resolves immediately.
@@ -224,6 +237,9 @@ impl ShmServer {
         rt_handle: &tokio::runtime::Handle,
     ) -> Response {
         let mut fut = std::pin::pin!(router.dispatch(req));
+        // Enter the runtime context so handlers that use tokio timers,
+        // IO, etc. can find the reactor during the initial poll.
+        let _guard = rt_handle.enter();
         let waker = std::task::Waker::noop();
         let mut cx = std::task::Context::from_waker(waker);
         match fut.as_mut().poll(&mut cx) {
@@ -401,12 +417,12 @@ impl PollerWake {
 unsafe impl Send for PollerWake {}
 unsafe impl Sync for PollerWake {}
 
-/// Shared-memory IPC client (V2 — dedicated poller, zero-copy reads).
+/// Shared-memory IPC client (V2 — inline spin + poller fallback).
 ///
 /// Attaches to an existing shared memory region created by [`ShmServer`].
-/// Uses a dedicated background thread to poll for responses instead of
-/// `spawn_blocking`, eliminating ~15-20 µs of tokio threadpool overhead
-/// per request.
+/// Uses a two-phase response strategy:
+/// 1. **Inline spin** (~2 µs) catches fast handlers without any channel overhead
+/// 2. **Poller thread fallback** handles slow handlers via eventfd + oneshot
 ///
 /// # Examples
 ///
@@ -517,11 +533,41 @@ impl ShmClient {
         })
     }
 
-    /// Adaptive spin constants for the poller loop.
+    /// Number of inline spin iterations in `request()` before falling back
+    /// to the poller thread. At ~1 ns per iteration, 2048 ≈ 2 µs of
+    /// spinning. Catches fast handlers (e.g. /health) without touching
+    /// channels, oneshot, or eventfd.
+    const INLINE_SPIN_ITERS: u32 = 2048;
+
+    /// Adaptive spin constants for the poller loop (slow-path fallback).
     const SPIN_ITERS: u32 = 64;
     const YIELD_ITERS: u32 = 8;
     const PARK_MIN_US: u64 = 50;
     const PARK_MAX_US: u64 = 5000;
+
+    /// Reads the response from a completed slot and releases it back to FREE.
+    ///
+    /// Shared by both the inline fast-spin path and the poller thread.
+    #[inline]
+    fn complete_response(
+        region: &Arc<ShmRegion>,
+        slot_idx: u32,
+    ) -> Result<Response, CrossbarError> {
+        let resp_block_idx = region.response_block_idx(slot_idx);
+        let resp = if resp_block_idx == u32::MAX {
+            let status = region.response_status(slot_idx);
+            Ok(Response::with_status(status))
+        } else {
+            region.read_response_from_block(slot_idx)
+        };
+
+        // Clear block indices before releasing slot
+        region.set_request_block_idx(slot_idx, NO_BLOCK);
+        region.set_response_block_idx(slot_idx, NO_BLOCK);
+        region.slot_state(slot_idx).store(FREE, Ordering::Release);
+
+        resp
+    }
 
     /// Dedicated response poller — runs on its own OS thread.
     ///
@@ -567,21 +613,7 @@ impl ShmClient {
 
                 if current == RESPONSE_READY {
                     any_completed = true;
-
-                    // Read response — O(1) zero-copy body via Body::Mmap
-                    let resp_block_idx = region.response_block_idx(req.slot_idx);
-                    let resp = if resp_block_idx == u32::MAX {
-                        let status = region.response_status(req.slot_idx);
-                        Ok(Response::with_status(status))
-                    } else {
-                        region.read_response_from_block(req.slot_idx)
-                    };
-
-                    // Clear block indices before releasing slot
-                    region.set_request_block_idx(req.slot_idx, NO_BLOCK);
-                    region.set_response_block_idx(req.slot_idx, NO_BLOCK);
-                    state.store(FREE, Ordering::Release);
-
+                    let resp = Self::complete_response(&region, req.slot_idx);
                     if let Some(tx) = req.tx.take() {
                         let _ = tx.send(resp);
                     }
@@ -703,7 +735,19 @@ impl ShmClient {
         state_atom.store(REQUEST_READY, Ordering::Release);
         self.region.notify_server();
 
-        // Submit to dedicated poller thread (not spawn_blocking)
+        // ── Fast path: inline spin ──
+        // Catches fast handlers (~2 µs window) without touching channels,
+        // oneshot, or eventfd. Zero overhead for the common case.
+        for _ in 0..Self::INLINE_SPIN_ITERS {
+            if state_atom.load(Ordering::Acquire) == RESPONSE_READY {
+                return Self::complete_response(&self.region, slot_idx);
+            }
+            core::hint::spin_loop();
+        }
+
+        // ── Slow path: poller thread fallback ──
+        // Handler didn't respond within the spin window. Submit to the
+        // dedicated poller thread which uses adaptive backoff.
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.poller_tx
             .send(InflightRequest {
@@ -713,7 +757,7 @@ impl ShmClient {
             })
             .map_err(|_| CrossbarError::ShmServerDead)?;
 
-        // Wake the poller thread via eventfd/pipe (zero-latency)
+        // Wake the poller thread via eventfd/pipe
         self.poller_wake.wake();
 
         // Await response — non-blocking in tokio

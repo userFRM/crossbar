@@ -344,36 +344,47 @@ impl ShmRegion {
         }
     }
 
-    // -- Server notification flag (global header offset 0x30) --
+    // -- Server notification (global header offsets 0x30, 0x38) --
 
-    /// Returns a reference to the server notification flag.
-    ///
-    /// The flag lives at offset `0x30` in the global header (reserved space).
-    /// It is zero when idle; the client stores `1` and wakes the server's
-    /// futex to signal that a new request is pending.
+    /// Returns a reference to the server notification flag (offset 0x30).
     #[allow(clippy::cast_ptr_alignment)] // offset 0x30 is 4-byte aligned within the header
     fn server_notify_atomic(&self) -> &AtomicU32 {
         unsafe { &*self.mmap.as_ptr().add(0x30).cast::<AtomicU32>() }
     }
 
-    /// Signals the server that at least one slot has transitioned to
-    /// `REQUEST_READY`. Called by the client immediately after the slot
-    /// state store.
+    /// Returns a reference to the server waiters counter (offset 0x38).
     ///
-    /// Stores `1` into the flag then issues a `futex_wake` so the server's
-    /// `wait_for_work` wakes up without waiting for the spin timeout.
+    /// Tracks how many threads are blocked in `wait_for_work()`. Used by
+    /// `notify_server()` to skip the `futex_wake` syscall (~170 ns) when
+    /// the server is already busy processing requests (smart wake).
+    #[allow(clippy::cast_ptr_alignment)] // offset 0x38 is 4-byte aligned within the header
+    fn server_waiters_atomic(&self) -> &AtomicU32 {
+        unsafe { &*self.mmap.as_ptr().add(0x38).cast::<AtomicU32>() }
+    }
+
+    /// Signals the server that at least one slot has transitioned to
+    /// `REQUEST_READY`.
+    ///
+    /// Smart wake: only issues the `futex_wake` syscall if the server is
+    /// actually blocked in `wait_for_work()`. When the server is busy
+    /// processing, it will see the flag on its next poll loop iteration
+    /// without a syscall. Saves ~170 ns per request under load.
+    #[inline]
     pub fn notify_server(&self) {
         let flag = self.server_notify_atomic();
         flag.store(1, Ordering::Release);
-        super::notify::wake_one(flag);
+        // Only issue the syscall if the server is actually sleeping
+        if self.server_waiters_atomic().load(Ordering::Acquire) > 0 {
+            super::notify::wake_one(flag);
+        }
     }
 
     /// Blocks the server thread until the notification flag becomes non-zero,
     /// then clears it and returns.
     ///
-    /// Uses `futex_wait` (Linux) or short-sleep polling (other Unix) so the
-    /// server thread does not burn CPU while idle.  The timeout is capped at
-    /// 1 ms so the server still wakes promptly when the stop flag is set.
+    /// Increments the waiters counter so `notify_server()` knows to issue
+    /// a `futex_wake`. The timeout is capped at 1 ms so the server still
+    /// checks the stop flag promptly.
     pub fn wait_for_work(&self) {
         let flag = self.server_notify_atomic();
         // Fast path: already signalled (no syscall needed).
@@ -381,8 +392,10 @@ impl ShmRegion {
             flag.store(0, Ordering::Release);
             return;
         }
-        // Slow path: wait up to 1 ms for the client to signal.
+        // Slow path: register as waiter, then futex_wait.
+        self.server_waiters_atomic().fetch_add(1, Ordering::Release);
         super::notify::wait_until_not(flag, 0, std::time::Duration::from_millis(1)).ok();
+        self.server_waiters_atomic().fetch_sub(1, Ordering::Release);
         flag.store(0, Ordering::Release);
     }
 
