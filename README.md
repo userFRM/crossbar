@@ -15,8 +15,8 @@ let router = Router::new()
     .route("/echo", post(echo));
 
 // Same router, same handlers — pick your transport.
-InProcessClient::new(router.clone());                      // in-process,     ~150 ns
-ShmServer::spawn("myapp", router.clone()).await?;          // cross-process,  ~3-5 µs
+InProcessClient::new(router.clone());                      // in-process,   ~150 ns
+ShmServer::spawn("myapp", router.clone()).await?;          // cross-process, ~54 µs
 ```
 
 ---
@@ -27,8 +27,8 @@ Most web frameworks (axum, actix, warp) couple your handlers to HTTP. Crossbar d
 
 **In plain terms:** imagine you have a function that returns stock prices. With crossbar, that same function can serve requests from:
 
-- Another function in the same program (150 nanoseconds)
-- Another process on the same machine via shared memory (3-5 microseconds)
+- Another function in the same program (152 nanoseconds)
+- Another process on the same machine via shared memory (54 microseconds RPC, 218 nanoseconds pub/sub)
 
 You never change the function. You only change how it's wired up.
 
@@ -60,12 +60,12 @@ The demo builds a single router and exercises it over both in-process and SHM tr
 - **You're building a trading system** — sub-microsecond in-process dispatch, with cross-process SHM for co-located services
 - **You have co-located services** — game servers, microservice sidecars, or ML pipelines on the same host
 - **You want transport-agnostic testing** — swap SHM for `InProcessClient` and run integration tests without shared memory setup
+- **You need pub/sub over shared memory** — 218 ns end-to-end with futex wake, 45 ns without
 
 ### Don't use crossbar when
 
 - **You need HTTP** — use [axum](https://github.com/tokio-rs/axum) or [actix-web](https://github.com/actix/actix-web)
 - **You need browser compatibility** — crossbar's wire protocol is not HTTP
-- **You need true zero-copy IPC** — see [How crossbar compares](#how-crossbar-compares) below
 - **You want a mature ecosystem** — crossbar is new; axum has middleware, extractors, and a large community
 
 > [!TIP]
@@ -91,11 +91,11 @@ Client                   Server
 
 The simplest transport. `InProcessClient` holds an `Arc<Router>` and calls `router.dispatch(req)` directly — the same way you'd call any async function. There is no serialization, no framing, no I/O. The request and response stay in the same memory space and the same thread.
 
-**Cost:** one async function call (~150 ns).
+**Cost:** one async function call (~152 ns).
 
 **Use case:** in-process dispatch, unit testing, embedding crossbar as a function router.
 
-### SHM — shared memory with block pool and zero-copy reads (V2)
+### SHM RPC — shared memory with block pool and zero-copy reads (V2)
 
 ```
 Client process                      Server process
@@ -105,36 +105,58 @@ Client process                      Server process
   ├── acquire slot, set REQUEST_READY   │
   │                                     ├── poll: sees REQUEST_READY
   │                                     ├── state = PROCESSING
-  │                                     ├── read request (zero-copy via Bytes::from_owner)
+  │                                     ├── read request (zero-copy via Body::Mmap)
   │                                     ├── router.dispatch(req)
   │                                     ├── alloc response block
   │                                     ├── memcpy response into block
   │                                     ├── state = RESPONSE_READY
   ├── poll: sees RESPONSE_READY ◄───────┤
-  ├── read response (zero-copy via Bytes::from_owner)
+  ├── read response (zero-copy via Body::Mmap)
   ├── state = FREE                      │
   │                                     │
 ```
 
 Both processes `mmap` the same file at `/dev/shm/crossbar-{name}`. The V2 architecture separates **coordination slots** (64 bytes each, hold state machine) from **data blocks** (configurable size, hold request/response payloads). Blocks are managed by a lock-free Treiber stack allocator.
 
-Key V2 improvements over V1:
-- **Zero-copy reads:** Response bodies are returned as `Bytes::from_owner`, pointing directly into the mmap region. No memcpy on the read path.
-- **Block pool:** Data blocks are allocated independently from coordination slots, allowing more efficient memory utilization.
+Key V2 features:
+- **Zero-copy reads:** Response bodies are returned as `Body::Mmap`, pointing directly into the mmap region. No memcpy on the read path. No external crate dependency (no `bytes`).
+- **Block pool:** Data blocks are allocated independently from coordination slots via a lock-free Treiber stack with ABA protection.
 - **Decoupled sizing:** Coordination slots are small and fixed; data block size is configurable independently.
+- **SHM soundness:** All shared memory access uses raw pointers (`ptr::copy_nonoverlapping`) — no `&[u8]` references to raced memory. Mmap wrappers expose `as_ptr()`/`as_mut_ptr()` only, not `Deref`.
 
 Synchronization uses a spin-then-futex strategy: spin briefly, then fall back to `futex_wait` (Linux) or polling (macOS) to avoid burning CPU while idle.
 
-**Cost:** one `memcpy` per write + zero-copy reads + atomic synchronization (~3-5 µs). No kernel syscalls on the data path.
+**Cost:** ~54 µs per round-trip (dominated by coordination overhead — `spawn_blocking`, futex transitions, header serialization — not by data copying).
 
-**Use case:** ultra-low-latency cross-process IPC on the same host.
+**Use case:** cross-process request/response IPC on the same host.
+
+### SHM Pub/Sub — zero-copy streaming
+
+```
+Publisher                   Shared Memory                  Subscriber
+  │                                                           │
+  ├── loan_to(&topic) ───► get mutable ptr to ring slot       │
+  ├── write directly ────► data born in SHM (no copy)         │
+  ├── publish() ─────────► atomic seq + futex_wake            │
+  │                                                           │
+  │                        ◄── try_recv_ref() ────────────────┤
+  │                        ◄── returns raw ptr into mmap ─────┤
+  │                        ◄── O(1) — no copy, no alloc ──────┤
+```
+
+The fastest cross-process path. No routing, no serialization, no state machine. A ring buffer with seqlock validation. Publisher writes raw bytes into mmap; subscriber reads them in-place.
+
+| Metric | Value |
+|--------|-------|
+| End-to-end latency (with futex wake) | **218 ns** |
+| Transport-only (no futex, `publish_silent`) | **45 ns** |
+| Throughput (64 KB payloads) | **17.5 GiB/s** |
 
 > [!IMPORTANT]
-> Crossbar's SHM transport copies data into shared memory blocks on the write path but uses
-> zero-copy `Bytes::from_owner` on the read path. This is different from **true zero-copy**
-> solutions like [iceoryx2](https://github.com/eclipse-iceoryx/iceoryx2), which transfer only
-> a pointer offset (~8 bytes) regardless of payload size. See
-> [How crossbar compares](#how-crossbar-compares) for a detailed breakdown.
+> The `loan_to()` API writes directly into the mmap slot (iceoryx-style "born in SHM" pattern).
+> The publish itself transfers only metadata (seq number + data length) — not the payload.
+> However, data must still be copied INTO the ring slot by the publisher. True O(1) transfer
+> regardless of payload size requires pool-based ownership transfer (planned).
 
 ---
 
@@ -146,25 +168,20 @@ Crossbar and HTTP frameworks solve different problems. Crossbar provides URI rou
 
 ### vs iceoryx2
 
-[iceoryx2](https://github.com/eclipse-iceoryx/iceoryx2) is a true zero-copy shared memory middleware. The architectural difference is fundamental:
+[iceoryx2](https://github.com/eclipse-iceoryx/iceoryx2) is a true zero-copy shared memory middleware. The architectural difference:
 
-| | crossbar SHM (V2) | iceoryx2 |
+| | crossbar SHM | iceoryx2 |
 |---|---|---|
-| **What is transferred** | Write: memcpy into block. Read: zero-copy pointer | A pointer offset (~8 bytes) |
-| **Write-side scaling** | O(n) — grows with payload size | O(1) — data "born" in SHM |
-| **Read-side scaling** | O(1) — `Bytes::from_owner` | O(1) — pointer deref |
-| **Pattern** | Request/response with URI routing | Publish/subscribe (and request/response) |
-| **Memory model** | Block pool allocator, Treiber stack | Pool allocator, producer writes directly into shared memory |
+| **RPC latency** | ~54 µs (V2, block pool) | N/A (pub/sub only) |
+| **Pub/sub latency (small)** | **45 ns** (no futex) | ~100 ns |
+| **Pub/sub latency (large)** | O(n) — memcpy into ring | O(1) — pointer offset |
+| **What is transferred** | Seq + data length (ring) / block index (RPC) | Pointer offset (~8 bytes) |
+| **Data model** | Ring buffer (loss-tolerant) | Pool-based ownership transfer |
+| **Pattern** | Request/response + pub/sub | Pub/sub + request/response |
 | **Routing** | Built-in URI pattern matching | Service-oriented discovery |
+| **Memory safety** | Raw pointers, seqlock validation | `unsafe` under the hood, safe API |
 
-**When to choose iceoryx2:** you need the absolute lowest latency regardless of payload size, you're streaming large data (sensor feeds, video frames, point clouds), or you're in an automotive/robotics context where iceoryx2's safety certifications matter.
-
-**When to choose crossbar:** you want familiar REST-like URI routing (`/api/orders/:id`), you need both in-process and cross-process transports, your payloads are small (< 64 KB where the memcpy cost is negligible), or you want the simplicity of a single router that works identically across in-process and cross-process contexts.
-
-> [!NOTE]
-> Crossbar is not trying to compete with iceoryx2 on raw shared memory throughput. They
-> occupy different niches. Crossbar's value is **transport polymorphism** — the same router
-> and handlers serving over any transport, from a direct function call to cross-process SHM.
+**Crossbar wins on small-payload pub/sub** (45 ns vs ~100 ns) because the ring buffer commit is just two atomic stores. **iceoryx2 wins on large payloads** because only an 8-byte offset is transferred, not the data. Pool-based O(1) pub/sub is on the crossbar roadmap.
 
 ### vs raw Unix IPC (pipes, message queues, domain sockets)
 
@@ -178,16 +195,19 @@ Crossbar adds URI-based routing on top of shared memory. Without crossbar, you'd
 graph TD
     R["Router"] --> H["Handler<br>async fn(Request) -> impl IntoResponse"]
 
-    H --> M["In-process<br>~150 ns"]
-    H --> SHM["SHM V2<br>~3-5 µs"]
+    H --> M["In-process<br>~152 ns"]
+    H --> SHM["SHM RPC<br>~54 µs"]
 
     M -.- MP["In-process<br>direct fn call"]
     SHM -.- SP["Cross-process<br>/dev/shm mmap<br>block pool + zero-copy reads"]
+
+    PS["Pub/Sub<br>~218 ns"] -.- PSP["Cross-process<br>ring buffer + seqlock<br>zero-copy reads"]
 
     style R fill:#7c3aed,color:#fff
     style H fill:#059669,color:#fff
     style M fill:#f59e0b,color:#000
     style SHM fill:#f59e0b,color:#000
+    style PS fill:#ef4444,color:#fff
 ```
 
 ---
@@ -196,8 +216,9 @@ graph TD
 
 | Transport | Typical latency | Boundary | Data path | Platform |
 |---|---|---|---|---|
-| **In-process** | ~150 ns | Same thread | Direct `Arc<Router>` call | All |
-| **SHM** | ~3-5 µs | Cross-process | `mmap` + block pool + atomics + futex | Unix (`shm` feature) |
+| **In-process** | ~152 ns | Same thread | Direct `Arc<Router>` call | All |
+| **SHM RPC** | ~54 µs | Cross-process | `mmap` + block pool + atomics + futex | Unix (`shm` feature) |
+| **SHM Pub/Sub** | ~218 ns | Cross-process | `mmap` + ring buffer + seqlock + futex | Unix (`shm` feature) |
 
 > [!IMPORTANT]
 > These latency numbers are from Criterion benchmarks (see [BENCHMARKS.md](BENCHMARKS.md)).
@@ -325,7 +346,7 @@ async fn get_tick(
 |---|---|---|
 | `&'static str` | 200 | text |
 | `String` | 200 | text |
-| `Vec<u8>` / `Bytes` | 200 | raw bytes |
+| `Vec<u8>` / `Body` | 200 | raw bytes |
 | `Json<T: Serialize>` | 200 | JSON |
 | `(u16, &str)` / `(u16, String)` | custom | text |
 | `Result<R, E>` | delegates | delegates |
@@ -335,7 +356,7 @@ async fn get_tick(
 
 ## Shared memory transport
 
-The `shm` feature adds `ShmServer` and `ShmClient` for cross-process IPC via shared memory, plus `ShmPublisher` and `ShmSubscriber` for zero-copy pub/sub.
+The `shm` feature adds `ShmServer` and `ShmClient` for cross-process RPC via shared memory, plus `ShmPublisher` and `ShmSubscriber` for zero-copy pub/sub.
 
 ```toml
 crossbar = { version = "0.1", features = ["shm"] }
@@ -353,14 +374,15 @@ let client = ShmClient::connect("myapp").await?;
 let resp = client.get("/tick").await?;
 ```
 
-**How it works:** The server creates a memory-mapped region at `/dev/shm/crossbar-{name}` using direct `libc::mmap` with `MADV_HUGEPAGE` (transparent 2 MiB huge pages for TLB efficiency). The V2 architecture uses a block pool allocator (Treiber stack) for data blocks, with separate coordination slots for the request/response state machine. Reads are zero-copy via `Bytes::from_owner`.
+**How it works:** The server creates a memory-mapped region at `/dev/shm/crossbar-{name}` using direct `libc::mmap` with `MADV_HUGEPAGE` (transparent 2 MiB huge pages for TLB efficiency). The V2 architecture uses a block pool allocator (Treiber stack) for data blocks, with separate coordination slots for the request/response state machine. Reads are zero-copy via `Body::Mmap` — a custom guard that holds the mmap region alive and frees the block on drop. No external `bytes` crate dependency.
 
 | Detail | Value |
 |---|---|
 | Coordination slots | 64 (configurable via `ShmConfig::slot_count`) |
 | Block count | 192 (configurable via `ShmConfig::block_count`) |
 | Block size | 64 KiB (configurable via `ShmConfig::block_size`) |
-| Synchronization | spin → futex_wait (Linux) / poll (macOS) |
+| Total region size | ~12.6 MiB (with defaults) |
+| Synchronization | spin + futex_wait (Linux) / poll (macOS) |
 | Crash recovery | Server heartbeat + stale slot CAS recovery |
 
 > [!WARNING]
@@ -379,16 +401,25 @@ let resp = client.get("/tick").await?;
 let mut pub_ = ShmPublisher::create("prices", PubSubConfig::default())?;
 let topic = pub_.register("/tick/AAPL")?;
 
+// Born-in-SHM: write directly into the mmap slot (iceoryx-style loan)
 let mut loan = pub_.loan_to(&topic);
-loan.set_data(b"price data here");
-loan.publish();
+loan.as_mut_slice()[..8].copy_from_slice(&42u64.to_le_bytes());
+loan.set_len(8);
+loan.publish();  // 218 ns end-to-end
 
 // Subscriber process
 let sub = ShmSubscriber::connect("prices")?;
-let mut subscription = sub.subscribe("/tick/AAPL")?;
+let mut stream = sub.subscribe("/tick/AAPL")?;
 
-if let Some(sample) = subscription.try_recv_ref() {
-    println!("got: {:?}", &*sample);
+// Zero-copy read (returns raw pointer into mmap)
+if let Some(sample) = stream.try_recv_ref() {
+    let data = sample.copy_to_vec();  // safe: copies within seqlock window
+    // or: unsafe { sample.as_bytes_unchecked() }  // zero-copy, caller guarantees no concurrent write
+}
+
+// Or: owned copy (guaranteed consistent)
+if let Some(sample) = stream.try_recv() {
+    println!("got {} bytes", sample.data_len());
 }
 ```
 
@@ -396,16 +427,33 @@ if let Some(sample) = subscription.try_recv_ref() {
 
 ## Benchmarks
 
-Criterion benchmarks for both transports. Full results, methodology, and throughput data
+Criterion benchmarks for all transports. Full results, methodology, and throughput data
 in [BENCHMARKS.md](BENCHMARKS.md).
 
-| Benchmark | In-process | SHM |
+### Request/Response latency
+
+| Benchmark | In-process | SHM (V2) |
 |---|---|---|
-| `/health` (2B response) | ~150 ns | ~3-5 µs |
-| JSON + path params | ~1.2 µs | ~4-6 µs |
-| POST JSON body | ~1.3 µs | ~4-6 µs |
-| 64 KB response | ~1.4 µs | ~5-7 µs |
-| 1 MB response | ~19 µs | ~30-40 µs |
+| `/health` (2B response) | 152 ns | 53.5 µs |
+| JSON + path params (OHLC) | 1.14 µs | 55.7 µs |
+| POST JSON body | 1.34 µs | 56.5 µs |
+| 64 KB response | 1.19 µs | 55.8 µs |
+| 1 MB response | 16.97 µs | 72.7 µs |
+
+### Pub/Sub latency
+
+| Mode | Latency |
+|---|---|
+| `publish()` + `try_recv_ref()` (with futex wake) | **218 ns** |
+| `publish_silent()` + `try_recv_ref()` (no futex) | **45 ns** |
+
+### Throughput
+
+| Transport | 64 KB | 1 MB |
+|---|---|---|
+| In-process | 53.2 GiB/s | 54.7 GiB/s |
+| SHM RPC | 1.09 GiB/s | 13.6 GiB/s |
+| Pub/Sub SHM | 17.5 GiB/s | 15.2 GiB/s |
 
 > [!NOTE]
 > Run `cargo bench --features shm` on your hardware — your numbers will differ.
@@ -421,7 +469,7 @@ crossbar/
     lib.rs              Crate root, prelude
     router.rs           URI pattern matching, route registration
     handler.rs          Handler trait, sync wrappers, BoxedHandler
-    types.rs            Request, Response, Uri, Method, IntoResponse, Json
+    types.rs            Request, Response, Uri, Method, Body, IntoResponse, Json
     error.rs            CrossbarError enum
     transport/
       mod.rs            SHM serialization helpers
@@ -438,22 +486,24 @@ crossbar/
     pubsub_publisher.rs SHM pub/sub publisher example
     pubsub_subscriber.rs SHM pub/sub subscriber example
   tests/
-    transport.rs        20 transport tests (in-process + SHM)
-    stress.rs           6 stress/concurrency tests
+    transport.rs        30 transport tests (in-process + SHM + pub/sub)
+    stress.rs           11 stress/concurrency tests
     routing.rs          31 URI pattern matching tests
     handler.rs          28 handler trait tests
     macros.rs           13 proc macro tests
     types.rs            64 type/serialization tests
   benches/
-    transport.rs        Criterion benchmarks (dispatch, inproc, shm, pubsub)
+    transport.rs        Criterion benchmarks (dispatch, inproc, shm, pubsub, throughput)
 ```
 
-> **168 tests** across the workspace. Run with `cargo test --workspace --features shm`.
+> **235 tests** across the workspace. Run with `cargo test --workspace --features shm`.
 
 ---
 
 ## Roadmap
 
+- **Pool-based O(1) pub/sub** — iceoryx2-style ownership transfer: publish an 8-byte buffer index, O(1) regardless of payload size
+- **Dedicated SHM poller** — eliminate `spawn_blocking` / `block_on` from RPC path, targeting sub-10 µs latency
 - **HTTP bridge** — serve crossbar routes over hyper/axum for HTTP compatibility
 - **Middleware** — composable request/response interceptors (logging, auth, metrics)
 - **WebSocket transport** — persistent bidirectional communication

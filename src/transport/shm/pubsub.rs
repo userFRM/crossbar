@@ -1312,14 +1312,16 @@ impl ShmSubscription {
 
         // Copy data while we're inside the seqlock window — via raw pointer,
         // not &[u8], because the publisher can write concurrently.
+        // Use with_capacity + set_len to avoid zeroing memory we immediately overwrite.
         let data_start = s_off + SAMPLE_HEADER_SIZE;
-        let mut data = vec![0u8; data_len];
+        let mut data = Vec::with_capacity(data_len);
         unsafe {
             std::ptr::copy_nonoverlapping(
                 self.mmap.as_ptr().add(data_start),
                 data.as_mut_ptr(),
                 data_len,
             );
+            data.set_len(data_len);
         }
 
         // Final seqlock check: if the slot was overwritten during our copy,

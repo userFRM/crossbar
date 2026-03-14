@@ -96,8 +96,8 @@ publisher API used.
 
 | Payload | Pub/Sub SHM |
 |---|---|
-| 64 KB | 13.5 GiB/s |
-| 1 MB | 12.2 GiB/s |
+| 64 KB | 17.5 GiB/s |
+| 1 MB | 15.2 GiB/s |
 
 ## Interpretation
 
