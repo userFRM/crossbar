@@ -1194,9 +1194,11 @@ impl ShmRegion {
                 .compare_exchange(FREE, WRITING, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
+                // Refresh timestamp FIRST — prevents stale recovery from
+                // reclaiming this slot based on the previous request's timestamp.
+                self.touch_slot(i);
                 self.set_slot_client_id(i, client_id);
                 self.slot_sequence(i).fetch_add(1, Ordering::Relaxed);
-                self.touch_slot(i);
                 // Advance the hint past this slot for the next caller.
                 self.slot_hint().store(i.wrapping_add(1), Ordering::Relaxed);
                 return Some(i);

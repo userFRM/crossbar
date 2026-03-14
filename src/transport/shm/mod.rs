@@ -295,6 +295,10 @@ impl ShmServer {
                         continue;
                     };
 
+                    // The request block is now owned by req.body (ShmBodyGuard).
+                    // Clear the slot reference so stale recovery doesn't double-free it.
+                    region.set_request_block_idx(slot_idx, NO_BLOCK);
+
                     // Inject SHM region so handlers can allocate born-in-SHM responses
                     req.shm_region = Some(Arc::clone(region));
 
@@ -850,6 +854,7 @@ impl ShmClient {
         };
         if let Err(e) = write_result {
             self.region.free_block(req_block_idx);
+            self.region.set_request_block_idx(slot_idx, NO_BLOCK);
             self.region
                 .slot_state(slot_idx)
                 .store(FREE, Ordering::Release);
