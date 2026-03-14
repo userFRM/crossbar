@@ -45,12 +45,15 @@ struct PathPattern {
     segments: Vec<Segment>,
     /// The original pattern string, kept for [`Router::routes_info`].
     raw: String,
+    /// True when at least one segment is a [`Segment::Param`].
+    /// When false, [`matches_literal`] can be used for zero-alloc matching.
+    has_params: bool,
 }
 
 impl PathPattern {
     /// Compile a pattern string into a [`PathPattern`].
     fn parse(pattern: &str) -> Self {
-        let segments = pattern
+        let segments: Vec<Segment> = pattern
             .split('/')
             .filter(|s| !s.is_empty())
             .map(|s| {
@@ -61,36 +64,62 @@ impl PathPattern {
                 }
             })
             .collect();
+        let has_params = segments.iter().any(|s| matches!(s, Segment::Param(_)));
         PathPattern {
             segments,
             raw: pattern.to_string(),
+            has_params,
         }
+    }
+
+    /// Fast path for literal-only patterns: no `HashMap`, no allocations.
+    ///
+    /// Returns `true` if `path` matches this pattern exactly. Only valid
+    /// when `has_params` is `false`.
+    #[inline]
+    fn matches_literal(&self, path: &str) -> bool {
+        debug_assert!(!self.has_params);
+        let mut path_iter = path.split('/').filter(|s| !s.is_empty());
+        for seg in &self.segments {
+            match seg {
+                Segment::Literal(lit) => match path_iter.next() {
+                    Some(s) if s == lit.as_str() => {}
+                    _ => return false,
+                },
+                Segment::Param(_) => unreachable!("matches_literal called with params"),
+            }
+        }
+        path_iter.next().is_none()
     }
 
     /// Attempt to match `path` against this pattern.
     ///
     /// Returns `Some(params)` with any captured named parameters on success,
     /// or `None` if the path does not match.
+    ///
+    /// Uses iterator-based matching to avoid collecting path segments into
+    /// a `Vec`.
     fn matches(&self, path: &str) -> Option<HashMap<String, String>> {
-        let path_segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-
-        if self.segments.len() != path_segs.len() {
-            return None;
-        }
-
+        let mut path_iter = path.split('/').filter(|s| !s.is_empty());
         let mut params = HashMap::new();
 
-        for (pat, seg) in self.segments.iter().zip(path_segs.iter()) {
-            match pat {
+        for seg in &self.segments {
+            let path_seg = path_iter.next()?;
+            match seg {
                 Segment::Literal(lit) => {
-                    if lit != seg {
+                    if lit != path_seg {
                         return None;
                     }
                 }
                 Segment::Param(name) => {
-                    params.insert(name.clone(), percent_decode(seg));
+                    params.insert(name.clone(), percent_decode(path_seg));
                 }
             }
+        }
+
+        // Reject paths with trailing segments
+        if path_iter.next().is_some() {
+            return None;
         }
 
         Some(params)
@@ -198,9 +227,21 @@ impl Router {
     pub async fn dispatch(&self, mut req: Request) -> Response {
         for route in self.routes.iter() {
             if route.method == req.method {
-                if let Some(params) = route.pattern.matches(req.uri.path()) {
-                    req.path_params = params;
-                    return route.handler.call(req).await;
+                if route.pattern.has_params {
+                    if let Some(params) = route.pattern.matches(req.uri.path()) {
+                        req.path_params = params;
+                        // Try sync first to avoid Box::pin allocation
+                        match route.handler.try_call_sync(req) {
+                            Ok(resp) => return resp,
+                            Err(req) => return route.handler.call(req).await,
+                        }
+                    }
+                } else if route.pattern.matches_literal(req.uri.path()) {
+                    // Zero-alloc fast path: no params, try sync dispatch
+                    match route.handler.try_call_sync(req) {
+                        Ok(resp) => return resp,
+                        Err(req) => return route.handler.call(req).await,
+                    }
                 }
             }
         }

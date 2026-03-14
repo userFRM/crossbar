@@ -55,10 +55,21 @@ use std::sync::Arc;
 /// Implemented automatically for:
 /// - `async fn() -> impl IntoResponse` (zero-argument handlers)
 /// - `async fn(Request) -> impl IntoResponse` (single-argument handlers)
-pub trait Handler<T>: Send + Sync + 'static {
+pub trait Handler<T: 'static>: Send + Sync + 'static {
     /// Calls the handler with the given request and returns a boxed future
     /// that resolves to a [`Response`].
     fn call(&self, req: Request) -> Pin<Box<dyn Future<Output = Response> + Send>>;
+
+    /// Wraps this handler into a [`BoxedHandler`] for storage in the router.
+    ///
+    /// The default implementation uses the async path. Sync handler adapters
+    /// override this to install a zero-alloc fast path.
+    fn boxed(self) -> BoxedHandler
+    where
+        Self: Sized,
+    {
+        BoxedHandler::new_async(self)
+    }
 }
 
 // ── BoxedHandler (type-erased) ───────────────────────────
@@ -73,9 +84,13 @@ pub trait Handler<T>: Send + Sync + 'static {
 /// allocation occurs.
 pub struct BoxedHandler {
     f: Arc<DynHandler>,
+    /// Optional sync fast path — skips `Box::pin` allocation entirely.
+    /// Set for handlers created via [`sync_handler`] / [`sync_handler_with_req`].
+    sync_f: Option<Arc<DynSyncHandler>>,
 }
 
 type DynHandler = dyn Fn(Request) -> Pin<Box<dyn Future<Output = Response> + Send>> + Send + Sync;
+type DynSyncHandler = dyn Fn(Request) -> Response + Send + Sync;
 
 impl BoxedHandler {
     /// Wraps a [`Handler`] implementation in a type-erased, heap-allocated
@@ -85,9 +100,41 @@ impl BoxedHandler {
     /// [`post`](crate::router::post), etc., which call this internally.
     #[must_use]
     pub fn new<H: Handler<T>, T: 'static>(handler: H) -> Self {
+        handler.boxed()
+    }
+
+    /// Default async-only boxing (used by `Handler::boxed` default impl).
+    #[must_use]
+    pub(crate) fn new_async<H: Handler<T>, T: 'static>(handler: H) -> Self {
         let handler = Arc::new(handler);
         BoxedHandler {
             f: Arc::new(move |req| handler.call(req)),
+            sync_f: None,
+        }
+    }
+
+    /// Wraps a sync handler with a direct call path that avoids `Box::pin`.
+    #[must_use]
+    pub(crate) fn new_sync<F>(sync_fn: F, async_fn: Arc<DynHandler>) -> Self
+    where
+        F: Fn(Request) -> Response + Send + Sync + 'static,
+    {
+        BoxedHandler {
+            f: async_fn,
+            sync_f: Some(Arc::new(sync_fn)),
+        }
+    }
+
+    /// Tries to call the handler synchronously without `Box::pin`.
+    ///
+    /// Returns `Ok(response)` if a sync fast path is available, or
+    /// `Err(request)` if the handler is async (request returned for reuse).
+    #[inline]
+    #[allow(clippy::result_large_err)] // Request is returned to caller on miss, not a real error
+    pub(crate) fn try_call_sync(&self, req: Request) -> Result<Response, Request> {
+        match &self.sync_f {
+            Some(f) => Ok((f)(req)),
+            None => Err(req),
         }
     }
 
@@ -102,6 +149,7 @@ impl Clone for BoxedHandler {
     fn clone(&self) -> Self {
         BoxedHandler {
             f: Arc::clone(&self.f),
+            sync_f: self.sync_f.as_ref().map(Arc::clone),
         }
     }
 }
@@ -207,6 +255,18 @@ where
         let resp = (self.0)().into_response();
         Box::pin(async move { resp })
     }
+
+    fn boxed(self) -> BoxedHandler
+    where
+        Self: Sized,
+    {
+        let handler = Arc::new(self);
+        let async_handler = Arc::clone(&handler);
+        BoxedHandler::new_sync(
+            move |_req| (handler.0)().into_response(),
+            Arc::new(move |req| async_handler.call(req)),
+        )
+    }
 }
 
 impl<F, R> Handler<(Request,)> for SyncFn1<F>
@@ -217,5 +277,17 @@ where
     fn call(&self, req: Request) -> Pin<Box<dyn Future<Output = Response> + Send>> {
         let resp = (self.0)(req).into_response();
         Box::pin(async move { resp })
+    }
+
+    fn boxed(self) -> BoxedHandler
+    where
+        Self: Sized,
+    {
+        let handler = Arc::new(self);
+        let async_handler = Arc::clone(&handler);
+        BoxedHandler::new_sync(
+            move |req| (handler.0)(req).into_response(),
+            Arc::new(move |req| async_handler.call(req)),
+        )
     }
 }
