@@ -1,6 +1,5 @@
 use crate::router::Router;
-use crate::types::{Method, Request, Response};
-use bytes::Bytes;
+use crate::types::{Body, Method, Request, Response};
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // InProcessClient — in-process, zero-overhead
@@ -49,7 +48,7 @@ impl InProcessClient {
     }
 
     /// Convenience method for `POST` requests with a body.
-    pub async fn post(&self, uri: &str, body: impl Into<Bytes>) -> Response {
+    pub async fn post(&self, uri: &str, body: impl Into<Body>) -> Response {
         self.request(Request::new(Method::Post, uri).with_body(body))
             .await
     }

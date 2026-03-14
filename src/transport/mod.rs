@@ -12,7 +12,7 @@
 
 mod inproc;
 #[cfg(all(unix, feature = "shm"))]
-mod shm;
+pub(crate) mod shm;
 
 pub use inproc::InProcessClient;
 #[cfg(all(unix, feature = "shm"))]

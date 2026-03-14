@@ -3,7 +3,7 @@
 mod mmap;
 mod notify;
 mod pubsub;
-mod region;
+pub(crate) mod region;
 
 pub use pubsub::{
     PubSubConfig, ShmLoan, ShmPublisher, ShmSample, ShmSampleRef, ShmSubscriber, ShmSubscription,
@@ -13,8 +13,7 @@ pub use region::ShmConfig;
 
 use crate::error::CrossbarError;
 use crate::router::Router;
-use crate::types::{Method, Request, Response};
-use bytes::Bytes;
+use crate::types::{Body, Method, Request, Response};
 use region::{ShmRegion, FREE, NO_BLOCK, PROCESSING, REQUEST_READY, RESPONSE_READY};
 use std::io;
 use std::sync::atomic::Ordering;
@@ -66,7 +65,7 @@ impl Drop for ShmHandle {
 /// Creates a memory-mapped region and serves requests from any [`ShmClient`]
 /// that attaches to the same name. Achieves low-microsecond latency by
 /// transferring only block indices in coordination slots and using
-/// `Bytes::from_owner` for O(1) zero-copy reads.
+/// `Body::Mmap` for O(1) zero-copy reads.
 ///
 /// Only available on Unix targets with the `shm` feature enabled.
 ///
@@ -254,7 +253,7 @@ impl ShmServer {
                     };
 
                     // Dispatch through router
-                    // (request body Bytes holds ShmBlockGuard — block freed when req dropped)
+                    // (request body Body::Mmap holds ShmBodyGuard — block freed when req dropped)
                     let resp = rt_handle.block_on(router.dispatch(req));
                     // req dropped here → request block freed back to pool
 
@@ -440,7 +439,7 @@ impl ShmClient {
                 }
             }
 
-            // Read response — O(1) zero-copy body via Bytes::from_owner
+            // Read response — O(1) zero-copy body via Body::Mmap
             let resp_block_idx = region.response_block_idx(slot_idx);
             let resp = if resp_block_idx == u32::MAX {
                 // Server couldn't allocate a response block (503 fallback)
@@ -481,7 +480,7 @@ impl ShmClient {
     /// # Errors
     ///
     /// See [`ShmClient::request`] for the full list of error conditions.
-    pub async fn post(&self, uri: &str, body: impl Into<Bytes>) -> Result<Response, CrossbarError> {
+    pub async fn post(&self, uri: &str, body: impl Into<Body>) -> Result<Response, CrossbarError> {
         self.request(Request::new(Method::Post, uri).with_body(body))
             .await
     }

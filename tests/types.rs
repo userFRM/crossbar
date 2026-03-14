@@ -174,7 +174,7 @@ fn request_with_body() {
 
 #[test]
 fn request_with_body_bytes() {
-    let data = bytes::Bytes::from_static(b"\x00\x01\x02\x03");
+    let data: &[u8] = &[0x00, 0x01, 0x02, 0x03];
     let req = Request::new(Method::Post, "/bin").with_body(data);
     assert_eq!(req.body.as_ref(), &[0, 1, 2, 3]);
 }
@@ -297,7 +297,7 @@ fn response_bad_request_string() {
 
 #[test]
 fn response_body_str_binary() {
-    let resp = Response::ok().with_body(bytes::Bytes::from_static(&[0xFF, 0xFE]));
+    let resp = Response::ok().with_body(&[0xFFu8, 0xFE][..]);
     // Invalid UTF-8 should return "<binary>"
     assert_eq!(resp.body_str(), "<binary>");
 }
@@ -397,8 +397,8 @@ fn into_response_result_ok_json() {
 }
 
 #[test]
-fn into_response_bytes() {
-    let b = bytes::Bytes::from_static(b"raw bytes");
+fn into_response_body() {
+    let b = Body::from(&b"raw bytes"[..]);
     let resp = b.into_response();
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body_str(), "raw bytes");

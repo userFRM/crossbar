@@ -2,8 +2,7 @@
 
 use super::mmap::RawMmap;
 use crate::error::CrossbarError;
-use crate::types::{Method, Request, Response};
-use bytes::Bytes;
+use crate::types::{Body, Method, Request, Response, ShmBodyGuard};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -681,7 +680,7 @@ impl ShmRegion {
 
     /// Reads a request from a block.
     ///
-    /// The body is zero-copy via `Bytes::from_owner`.
+    /// The body is zero-copy via `Body::Mmap`.
     /// Block layout: `[uri bytes][headers_data][body bytes]`.
     ///
     /// # Errors
@@ -747,17 +746,16 @@ impl ShmRegion {
         };
         off += headers_data_len;
 
-        // Body — zero-copy via Bytes::from_owner
+        // Body — zero-copy via Body::Mmap
         let body = if body_len == 0 {
-            Bytes::new()
+            Body::Empty
         } else {
-            let guard = ShmBlockGuard {
+            Body::Mmap(ShmBodyGuard {
                 region: Arc::clone(self),
                 block_idx,
                 offset: off,
                 len: body_len,
-            };
-            Bytes::from_owner(guard)
+            })
         };
 
         let mut req = Request::new(method, uri_str).with_body(body);
@@ -846,7 +844,7 @@ impl ShmRegion {
 
     /// Reads a response from a block.
     ///
-    /// The body is zero-copy via `Bytes::from_owner`.
+    /// The body is zero-copy via `Body::Mmap`.
     /// Block layout: `[headers_data][body bytes]`.
     ///
     /// # Errors
@@ -891,17 +889,16 @@ impl ShmRegion {
         };
         off += headers_data_len;
 
-        // Body — zero-copy via Bytes::from_owner
+        // Body — zero-copy via Body::Mmap
         let body = if body_len == 0 {
-            Bytes::new()
+            Body::Empty
         } else {
-            let guard = ShmBlockGuard {
+            Body::Mmap(ShmBodyGuard {
                 region: Arc::clone(self),
                 block_idx,
                 offset: off,
                 len: body_len,
-            };
-            Bytes::from_owner(guard)
+            })
         };
 
         // If body is empty, free the block immediately
@@ -1015,33 +1012,5 @@ impl ShmRegion {
                 }
             }
         }
-    }
-}
-
-/// Owns a block in the SHM pool. Frees the block back to the pool on drop.
-/// Used with `Bytes::from_owner` for zero-copy reads.
-pub struct ShmBlockGuard {
-    region: Arc<ShmRegion>,
-    block_idx: u32,
-    offset: usize,
-    len: usize,
-}
-
-// SAFETY: ShmBlockGuard holds an Arc<ShmRegion> which keeps the mmap alive.
-// The block is exclusively owned (not in the free list) until this guard drops.
-// The underlying data is immutable while the guard exists.
-unsafe impl Send for ShmBlockGuard {}
-unsafe impl Sync for ShmBlockGuard {}
-
-impl AsRef<[u8]> for ShmBlockGuard {
-    fn as_ref(&self) -> &[u8] {
-        let ptr = self.region.block_ptr(self.block_idx);
-        unsafe { std::slice::from_raw_parts(ptr.add(self.offset), self.len) }
-    }
-}
-
-impl Drop for ShmBlockGuard {
-    fn drop(&mut self) {
-        self.region.free_block(self.block_idx);
     }
 }

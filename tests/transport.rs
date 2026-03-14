@@ -429,9 +429,9 @@ async fn shm_slots_full_returns_error() {
     cleanup_shm(&name);
 }
 
-/// Verify response body (Bytes) remains valid after the coordination slot
+/// Verify response body (Body) remains valid after the coordination slot
 /// transitions to FREE. The body is copied out of the slot before the slot
-/// is released, so the Bytes buffer must remain independently valid.
+/// is released, so the Body buffer must remain independently valid.
 #[cfg(all(unix, feature = "shm"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shm_body_valid_after_slot_free() {
@@ -460,8 +460,8 @@ async fn shm_body_valid_after_slot_free() {
     cleanup_shm(&name);
 }
 
-/// Zero-copy body guard: hold response body Bytes across many subsequent
-/// requests. The ShmBlockGuard inside Bytes must keep the block alive even
+/// Zero-copy body guard: hold response body Body across many subsequent
+/// requests. The ShmBodyGuard inside Body must keep the block alive even
 /// though the slot has been freed and reused dozens of times.
 #[cfg(all(unix, feature = "shm"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

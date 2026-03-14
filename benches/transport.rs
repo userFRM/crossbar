@@ -1,5 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use crossbar::prelude::*;
+use std::hint::black_box;
 #[cfg(all(unix, feature = "shm"))]
 use std::sync::Arc;
 use std::time::Duration;

@@ -7,12 +7,217 @@
 //! - [`Uri`] — Parsed request URI with path and query components.
 //! - [`Request`] — Inbound message carrying method, URI, headers, and body.
 //! - [`Response`] — Outbound message with status code, headers, and body.
+//! - [`Body`] — Zero-copy request/response body.
 //! - [`Json`] — Thin wrapper that serializes `T` to a JSON response body.
 //! - [`IntoResponse`] — Trait implemented by everything that can become a
 //!   [`Response`]; enables ergonomic handler return types.
 
-use bytes::Bytes;
 use std::collections::HashMap;
+
+// ── Body ───────────────────────────────────────────────
+
+#[cfg(feature = "shm")]
+use crate::transport::shm::region::ShmRegion;
+#[cfg(feature = "shm")]
+use std::sync::Arc;
+
+/// Guard that owns a block in the SHM pool. Frees the block back to the pool
+/// on drop. Used as the `Mmap` variant of [`Body`] for zero-copy reads.
+#[cfg(feature = "shm")]
+pub struct ShmBodyGuard {
+    pub(crate) region: Arc<ShmRegion>,
+    pub(crate) block_idx: u32,
+    pub(crate) offset: usize,
+    pub(crate) len: usize,
+}
+
+// SAFETY: ShmBodyGuard holds an Arc<ShmRegion> which keeps the mmap alive.
+// The block is exclusively owned (not in the free list) until this guard drops.
+// The underlying data is immutable while the guard exists.
+#[cfg(feature = "shm")]
+#[allow(unsafe_code)]
+unsafe impl Send for ShmBodyGuard {}
+#[cfg(feature = "shm")]
+#[allow(unsafe_code)]
+unsafe impl Sync for ShmBodyGuard {}
+
+#[cfg(feature = "shm")]
+#[allow(unsafe_code)]
+impl ShmBodyGuard {
+    fn as_slice(&self) -> &[u8] {
+        let ptr = self.region.block_ptr(self.block_idx);
+        unsafe { std::slice::from_raw_parts(ptr.add(self.offset), self.len) }
+    }
+}
+
+#[cfg(feature = "shm")]
+impl Drop for ShmBodyGuard {
+    fn drop(&mut self) {
+        self.region.free_block(self.block_idx);
+    }
+}
+
+#[cfg(feature = "shm")]
+impl std::fmt::Debug for ShmBodyGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShmBodyGuard")
+            .field("block_idx", &self.block_idx)
+            .field("offset", &self.offset)
+            .field("len", &self.len)
+            .finish()
+    }
+}
+
+/// Zero-copy request/response body.
+///
+/// Avoids heap allocation on the SHM path by storing the mmap block guard
+/// inline. For owned data, wraps a `Vec<u8>` with no Arc overhead.
+pub enum Body {
+    /// No body.
+    Empty,
+    /// Heap-owned bytes (from user code, JSON serialization, etc.).
+    Owned(Vec<u8>),
+    /// Zero-copy view into an mmap block. The block is freed when this
+    /// variant is dropped. Only constructed inside `region.rs`.
+    #[cfg(feature = "shm")]
+    Mmap(ShmBodyGuard),
+}
+
+impl Body {
+    /// Creates an empty body.
+    #[inline]
+    #[must_use]
+    pub fn new() -> Body {
+        Body::Empty
+    }
+
+    /// Returns the length of the body in bytes.
+    #[inline]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            Body::Empty => 0,
+            Body::Owned(v) => v.len(),
+            #[cfg(feature = "shm")]
+            Body::Mmap(guard) => guard.len,
+        }
+    }
+
+    /// Returns `true` if the body has zero length.
+    #[inline]
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Returns a raw pointer to the start of the body data.
+    ///
+    /// Returns a dangling pointer if the body is empty.
+    #[inline]
+    #[must_use]
+    pub fn as_ptr(&self) -> *const u8 {
+        match self {
+            Body::Empty => [].as_ptr(),
+            Body::Owned(v) => v.as_ptr(),
+            #[cfg(feature = "shm")]
+            Body::Mmap(guard) => guard.as_slice().as_ptr(),
+        }
+    }
+}
+
+impl Default for Body {
+    #[inline]
+    fn default() -> Self {
+        Body::Empty
+    }
+}
+
+impl std::fmt::Debug for Body {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Body::Empty => f.write_str("Body::Empty"),
+            Body::Owned(v) => write!(f, "Body::Owned(len={})", v.len()),
+            #[cfg(feature = "shm")]
+            Body::Mmap(guard) => write!(f, "Body::Mmap(len={})", guard.len),
+        }
+    }
+}
+
+impl Clone for Body {
+    fn clone(&self) -> Self {
+        match self {
+            Body::Empty => Body::Empty,
+            Body::Owned(v) => Body::Owned(v.clone()),
+            #[cfg(feature = "shm")]
+            Body::Mmap(guard) => Body::Owned(guard.as_slice().to_vec()),
+        }
+    }
+}
+
+impl AsRef<[u8]> for Body {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Body::Empty => &[],
+            Body::Owned(v) => v.as_ref(),
+            #[cfg(feature = "shm")]
+            Body::Mmap(guard) => guard.as_slice(),
+        }
+    }
+}
+
+impl std::ops::Deref for Body {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        self.as_ref()
+    }
+}
+
+impl From<Vec<u8>> for Body {
+    #[inline]
+    fn from(v: Vec<u8>) -> Self {
+        if v.is_empty() {
+            Body::Empty
+        } else {
+            Body::Owned(v)
+        }
+    }
+}
+
+impl From<&[u8]> for Body {
+    #[inline]
+    fn from(s: &[u8]) -> Self {
+        if s.is_empty() {
+            Body::Empty
+        } else {
+            Body::Owned(s.to_vec())
+        }
+    }
+}
+
+impl From<&str> for Body {
+    #[inline]
+    fn from(s: &str) -> Self {
+        if s.is_empty() {
+            Body::Empty
+        } else {
+            Body::Owned(s.as_bytes().to_vec())
+        }
+    }
+}
+
+impl From<String> for Body {
+    #[inline]
+    fn from(s: String) -> Self {
+        if s.is_empty() {
+            Body::Empty
+        } else {
+            Body::Owned(s.into_bytes())
+        }
+    }
+}
 
 // ── Method ──────────────────────────────────────────────
 
@@ -278,7 +483,7 @@ pub struct Request {
     /// Request headers as a flat key-value map (lowercase keys by convention).
     pub headers: HashMap<String, String>,
     /// The raw request body.
-    pub body: Bytes,
+    pub body: Body,
     /// Path parameters extracted by the router (e.g. `{id}` from `/users/:id`).
     pub(crate) path_params: HashMap<String, String>,
 }
@@ -299,7 +504,7 @@ impl Request {
             method,
             uri: Uri::parse(uri),
             headers: HashMap::new(),
-            body: Bytes::new(),
+            body: Body::Empty,
             path_params: HashMap::new(),
         }
     }
@@ -314,7 +519,7 @@ impl Request {
     /// assert_eq!(&req.body[..], b"payload");
     /// ```
     #[must_use]
-    pub fn with_body(mut self, body: impl Into<Bytes>) -> Self {
+    pub fn with_body(mut self, body: impl Into<Body>) -> Self {
         self.body = body.into();
         self
     }
@@ -457,7 +662,7 @@ pub struct Response {
     /// Response headers as a flat key-value map (lowercase keys by convention).
     pub headers: HashMap<String, String>,
     /// The raw response body.
-    pub body: Bytes,
+    pub body: Body,
 }
 
 impl Response {
@@ -476,7 +681,7 @@ impl Response {
         Response {
             status: 200,
             headers: HashMap::new(),
-            body: Bytes::new(),
+            body: Body::Empty,
         }
     }
 
@@ -495,7 +700,7 @@ impl Response {
         Response {
             status,
             headers: HashMap::new(),
-            body: Bytes::new(),
+            body: Body::Empty,
         }
     }
 
@@ -509,7 +714,7 @@ impl Response {
     /// assert_eq!(r.body_str(), "pong");
     /// ```
     #[must_use]
-    pub fn with_body(mut self, body: impl Into<Bytes>) -> Self {
+    pub fn with_body(mut self, body: impl Into<Body>) -> Self {
         self.body = body.into();
         self
     }
@@ -553,7 +758,7 @@ impl Response {
     pub fn json<T: serde::Serialize>(data: &T) -> Self {
         match serde_json::to_vec(data) {
             Ok(bytes) => Response::ok()
-                .with_body(Bytes::from(bytes))
+                .with_body(Body::Owned(bytes))
                 .with_header("content-type", "application/json"),
             Err(_) => Response::with_status(500).with_body("serialization error"),
         }
@@ -670,8 +875,8 @@ impl IntoResponse for String {
     }
 }
 
-impl IntoResponse for Bytes {
-    /// Wraps the bytes in a `200 OK` response.
+impl IntoResponse for Body {
+    /// Wraps the body in a `200 OK` response.
     #[inline]
     fn into_response(self) -> Response {
         Response::ok().with_body(self)

@@ -30,7 +30,7 @@ Each benchmark:
 2. Spins up the relevant transport server (if any).
 3. Runs the Criterion harness: automatic warm-up, then 100 statistical samples.
 
-Benchmark functions use `criterion::black_box` to prevent the compiler from eliding work.
+Benchmark functions use `std::hint::black_box` to prevent the compiler from eliding work.
 All transports use a **single persistent connection** (no connect/disconnect per request).
 SHM RPC benchmarks use the V2 block pool architecture (64 coordination slots, 192 blocks × 64 KiB).
 Pub/sub benchmarks use 1 MiB sample capacity with a 64-slot ring.
@@ -51,53 +51,53 @@ The timing covers the **full client-side round-trip**: serialize request, transm
 
 | Benchmark | In-process | SHM (V2) |
 |---|---|---|
-| `/health` (2-byte response) | 149 ns | 54.1 µs |
-| JSON + path params (OHLC) | 1.17 µs | 55.6 µs |
-| POST JSON body (order) | 1.33 µs | 56.0 µs |
-| 64 KB response | 1.25 µs | 55.6 µs |
-| 1 MB response | 16.9 µs | 71.8 µs |
+| `/health` (2-byte response) | 152 ns | 53.5 µs |
+| JSON + path params (OHLC) | 1.14 µs | 55.7 µs |
+| POST JSON body (order) | 1.34 µs | 56.5 µs |
+| 64 KB response | 1.19 µs | 55.8 µs |
+| 1 MB response | 16.97 µs | 72.7 µs |
 
 ### Pub/Sub latency (shared memory, single publisher + subscriber)
 
 | Payload | Zero-copy (`try_recv_ref`) | Memcpy (`set_data` + `try_recv_ref`) |
 |---|---|---|
-| 8 bytes | 220 ns | — |
+| 8 bytes | 223 ns | — |
 | 64 bytes | — | 225 ns |
-| 64 KB | 1.50 µs | 1.50 µs |
-| 1 MB | 29.6 µs | 29.5 µs |
+| 64 KB | 1.54 µs | 1.54 µs |
+| 1 MB | 29.8 µs | 29.8 µs |
 
 ### Pub/Sub wake cost breakdown
 
 | Mode | Latency | Notes |
 |---|---|---|
-| `publish()` (with futex wake) | 220 ns | Full path: atomics + futex syscall |
+| `publish()` (with futex wake) | 218 ns | Full path: atomics + futex syscall |
 | `publish_silent()` (no futex) | 45 ns | Atomics only — 2.2x faster than iceoryx |
 
 The `publish_silent()` path skips `futex(FUTEX_WAKE)` and the notification counter,
-proving the transport itself runs at **45 ns** — the remaining 175 ns is pure Linux
+proving the transport itself runs at **45 ns** — the remaining ~173 ns is pure Linux
 kernel overhead from the futex syscall.
 
-**Zero-copy path:** Publisher writes payload into a loaned mmap slot (`copy_from_slice`),
-subscriber reads via `try_recv_ref()` which returns a pointer into mmap — no allocation, no copy.
-The write is O(n) but the read is O(1).
+**Zero-copy path:** Publisher writes payload into a loaned mmap slot (`ptr::copy_nonoverlapping`),
+subscriber reads via `try_recv_ref()` which returns a `ShmSampleRef` — use `copy_to_vec()` for safe
+access or `as_bytes_unchecked()` for zero-copy. The write is O(n) but the read is O(1).
 
 **Memcpy path:** Publisher uses `set_data()` (same underlying copy), subscriber uses `try_recv_ref()`
-then accesses the data (pointer deref, same as zero-copy). Both paths are equivalent for the
-subscriber — the naming reflects the publisher API used.
+then accesses the data. Both paths are equivalent for the subscriber — the naming reflects the
+publisher API used.
 
 ### Request/Response throughput (bytes/sec, large payloads)
 
 | Payload | In-process | SHM |
 |---|---|---|
-| 64 KB | 50.2 GiB/s | 1.1 GiB/s |
-| 1 MB | 53.5 GiB/s | 13.6 GiB/s |
+| 64 KB | 53.2 GiB/s | 1.09 GiB/s |
+| 1 MB | 54.7 GiB/s | 13.6 GiB/s |
 
 ### Pub/Sub throughput (bytes/sec)
 
 | Payload | Pub/Sub SHM |
 |---|---|
-| 64 KB | 18.8 GiB/s |
-| 1 MB | 15.3 GiB/s |
+| 64 KB | 13.5 GiB/s |
+| 1 MB | 12.2 GiB/s |
 
 ## Interpretation
 
@@ -107,9 +107,9 @@ no kernel involvement. This is the theoretical floor.
 **SHM RPC (V2)** uses direct `libc::mmap` with `MADV_HUGEPAGE` (transparent 2 MiB huge pages
 for TLB efficiency) + block pool allocator + atomics + futex for cross-process request/response.
 The V2 architecture separates coordination slots (64 bytes) from data blocks (64 KiB), uses a
-Treiber stack for lock-free block allocation, and `Bytes::from_owner` for zero-copy reads
-(eliminating 2 of 4 memcpys per roundtrip). However, the **dominant bottleneck is coordination
-overhead** (~54 µs), not data copying:
+Treiber stack for lock-free block allocation, and a custom `Body::Mmap` guard for zero-copy reads
+(eliminating 2 of 4 memcpys per roundtrip — no `bytes` crate dependency). However, the **dominant
+bottleneck is coordination overhead** (~54 µs), not data copying:
 
 1. `spawn_blocking` on the client to avoid blocking the tokio runtime
 2. Atomic CAS state transitions (5 per roundtrip)
@@ -119,9 +119,9 @@ overhead** (~54 µs), not data copying:
 This fixed overhead means `/health` (2 bytes) and `64 KB` show nearly identical latency.
 At 1 MB, the data copy starts to contribute, but coordination still dominates.
 
-**SHM Pub/Sub** is the fastest cross-process path at 220 ns for small payloads (45 ns without
+**SHM Pub/Sub** is the fastest cross-process path at ~220 ns for small payloads (45 ns without
 futex wake). It uses a ring buffer with seqlock validation — no slot state machine, no routing,
-no serialization. The 220 ns breaks down as: ~45 ns for atomics + ~175 ns for `futex(FUTEX_WAKE)`.
+no serialization. The ~220 ns breaks down as: ~45 ns for atomics + ~173 ns for `futex(FUTEX_WAKE)`.
 Use `publish_silent()` for polling consumers to bypass the futex entirely.
 
 The write is still O(n) because data must be copied into the mmap region. True O(1) transfer
@@ -141,7 +141,7 @@ no routing, no request serialization, no state machine, no spawn_blocking.
 
 ### Why pub/sub scales linearly with payload size
 
-The 8B→64KB→1MB latency progression (220 ns → 1.50 µs → 29.6 µs) shows clear O(n)
+The 8B→64KB→1MB latency progression (223 ns → 1.54 µs → 29.8 µs) shows clear O(n)
 scaling. This is because every publish does a `memcpy` of the full payload into the
 ring buffer slot. The read side is O(1) (pointer deref into mmap), but the write
 dominates total latency.
