@@ -227,6 +227,94 @@ fn bench_pubsub(c: &mut Criterion) {
     let payload_64kb = vec![42u8; 65_536];
     let payload_1mb = vec![42u8; 1_048_576];
 
+    // -- Transport overhead ONLY: loan + publish + recv, NO data write --
+    // This proves the transport layer is O(1) regardless of topic capacity.
+    // The "payload size" here is the topic's sample_capacity — but we write
+    // ZERO bytes. Only the atomic publish + seqlock recv is measured.
+    {
+        let mut group = c.benchmark_group("pubsub_transport_only");
+        group.measurement_time(Duration::from_secs(1));
+
+        // Publish zero-length samples on topics with different capacities.
+        // If transport is O(1), all three should be ~identical.
+        group.bench_function("on_64b_topic", |b| {
+            b.iter(|| {
+                let loan = pub_.loan_to(&h_64b);
+                // NO data written — just publish the empty loan
+                loan.publish();
+                let s = s_64b.try_recv_ref().unwrap();
+                black_box(&*s);
+            })
+        });
+
+        group.bench_function("on_64kb_topic", |b| {
+            b.iter(|| {
+                let loan = pub_.loan_to(&h_64kb);
+                loan.publish();
+                let s = s_64kb.try_recv_ref().unwrap();
+                black_box(&*s);
+            })
+        });
+
+        group.bench_function("on_1mb_topic", |b| {
+            b.iter(|| {
+                let loan = pub_.loan_to(&h_1mb);
+                loan.publish();
+                let s = s_1mb.try_recv_ref().unwrap();
+                black_box(&*s);
+            })
+        });
+
+        group.finish();
+    }
+
+    // -- born-in-SHM: write directly into loaned buffer (iceoryx pattern) --
+    // This is how iceoryx achieves O(1): data is constructed IN the SHM slot,
+    // not copied from an external buffer. Only 8 bytes of metadata are written
+    // regardless of topic capacity.
+    {
+        let mut group = c.benchmark_group("pubsub_born_in_shm");
+        group.measurement_time(Duration::from_secs(1));
+
+        group.bench_function("8B_on_64b_topic", |b| {
+            b.iter(|| {
+                let mut loan = pub_.loan_to(&h_64b);
+                let buf = loan.as_mut_slice();
+                buf[0..8].copy_from_slice(&42u64.to_le_bytes());
+                loan.set_len(8);
+                loan.publish();
+                let s = s_64b.try_recv_ref().unwrap();
+                black_box(&*s);
+            })
+        });
+
+        group.bench_function("8B_on_64kb_topic", |b| {
+            b.iter(|| {
+                let mut loan = pub_.loan_to(&h_64kb);
+                let buf = loan.as_mut_slice();
+                buf[0..8].copy_from_slice(&42u64.to_le_bytes());
+                loan.set_len(8);
+                loan.publish();
+                let s = s_64kb.try_recv_ref().unwrap();
+                black_box(&*s);
+            })
+        });
+
+        group.bench_function("8B_on_1mb_topic", |b| {
+            b.iter(|| {
+                let mut loan = pub_.loan_to(&h_1mb);
+                let buf = loan.as_mut_slice();
+                buf[0..8].copy_from_slice(&42u64.to_le_bytes());
+                loan.set_len(8);
+                loan.publish();
+                let s = s_1mb.try_recv_ref().unwrap();
+                black_box(&*s);
+            })
+        });
+
+        group.finish();
+    }
+
     // -- Zero-copy path: memcpy write + zero-copy read --
     {
         let mut group = c.benchmark_group("pubsub_zerocopy");
