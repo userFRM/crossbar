@@ -254,9 +254,12 @@ impl ShmServer {
         rt_handle: &tokio::runtime::Handle,
         stop: &std::sync::atomic::AtomicBool,
     ) {
+        let n = region.slot_count;
         while !stop.load(Ordering::Acquire) {
             let mut found_work = false;
-            for slot_idx in 0..region.slot_count {
+            let start = region.server_slot_hint().load(Ordering::Relaxed) % n;
+            for offset in 0..n {
+                let slot_idx = (start + offset) % n;
                 let state = region.slot_state(slot_idx);
 
                 if state
@@ -269,6 +272,10 @@ impl ShmServer {
                     .is_ok()
                 {
                     found_work = true;
+                    // Advance hint past this slot for next scan
+                    region
+                        .server_slot_hint()
+                        .store(slot_idx.wrapping_add(1) % n, Ordering::Relaxed);
                     region.touch_slot(slot_idx);
 
                     let Ok(req) = region.read_request_from_block(slot_idx) else {

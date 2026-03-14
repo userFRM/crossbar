@@ -715,6 +715,7 @@ impl ShmRegion {
     /// Returns [`CrossbarError::ShmMessageTooLarge`] if the request payload
     /// exceeds the block capacity, or [`CrossbarError::HeaderOverflow`] if
     /// header serialization fails.
+    #[inline]
     #[allow(clippy::cast_possible_truncation)] // lengths bounded by block_size (u32)
     pub fn write_request_to_block(
         &self,
@@ -776,6 +777,7 @@ impl ShmRegion {
     /// Returns an error if the block contents are malformed (invalid method
     /// byte, non-UTF-8 URI, truncated headers, or payload exceeding block
     /// size). The block is freed before returning on error.
+    #[inline]
     pub fn read_request_from_block(
         self: &Arc<Self>,
         slot_idx: u32,
@@ -863,6 +865,7 @@ impl ShmRegion {
     ///
     /// If the response exceeds block capacity or headers fail to serialize,
     /// a 500 fallback is written instead (this method never fails).
+    #[inline]
     #[allow(clippy::cast_possible_truncation)] // lengths bounded by block_size (u32)
     pub fn write_response_to_block(&self, slot_idx: u32, block_idx: u32, resp: &Response) {
         let block_cap = self.block_size as usize;
@@ -940,6 +943,7 @@ impl ShmRegion {
     /// Returns an error if the block contents are malformed (truncated
     /// headers or payload exceeding block size). The block is freed before
     /// returning on error.
+    #[inline]
     pub fn read_response_from_block(
         self: &Arc<Self>,
         slot_idx: u32,
@@ -1041,16 +1045,22 @@ impl ShmRegion {
 
     // -- Slot acquisition --
 
-    /// Returns a reference to the slot hint index (global header offset 0x34).
-    ///
-    /// The hint tracks the last successfully acquired slot index so that
-    /// `try_acquire_slot` can start scanning from there instead of always
-    /// starting at slot 0. This avoids O(N) worst-case scanning when
-    /// contention is low and most early slots are busy.
-    #[allow(clippy::cast_ptr_alignment)] // offset 0x34 is 4-byte aligned within the header
+    /// Returns a reference to the client slot hint (global header offset 0x34).
+    #[allow(clippy::cast_ptr_alignment)]
     #[inline]
     fn slot_hint(&self) -> &AtomicU32 {
         unsafe { &*self.mmap.as_ptr().add(0x34).cast::<AtomicU32>() }
+    }
+
+    /// Returns a reference to the server slot hint (global header offset 0x3C).
+    ///
+    /// Tracks where the server last found a REQUEST_READY slot, so the poll
+    /// loop starts scanning there instead of slot 0. Gives O(1) amortised
+    /// scanning for sequential workloads.
+    #[allow(clippy::cast_ptr_alignment)]
+    #[inline]
+    pub fn server_slot_hint(&self) -> &AtomicU32 {
+        unsafe { &*self.mmap.as_ptr().add(0x3C).cast::<AtomicU32>() }
     }
 
     /// Tries to acquire a FREE slot via CAS. Returns the slot index or None.
