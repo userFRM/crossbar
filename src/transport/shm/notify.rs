@@ -3,8 +3,15 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-/// Spin, then yield, then park until `addr` no longer holds `current`.
-/// Returns the new value, or Err on timeout.
+/// Waits until `addr` no longer holds `current`, using a three-phase
+/// strategy: spin (100 iterations), yield (10 iterations), then
+/// platform-specific park (`futex_wait` on Linux, polling on macOS).
+///
+/// Returns the new value on success, or `Err(())` on timeout.
+///
+/// # Errors
+///
+/// Returns `Err(())` if `timeout` elapses before the value changes.
 pub fn wait_until_not(addr: &AtomicU32, current: u32, timeout: Duration) -> Result<u32, ()> {
     const SPIN_ITERS: u32 = 100;
     const YIELD_ITERS: u32 = 10;
@@ -63,17 +70,17 @@ mod platform {
     #[allow(unsafe_code)]
     pub fn futex_wait(addr: &AtomicU32, expected: u32, timeout: Option<Duration>) {
         let ts = timeout.map(|d| libc::timespec {
-            tv_sec: d.as_secs() as _,
-            tv_nsec: d.subsec_nanos() as _,
+            tv_sec: d.as_secs().cast_signed(),
+            tv_nsec: d.subsec_nanos().into(),
         });
         unsafe {
             libc::syscall(
                 libc::SYS_futex,
-                addr as *const AtomicU32,
+                std::ptr::from_ref::<AtomicU32>(addr),
                 libc::FUTEX_WAIT,
                 expected,
                 ts.as_ref()
-                    .map_or(std::ptr::null(), |t| t as *const libc::timespec),
+                    .map_or(std::ptr::null(), std::ptr::from_ref::<libc::timespec>),
                 std::ptr::null::<u32>(),
                 0u32,
             );
@@ -85,7 +92,7 @@ mod platform {
         unsafe {
             libc::syscall(
                 libc::SYS_futex,
-                addr as *const AtomicU32,
+                std::ptr::from_ref::<AtomicU32>(addr),
                 libc::FUTEX_WAKE,
                 count,
                 std::ptr::null::<libc::timespec>(),

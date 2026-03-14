@@ -1,45 +1,68 @@
 #![allow(unsafe_code)]
 
+use super::mmap::RawMmap;
 use crate::error::CrossbarError;
 use crate::types::{Method, Request, Response};
 use bytes::Bytes;
-use memmap2::MmapMut;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-// Magic bytes: "XBAR_V2\0"
+/// Magic bytes identifying a V2 shared memory region: `XBAR_V2\0`.
 pub const MAGIC: &[u8; 8] = b"XBAR_V2\0";
+/// Wire protocol version for the shared memory region layout.
 pub const VERSION: u32 = 2;
+/// Size of the global header at the start of the region, in bytes.
 pub const GLOBAL_HEADER_SIZE: usize = 128;
+/// Size of each coordination slot, in bytes.
 pub const SLOT_SIZE: usize = 64;
 
 // Sentinel for "no block assigned"
-const NO_BLOCK: u32 = u32::MAX;
+pub(crate) const NO_BLOCK: u32 = u32::MAX;
 
-// Slot states
+/// Slot state: no request is pending; the slot is available for acquisition.
 pub const FREE: u32 = 0;
+/// Slot state: a client has written a request and the server should process it.
 pub const REQUEST_READY: u32 = 1;
+/// Slot state: the server is processing the request.
 pub const PROCESSING: u32 = 2;
+/// Slot state: the server has written a response and the client should read it.
 pub const RESPONSE_READY: u32 = 3;
-/// Intermediate state: slot is acquired by a client, request data is being
-/// written. The server must not read the slot until it transitions to
+/// Slot state: a client has acquired the slot and is writing request data.
+/// The server must not read the slot until it transitions to
 /// [`REQUEST_READY`].
 pub const WRITING: u32 = 4;
 
-/// Configuration for shared memory transport.
+/// Configuration for the shared memory transport.
+///
+/// All fields have sensible defaults via [`ShmConfig::default`]. Override
+/// individual fields to tune concurrency, block sizing, or liveness detection.
+///
+/// # Examples
+///
+/// ```rust
+/// use crossbar::transport::ShmConfig;
+/// use std::time::Duration;
+///
+/// let config = ShmConfig {
+///     slot_count: 128,
+///     block_count: 384,
+///     block_size: 128 * 1024, // 128 KiB
+///     ..ShmConfig::default()
+/// };
+/// ```
 #[derive(Debug, Clone)]
 pub struct ShmConfig {
     /// Number of coordination slots (default: 64).
     pub slot_count: u32,
-    /// Number of data blocks in the pool (default: slot_count * 3).
+    /// Number of data blocks in the pool (default: 192, i.e. `slot_count * 3`).
     pub block_count: u32,
     /// Size of each data block in bytes (default: 65536 = 64 KiB).
     pub block_size: u32,
-    /// Heartbeat interval (default: 100ms).
+    /// Heartbeat interval (default: 100 ms).
     pub heartbeat_interval: Duration,
-    /// Timeout for considering server/client dead (default: 5s).
+    /// Timeout for considering the server dead (default: 5 s).
     pub stale_timeout: Duration,
 }
 
@@ -56,6 +79,10 @@ impl Default for ShmConfig {
 }
 
 /// Derives the file path for a named shared memory region.
+///
+/// On Linux this is `/dev/shm/crossbar-{name}`; on other Unix platforms
+/// it falls back to `/tmp/crossbar-shm-{name}`.
+#[must_use]
 pub fn shm_path(name: &str) -> PathBuf {
     if cfg!(target_os = "linux") {
         PathBuf::from(format!("/dev/shm/crossbar-{name}"))
@@ -68,28 +95,39 @@ pub fn shm_path(name: &str) -> PathBuf {
 
 #[inline]
 fn pack(gen: u32, idx: u32) -> u64 {
-    (gen as u64) << 32 | idx as u64
+    u64::from(gen) << 32 | u64::from(idx)
 }
 
 #[inline]
+#[allow(clippy::cast_possible_truncation)] // intentional: extracting u32 halves from a u64
 fn unpack(val: u64) -> (u32, u32) {
     ((val >> 32) as u32, val as u32)
 }
 
-fn region_size(config: &ShmConfig) -> usize {
-    GLOBAL_HEADER_SIZE
-        + config.slot_count as usize * SLOT_SIZE
-        + config.block_count as usize * config.block_size as usize
+fn region_size(config: &ShmConfig) -> Option<usize> {
+    let slots = (config.slot_count as usize).checked_mul(SLOT_SIZE)?;
+    let blocks = (config.block_count as usize).checked_mul(config.block_size as usize)?;
+    GLOBAL_HEADER_SIZE.checked_add(slots)?.checked_add(blocks)
 }
 
-/// Handle to a V2 memory-mapped shared region with block pool.
+/// Handle to a V2 memory-mapped shared region with a lock-free block pool.
+///
+/// The region layout is: global header (128 bytes) | coordination slots |
+/// data blocks. Coordination slots track request/response state machines;
+/// data blocks hold serialized payloads. Blocks are managed by a Treiber
+/// stack for lock-free allocation and deallocation.
 pub struct ShmRegion {
-    mmap: MmapMut,
+    mmap: RawMmap,
+    /// Number of coordination slots in this region.
     pub slot_count: u32,
+    /// Number of data blocks in the pool.
     pub block_count: u32,
+    /// Size of each data block in bytes.
     pub block_size: u32,
+    /// File system path of the shared memory file.
     #[allow(dead_code)]
     pub path: PathBuf,
+    /// Configuration used to create this region.
     #[allow(dead_code)]
     pub config: ShmConfig,
 }
@@ -101,9 +139,31 @@ unsafe impl Sync for ShmRegion {}
 
 impl ShmRegion {
     /// Creates a new V2 shared memory region (server side).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CrossbarError::ShmInvalidRegion`] if any config field is
+    /// zero or the computed layout overflows, or [`CrossbarError::Io`] if the
+    /// backing file cannot be created.
     pub fn create(name: &str, config: &ShmConfig) -> Result<Self, CrossbarError> {
+        if config.slot_count == 0 {
+            return Err(CrossbarError::ShmInvalidRegion(
+                "slot_count must be > 0".into(),
+            ));
+        }
+        if config.block_count == 0 {
+            return Err(CrossbarError::ShmInvalidRegion(
+                "block_count must be > 0".into(),
+            ));
+        }
+        if config.block_size == 0 {
+            return Err(CrossbarError::ShmInvalidRegion(
+                "block_size must be > 0".into(),
+            ));
+        }
         let path = shm_path(name);
-        let size = region_size(config);
+        let size = region_size(config)
+            .ok_or_else(|| CrossbarError::ShmInvalidRegion("layout size overflows".into()))?;
 
         // Remove any stale file
         let _ = std::fs::remove_file(&path);
@@ -118,7 +178,7 @@ impl ShmRegion {
 
         file.set_len(size as u64).map_err(CrossbarError::Io)?;
 
-        let mut mmap = unsafe { MmapMut::map_mut(&file) }.map_err(CrossbarError::Io)?;
+        let mmap = RawMmap::from_file_with_len(&file, size).map_err(CrossbarError::Io)?;
 
         // Write global header
         let ptr = mmap.as_mut_ptr();
@@ -146,7 +206,7 @@ impl ShmRegion {
                 4,
             );
             // 0x20: server_pid (8B)
-            let pid = std::process::id() as u64;
+            let pid = u64::from(std::process::id());
             std::ptr::copy_nonoverlapping(pid.to_le_bytes().as_ptr(), ptr.add(0x20), 8);
         }
 
@@ -177,6 +237,12 @@ impl ShmRegion {
     }
 
     /// Opens an existing V2 shared memory region (client side).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CrossbarError::Io`] if the backing file cannot be opened,
+    /// or [`CrossbarError::ShmInvalidRegion`] if the header magic, version,
+    /// or layout do not match.
     pub fn open(name: &str) -> Result<Self, CrossbarError> {
         let path = shm_path(name);
 
@@ -186,7 +252,7 @@ impl ShmRegion {
             .open(&path)
             .map_err(CrossbarError::Io)?;
 
-        let mmap = unsafe { MmapMut::map_mut(&file) }.map_err(CrossbarError::Io)?;
+        let mmap = RawMmap::from_file(&file).map_err(CrossbarError::Io)?;
 
         if mmap.len() < GLOBAL_HEADER_SIZE {
             return Err(CrossbarError::ShmInvalidRegion(
@@ -251,11 +317,12 @@ impl ShmRegion {
 
     // -- Pool allocator (Treiber stack) --
 
+    #[allow(clippy::cast_ptr_alignment)] // offset 0x28 is 8-byte aligned within the header
     fn pool_head(&self) -> &AtomicU64 {
-        unsafe { &*(self.mmap.as_ptr().add(0x28) as *const AtomicU64) }
+        unsafe { &*self.mmap.as_ptr().add(0x28).cast::<AtomicU64>() }
     }
 
-    /// Initialize the free list: chain block 0 -> 1 -> 2 -> ... -> NO_BLOCK
+    /// Initialize the free list: chain block 0 -> 1 -> 2 -> ... -> `NO_BLOCK`.
     fn init_free_list(&self) {
         for i in 0..self.block_count {
             let next = if i + 1 < self.block_count {
@@ -285,7 +352,9 @@ impl ShmRegion {
         }
     }
 
-    /// Allocates a block from the pool. Returns the block index or None if exhausted.
+    /// Allocates a block from the pool.
+    ///
+    /// Returns the block index, or `None` if all blocks are in use.
     pub fn alloc_block(&self) -> Option<u32> {
         loop {
             let head = self.pool_head().load(Ordering::Acquire);
@@ -306,7 +375,15 @@ impl ShmRegion {
     }
 
     /// Returns a block to the pool.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `idx` is out of bounds (>= `block_count`).
     pub fn free_block(&self, idx: u32) {
+        assert!(
+            (idx as usize) < self.block_count as usize,
+            "free_block: index {idx} out of bounds"
+        );
         loop {
             let head = self.pool_head().load(Ordering::Acquire);
             let (gen, old_head_idx) = unpack(head);
@@ -323,12 +400,20 @@ impl ShmRegion {
     }
 
     /// Returns a raw pointer to the start of block `idx`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `idx` is out of bounds (>= `block_count`).
     pub fn block_ptr(&self, idx: u32) -> *mut u8 {
-        debug_assert!((idx as usize) < self.block_count as usize);
+        assert!(
+            (idx as usize) < self.block_count as usize,
+            "block index {idx} out of bounds (max {})",
+            self.block_count
+        );
         let offset = GLOBAL_HEADER_SIZE
             + self.slot_count as usize * SLOT_SIZE
             + idx as usize * self.block_size as usize;
-        unsafe { self.mmap.as_ptr().add(offset) as *mut u8 }
+        unsafe { self.mmap.as_ptr().add(offset).cast_mut() }
     }
 
     /// Returns a slice of the block's data region.
@@ -344,21 +429,24 @@ impl ShmRegion {
         unsafe {
             self.mmap
                 .as_ptr()
-                .add(GLOBAL_HEADER_SIZE + idx as usize * SLOT_SIZE) as *mut u8
+                .add(GLOBAL_HEADER_SIZE + idx as usize * SLOT_SIZE)
+                .cast_mut()
         }
     }
 
     /// Returns a reference to the slot's atomic state field (offset 0x00).
+    #[allow(clippy::cast_ptr_alignment)] // slot_base is 64-byte aligned
     pub fn slot_state(&self, idx: u32) -> &AtomicU32 {
-        unsafe { &*(self.slot_base(idx) as *const AtomicU32) }
+        unsafe { &*self.slot_base(idx).cast::<AtomicU32>() }
     }
 
     /// Returns a reference to the slot's sequence counter (offset 0x04).
+    #[allow(clippy::cast_ptr_alignment)] // offset 0x04 within a 64-byte aligned slot
     pub fn slot_sequence(&self, idx: u32) -> &AtomicU32 {
-        unsafe { &*(self.slot_base(idx).add(4) as *const AtomicU32) }
+        unsafe { &*self.slot_base(idx).add(4).cast::<AtomicU32>() }
     }
 
-    /// Writes the client_id into a slot (offset 0x08).
+    /// Writes the `client_id` into a slot (offset 0x08).
     pub fn set_slot_client_id(&self, idx: u32, client_id: u64) {
         unsafe {
             let ptr = self.slot_base(idx).add(0x08);
@@ -366,7 +454,7 @@ impl ShmRegion {
         }
     }
 
-    /// Reads the client_id from a slot.
+    /// Reads the `client_id` from a slot.
     #[allow(dead_code)]
     pub fn slot_client_id(&self, idx: u32) -> u64 {
         unsafe {
@@ -378,6 +466,7 @@ impl ShmRegion {
     }
 
     /// Updates the slot timestamp to now (offset 0x10).
+    #[allow(clippy::cast_possible_truncation)] // millis since epoch fits in u64
     pub fn touch_slot(&self, idx: u32) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -455,58 +544,74 @@ impl ShmRegion {
     // 0x34: response_body_len (u32)
     // 0x38: response_headers_data_len (u32)
 
+    /// Sets the URI length in the coordination slot at `idx`.
     pub fn set_uri_len(&self, idx: u32, val: u32) {
         self.write_slot_u32(idx, 0x1C, val);
     }
+    /// Reads the URI length from the coordination slot at `idx`.
     pub fn uri_len(&self, idx: u32) -> u32 {
         self.read_slot_u32(idx, 0x1C)
     }
 
+    /// Sets the request body length in the coordination slot at `idx`.
     pub fn set_body_len(&self, idx: u32, val: u32) {
         self.write_slot_u32(idx, 0x20, val);
     }
+    /// Reads the request body length from the coordination slot at `idx`.
     pub fn body_len(&self, idx: u32) -> u32 {
         self.read_slot_u32(idx, 0x20)
     }
 
+    /// Sets the headers data length in the coordination slot at `idx`.
     pub fn set_headers_data_len(&self, idx: u32, val: u32) {
         self.write_slot_u32(idx, 0x24, val);
     }
+    /// Reads the headers data length from the coordination slot at `idx`.
     pub fn headers_data_len(&self, idx: u32) -> u32 {
         self.read_slot_u32(idx, 0x24)
     }
 
+    /// Sets the request block index in the coordination slot at `idx`.
     pub fn set_request_block_idx(&self, idx: u32, val: u32) {
         self.write_slot_u32(idx, 0x28, val);
     }
+    /// Reads the request block index from the coordination slot at `idx`.
     pub fn request_block_idx(&self, idx: u32) -> u32 {
         self.read_slot_u32(idx, 0x28)
     }
 
+    /// Sets the response block index in the coordination slot at `idx`.
     pub fn set_response_block_idx(&self, idx: u32, val: u32) {
         self.write_slot_u32(idx, 0x2C, val);
     }
+    /// Reads the response block index from the coordination slot at `idx`.
     pub fn response_block_idx(&self, idx: u32) -> u32 {
         self.read_slot_u32(idx, 0x2C)
     }
 
+    /// Sets the response status code in the coordination slot at `idx`.
     pub fn set_response_status(&self, idx: u32, val: u16) {
         self.write_slot_u16(idx, 0x30, val);
     }
+    /// Reads the response status code from the coordination slot at `idx`.
     pub fn response_status(&self, idx: u32) -> u16 {
         self.read_slot_u16(idx, 0x30)
     }
 
+    /// Sets the response body length in the coordination slot at `idx`.
     pub fn set_response_body_len(&self, idx: u32, val: u32) {
         self.write_slot_u32(idx, 0x34, val);
     }
+    /// Reads the response body length from the coordination slot at `idx`.
     pub fn response_body_len(&self, idx: u32) -> u32 {
         self.read_slot_u32(idx, 0x34)
     }
 
+    /// Sets the response headers data length in the coordination slot at `idx`.
     pub fn set_response_headers_data_len(&self, idx: u32, val: u32) {
         self.write_slot_u32(idx, 0x38, val);
     }
+    /// Reads the response headers data length from the coordination slot at `idx`.
     pub fn response_headers_data_len(&self, idx: u32) -> u32 {
         self.read_slot_u32(idx, 0x38)
     }
@@ -514,8 +619,16 @@ impl ShmRegion {
     // -- Request/Response block I/O --
 
     /// Writes a request directly into a block.
-    /// Block layout: [uri bytes][headers_data][body bytes]
+    ///
+    /// Block layout: `[uri bytes][headers_data][body bytes]`.
     /// Coordination slot metadata fields are also written.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CrossbarError::ShmMessageTooLarge`] if the request payload
+    /// exceeds the block capacity, or [`CrossbarError::HeaderOverflow`] if
+    /// header serialization fails.
+    #[allow(clippy::cast_possible_truncation)] // lengths bounded by block_size (u32)
     pub fn write_request_to_block(
         &self,
         slot_idx: u32,
@@ -566,8 +679,16 @@ impl ShmRegion {
         Ok(())
     }
 
-    /// Reads a request from a block. The body is zero-copy via `Bytes::from_owner`.
-    /// Block layout: [uri bytes][headers_data][body bytes]
+    /// Reads a request from a block.
+    ///
+    /// The body is zero-copy via `Bytes::from_owner`.
+    /// Block layout: `[uri bytes][headers_data][body bytes]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the block contents are malformed (invalid method
+    /// byte, non-UTF-8 URI, truncated headers, or payload exceeding block
+    /// size). The block is freed before returning on error.
     pub fn read_request_from_block(
         self: &Arc<Self>,
         slot_idx: u32,
@@ -576,7 +697,13 @@ impl ShmRegion {
         let block_cap = self.block_size as usize;
 
         let method_byte = self.slot_method(slot_idx);
-        let method = Method::try_from(method_byte).map_err(CrossbarError::InvalidMethod)?;
+        let method = match Method::try_from(method_byte) {
+            Ok(m) => m,
+            Err(e) => {
+                self.free_block(block_idx);
+                return Err(CrossbarError::InvalidMethod(e));
+            }
+        };
         let uri_len = self.uri_len(slot_idx) as usize;
         let body_len = self.body_len(slot_idx) as usize;
         let headers_data_len = self.headers_data_len(slot_idx) as usize;
@@ -588,6 +715,8 @@ impl ShmRegion {
         match total {
             Some(t) if t <= block_cap => {}
             _ => {
+                // Free the block before returning — caller won't see it again.
+                self.free_block(block_idx);
                 return Err(CrossbarError::ShmInvalidRegion(format!(
                     "request payload ({uri_len}+{headers_data_len}+{body_len}) exceeds block size ({block_cap})"
                 )));
@@ -598,17 +727,24 @@ impl ShmRegion {
 
         // URI
         let uri_slice = self.block_slice(block_idx, off, uri_len);
-        let uri_str = std::str::from_utf8(uri_slice).map_err(|_| {
-            CrossbarError::Io(std::io::Error::new(
+        let Ok(uri_str) = std::str::from_utf8(uri_slice) else {
+            self.free_block(block_idx);
+            return Err(CrossbarError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "URI not valid UTF-8",
-            ))
-        })?;
+            )));
+        };
         off += uri_len;
 
         // Headers
         let headers_slice = self.block_slice(block_idx, off, headers_data_len);
-        let headers = crate::transport::deserialize_headers(headers_slice)?;
+        let headers = match crate::transport::deserialize_headers(headers_slice) {
+            Ok(h) => h,
+            Err(e) => {
+                self.free_block(block_idx);
+                return Err(e);
+            }
+        };
         off += headers_data_len;
 
         // Body — zero-copy via Bytes::from_owner
@@ -636,10 +772,12 @@ impl ShmRegion {
     }
 
     /// Writes a response directly into a block.
-    /// Block layout: [headers_data][body bytes]
+    ///
+    /// Block layout: `[headers_data][body bytes]`.
     ///
     /// If the response exceeds block capacity or headers fail to serialize,
-    /// a 500 fallback is written instead.
+    /// a 500 fallback is written instead (this method never fails).
+    #[allow(clippy::cast_possible_truncation)] // lengths bounded by block_size (u32)
     pub fn write_response_to_block(&self, slot_idx: u32, block_idx: u32, resp: &Response) {
         let block_cap = self.block_size as usize;
         let block = self.block_ptr(block_idx);
@@ -669,22 +807,34 @@ impl ShmRegion {
         })();
 
         let (status, headers_data_len, body_len) = result.unwrap_or_else(|_| {
-            // Fallback: write a 500 error into the block
+            // Fallback: write a 500 error into the block, but respect block_cap.
             let fallback_headers = [0u8, 0u8]; // 0 headers
             let fallback_body = b"response too large for shm block";
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    fallback_headers.as_ptr(),
-                    block,
-                    fallback_headers.len(),
-                );
-                std::ptr::copy_nonoverlapping(
-                    fallback_body.as_ptr(),
-                    block.add(fallback_headers.len()),
-                    fallback_body.len(),
-                );
+            let total = fallback_headers.len() + fallback_body.len();
+            if total <= block_cap {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        fallback_headers.as_ptr(),
+                        block,
+                        fallback_headers.len(),
+                    );
+                    std::ptr::copy_nonoverlapping(
+                        fallback_body.as_ptr(),
+                        block.add(fallback_headers.len()),
+                        fallback_body.len(),
+                    );
+                }
+                (500u16, fallback_headers.len(), fallback_body.len())
+            } else if block_cap >= 2 {
+                // Block too small for fallback body — write just the header count.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(fallback_headers.as_ptr(), block, 2);
+                }
+                (500u16, 2, 0)
+            } else {
+                // Block cannot even hold the header count field.
+                (500u16, 0, 0)
             }
-            (500u16, fallback_headers.len(), fallback_body.len())
         });
 
         // Write metadata to coordination slot
@@ -694,8 +844,16 @@ impl ShmRegion {
         self.set_response_body_len(slot_idx, body_len as u32);
     }
 
-    /// Reads a response from a block. The body is zero-copy via `Bytes::from_owner`.
-    /// Block layout: [headers_data][body bytes]
+    /// Reads a response from a block.
+    ///
+    /// The body is zero-copy via `Bytes::from_owner`.
+    /// Block layout: `[headers_data][body bytes]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the block contents are malformed (truncated
+    /// headers or payload exceeding block size). The block is freed before
+    /// returning on error.
     pub fn read_response_from_block(
         self: &Arc<Self>,
         slot_idx: u32,
@@ -712,6 +870,8 @@ impl ShmRegion {
         match total {
             Some(t) if t <= block_cap => {}
             _ => {
+                // Free the block before returning — caller won't see it again.
+                self.free_block(block_idx);
                 return Err(CrossbarError::ShmInvalidRegion(format!(
                     "response payload ({headers_data_len}+{body_len}) exceeds block size ({block_cap})"
                 )));
@@ -722,7 +882,13 @@ impl ShmRegion {
 
         // Headers
         let headers_slice = self.block_slice(block_idx, off, headers_data_len);
-        let headers = crate::transport::deserialize_headers(headers_slice)?;
+        let headers = match crate::transport::deserialize_headers(headers_slice) {
+            Ok(h) => h,
+            Err(e) => {
+                self.free_block(block_idx);
+                return Err(e);
+            }
+        };
         off += headers_data_len;
 
         // Body — zero-copy via Bytes::from_owner
@@ -753,6 +919,7 @@ impl ShmRegion {
     // -- Heartbeat --
 
     /// Updates the server heartbeat timestamp.
+    #[allow(clippy::cast_possible_truncation)] // millis since epoch fits in u64 for ~585 million years
     pub fn update_heartbeat(&self) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -763,6 +930,12 @@ impl ShmRegion {
     }
 
     /// Checks if the server heartbeat is recent enough.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CrossbarError::ShmServerDead`] if the heartbeat is older
+    /// than `stale_timeout`.
+    #[allow(clippy::cast_possible_truncation)] // millis since epoch fits in u64
     pub fn check_heartbeat(&self, stale_timeout: Duration) -> Result<(), CrossbarError> {
         let hb = self.heartbeat_atomic();
         let last = hb.load(Ordering::Acquire);
@@ -776,8 +949,9 @@ impl ShmRegion {
         Ok(())
     }
 
+    #[allow(clippy::cast_ptr_alignment)] // offset 0x18 is 8-byte aligned within the header
     fn heartbeat_atomic(&self) -> &AtomicU64 {
-        unsafe { &*(self.mmap.as_ptr().add(0x18) as *const AtomicU64) }
+        unsafe { &*self.mmap.as_ptr().add(0x18).cast::<AtomicU64>() }
     }
 
     // -- Slot acquisition --
@@ -799,7 +973,8 @@ impl ShmRegion {
         None
     }
 
-    /// Scans for stale slots and resets them to FREE.
+    /// Scans for stale slots and resets them to [`FREE`].
+    #[allow(clippy::cast_possible_truncation)] // millis since epoch fits in u64
     pub fn recover_stale_slots(&self, stale_timeout: Duration) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -816,12 +991,13 @@ impl ShmRegion {
 
             let ts = self.slot_timestamp(i);
             if now.saturating_sub(ts) > stale_timeout.as_millis() as u64 {
-                // CAS to avoid racing with legitimate transitions.
-                // If we succeed, free any blocks that were assigned to this slot.
+                // CAS to PROCESSING first so no client can reacquire the slot
+                // while we are freeing its blocks.
                 if state
-                    .compare_exchange(current, FREE, Ordering::AcqRel, Ordering::Acquire)
+                    .compare_exchange(current, PROCESSING, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
                 {
+                    // Safe: slot is PROCESSING, no client can acquire it.
                     // Free request block if assigned
                     let req_block = self.request_block_idx(i);
                     if req_block != NO_BLOCK {
@@ -834,6 +1010,8 @@ impl ShmRegion {
                         self.free_block(resp_block);
                         self.set_response_block_idx(i, NO_BLOCK);
                     }
+                    // NOW release the slot to FREE
+                    state.store(FREE, Ordering::Release);
                 }
             }
         }

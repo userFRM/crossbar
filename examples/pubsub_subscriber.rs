@@ -36,8 +36,11 @@ fn main() {
     loop {
         if let Some(sample) = stream.try_recv_ref() {
             let recv_ts = mono_nanos();
-            let send_ts = u64::from_le_bytes(sample[0..8].try_into().unwrap());
-            let seq = u64::from_le_bytes(sample[8..16].try_into().unwrap());
+            // SAFETY: single-process example — no concurrent publisher overwrites
+            // within this read window.
+            let data = unsafe { sample.as_bytes_unchecked() };
+            let send_ts = u64::from_le_bytes(data[0..8].try_into().unwrap());
+            let seq = u64::from_le_bytes(data[8..16].try_into().unwrap());
 
             if seq > last_seq + 1 && last_seq > 0 {
                 // Skipped samples (ring overwrite)

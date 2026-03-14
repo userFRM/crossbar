@@ -33,6 +33,7 @@ use std::io;
 /// Serialize headers directly into a target buffer (SHM block).
 /// Returns the number of bytes written.
 #[cfg(feature = "shm")]
+#[allow(clippy::cast_possible_truncation)] // lengths verified <= u16::MAX before cast
 pub(crate) fn serialize_headers_into(
     headers: &HashMap<String, String>,
     target: &mut [u8],

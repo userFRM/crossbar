@@ -227,41 +227,29 @@ fn bench_pubsub(c: &mut Criterion) {
     let payload_64kb = vec![42u8; 65_536];
     let payload_1mb = vec![42u8; 1_048_576];
 
-    // -- Transport overhead ONLY: loan + publish + recv, NO data write --
-    // This proves the transport layer is O(1) regardless of topic capacity.
-    // The "payload size" here is the topic's sample_capacity — but we write
-    // ZERO bytes. Only the atomic publish + seqlock recv is measured.
+    // -- Transport overhead: publish (with futex wake) + recv --
+    // Measures full publish path including futex_wake syscall.
     {
         let mut group = c.benchmark_group("pubsub_transport_only");
         group.measurement_time(Duration::from_secs(1));
 
-        // Publish zero-length samples on topics with different capacities.
-        // If transport is O(1), all three should be ~identical.
-        group.bench_function("on_64b_topic", |b| {
+        group.bench_function("with_wake", |b| {
             b.iter(|| {
                 let loan = pub_.loan_to(&h_64b);
-                // NO data written — just publish the empty loan
-                loan.publish();
+                loan.publish(); // includes futex_wake_all
                 let s = s_64b.try_recv_ref().unwrap();
-                black_box(&*s);
+                black_box(unsafe { s.as_bytes_unchecked() });
             })
         });
 
-        group.bench_function("on_64kb_topic", |b| {
+        // Same but without futex wake — pure atomic overhead only.
+        // This is the iceoryx-comparable number.
+        group.bench_function("silent_no_wake", |b| {
             b.iter(|| {
-                let loan = pub_.loan_to(&h_64kb);
-                loan.publish();
-                let s = s_64kb.try_recv_ref().unwrap();
-                black_box(&*s);
-            })
-        });
-
-        group.bench_function("on_1mb_topic", |b| {
-            b.iter(|| {
-                let loan = pub_.loan_to(&h_1mb);
-                loan.publish();
-                let s = s_1mb.try_recv_ref().unwrap();
-                black_box(&*s);
+                let loan = pub_.loan_to(&h_64b);
+                loan.publish_silent(); // no futex, no notification counter
+                let s = s_64b.try_recv_ref().unwrap();
+                black_box(unsafe { s.as_bytes_unchecked() });
             })
         });
 
@@ -284,7 +272,7 @@ fn bench_pubsub(c: &mut Criterion) {
                 loan.set_len(8);
                 loan.publish();
                 let s = s_64b.try_recv_ref().unwrap();
-                black_box(&*s);
+                black_box(unsafe { s.as_bytes_unchecked() });
             })
         });
 
@@ -296,7 +284,7 @@ fn bench_pubsub(c: &mut Criterion) {
                 loan.set_len(8);
                 loan.publish();
                 let s = s_64kb.try_recv_ref().unwrap();
-                black_box(&*s);
+                black_box(unsafe { s.as_bytes_unchecked() });
             })
         });
 
@@ -308,7 +296,7 @@ fn bench_pubsub(c: &mut Criterion) {
                 loan.set_len(8);
                 loan.publish();
                 let s = s_1mb.try_recv_ref().unwrap();
-                black_box(&*s);
+                black_box(unsafe { s.as_bytes_unchecked() });
             })
         });
 
@@ -328,7 +316,7 @@ fn bench_pubsub(c: &mut Criterion) {
                 loan.set_len(8);
                 loan.publish();
                 let s = s_64b.try_recv_ref().unwrap();
-                black_box(&*s);
+                black_box(unsafe { s.as_bytes_unchecked() });
             })
         });
 
@@ -339,7 +327,7 @@ fn bench_pubsub(c: &mut Criterion) {
                 loan.set_len(payload_64kb.len());
                 loan.publish();
                 let s = s_64kb.try_recv_ref().unwrap();
-                black_box(&*s);
+                black_box(unsafe { s.as_bytes_unchecked() });
             })
         });
 
@@ -350,7 +338,7 @@ fn bench_pubsub(c: &mut Criterion) {
                 loan.set_len(payload_1mb.len());
                 loan.publish();
                 let s = s_1mb.try_recv_ref().unwrap();
-                black_box(&*s);
+                black_box(unsafe { s.as_bytes_unchecked() });
             })
         });
 
@@ -368,7 +356,7 @@ fn bench_pubsub(c: &mut Criterion) {
                 loan.set_data(&payload_64b);
                 loan.publish();
                 let s = s_64b.try_recv_ref().unwrap();
-                black_box(&*s);
+                black_box(unsafe { s.as_bytes_unchecked() });
             })
         });
 
@@ -378,7 +366,7 @@ fn bench_pubsub(c: &mut Criterion) {
                 loan.set_data(&payload_64kb);
                 loan.publish();
                 let s = s_64kb.try_recv_ref().unwrap();
-                black_box(&*s);
+                black_box(unsafe { s.as_bytes_unchecked() });
             })
         });
 
@@ -388,7 +376,7 @@ fn bench_pubsub(c: &mut Criterion) {
                 loan.set_data(&payload_1mb);
                 loan.publish();
                 let s = s_1mb.try_recv_ref().unwrap();
-                black_box(&*s);
+                black_box(unsafe { s.as_bytes_unchecked() });
             })
         });
 

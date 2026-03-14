@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::mmap::{RawMmap, RawMmapReadOnly};
 use super::notify;
 use crate::error::CrossbarError;
 
@@ -183,7 +184,7 @@ pub struct TopicHandle {
 /// loan.publish();
 /// ```
 pub struct ShmPublisher {
-    mmap: memmap2::MmapMut,
+    mmap: RawMmap,
     config: PubSubConfig,
     path: PathBuf,
     /// (uri_hash, topic_idx) cache for O(1) lookup after registration.
@@ -263,43 +264,65 @@ impl ShmPublisher {
         // to create — otherwise we'd split subscribers across two regions.
         if path.exists() {
             if let Ok(file) = std::fs::OpenOptions::new().read(true).open(&path) {
-                if let Ok(mmap) = unsafe { memmap2::Mmap::map(&file) } {
-                    if mmap.len() >= GLOBAL_HEADER_SIZE
-                        && &mmap[0..8] == MAGIC
-                        && u32::from_le_bytes(mmap[GH_VERSION..GH_VERSION + 4].try_into().unwrap())
-                            == VERSION
-                    {
-                        let hb_atom =
-                            unsafe { &*(mmap.as_ptr().add(GH_HEARTBEAT) as *const AtomicU64) };
-                        let hb = hb_atom.load(Ordering::Acquire);
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_micros() as u64;
+                if let Ok(mmap) = RawMmapReadOnly::from_file(&file) {
+                    if mmap.len() >= GLOBAL_HEADER_SIZE {
+                        // Read magic and version via raw pointers — no &[u8] to
+                        // shared memory.
+                        let mut magic_buf = [0u8; 8];
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                mmap.as_ptr().add(GH_MAGIC),
+                                magic_buf.as_mut_ptr(),
+                                8,
+                            );
+                        }
+                        let mut ver_buf = [0u8; 4];
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                mmap.as_ptr().add(GH_VERSION),
+                                ver_buf.as_mut_ptr(),
+                                4,
+                            );
+                        }
+                        let version = u32::from_le_bytes(ver_buf);
 
-                        // Use the EXISTING region's stale timeout, not our config's.
-                        // A live publisher with a longer heartbeat_interval must not
-                        // be mistaken for stale by a new publisher with a shorter timeout.
-                        let existing_stale_us = u64::from_le_bytes(
-                            mmap[GH_STALE_TIMEOUT_US..GH_STALE_TIMEOUT_US + 8]
-                                .try_into()
-                                .unwrap_or([0; 8]),
-                        );
-                        // Heartbeat and now are both in microseconds.
-                        // Fall back to our config timeout if the existing region
-                        // has no stored timeout (legacy or zeroed).
-                        let stale_us = if existing_stale_us > 0 {
-                            existing_stale_us
-                        } else {
-                            config.stale_timeout.as_micros() as u64
-                        };
+                        if &magic_buf == MAGIC && version == VERSION {
+                            let hb_atom =
+                                unsafe { &*(mmap.as_ptr().add(GH_HEARTBEAT) as *const AtomicU64) };
+                            let hb = hb_atom.load(Ordering::Acquire);
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_micros() as u64;
 
-                        if now.saturating_sub(hb) <= stale_us {
-                            // Release lock before returning error
-                            drop(lock_file);
-                            return Err(CrossbarError::ShmInvalidRegion(format!(
-                                "pub/sub region '{name}' is already active (heartbeat is fresh)"
-                            )));
+                            // Use the EXISTING region's stale timeout, not our config's.
+                            // A live publisher with a longer heartbeat_interval must not
+                            // be mistaken for stale by a new publisher with a shorter timeout.
+                            let mut stale_buf = [0u8; 8];
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    mmap.as_ptr().add(GH_STALE_TIMEOUT_US),
+                                    stale_buf.as_mut_ptr(),
+                                    8,
+                                );
+                            }
+                            let existing_stale_us = u64::from_le_bytes(stale_buf);
+                            // Heartbeat and now are both in microseconds.
+                            // Fall back to our config timeout if the existing region
+                            // has no stored timeout (legacy or zeroed).
+                            let stale_us = if existing_stale_us > 0 {
+                                existing_stale_us
+                            } else {
+                                config.stale_timeout.as_micros() as u64
+                            };
+
+                            if now.saturating_sub(hb) <= stale_us {
+                                // Release lock before returning error
+                                drop(lock_file);
+                                return Err(CrossbarError::ShmInvalidRegion(format!(
+                                    "pub/sub region '{name}' is already active (heartbeat is fresh)"
+                                )));
+                            }
                         }
                     }
                 }
@@ -330,12 +353,8 @@ impl ShmPublisher {
         // Pre-set inode; updated after rename below.
         let created_ino = file.metadata().map(|m| m.ino()).unwrap_or(0);
 
-        let mmap = unsafe {
-            memmap2::MmapOptions::new()
-                .len(size)
-                .map_mut(&file)
-                .map_err(|e| CrossbarError::ShmInvalidRegion(format!("mmap: {e}")))?
-        };
+        let mmap = RawMmap::from_file_with_len(&file, size)
+            .map_err(|e| CrossbarError::ShmInvalidRegion(format!("mmap: {e}")))?;
 
         let heartbeat_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -363,22 +382,37 @@ impl ShmPublisher {
             created_ino,
         };
 
-        // Write global header
-        pub_.mmap[GH_MAGIC..GH_MAGIC + 8].copy_from_slice(MAGIC);
-        pub_.mmap[GH_VERSION..GH_VERSION + 4].copy_from_slice(&VERSION.to_le_bytes());
-        pub_.mmap[GH_MAX_TOPICS..GH_MAX_TOPICS + 4]
-            .copy_from_slice(&pub_.config.max_topics.to_le_bytes());
-        pub_.mmap[GH_SAMPLE_CAPACITY..GH_SAMPLE_CAPACITY + 4]
-            .copy_from_slice(&pub_.config.sample_capacity.to_le_bytes());
-        pub_.mmap[GH_RING_DEPTH..GH_RING_DEPTH + 4]
-            .copy_from_slice(&pub_.config.ring_depth.to_le_bytes());
+        // Write global header via raw pointers — no &mut [u8] to shared memory.
+        unsafe {
+            let base = pub_.mmap.as_mut_ptr();
+            std::ptr::copy_nonoverlapping(MAGIC.as_ptr(), base.add(GH_MAGIC), 8);
+            std::ptr::copy_nonoverlapping(VERSION.to_le_bytes().as_ptr(), base.add(GH_VERSION), 4);
+            std::ptr::copy_nonoverlapping(
+                pub_.config.max_topics.to_le_bytes().as_ptr(),
+                base.add(GH_MAX_TOPICS),
+                4,
+            );
+            std::ptr::copy_nonoverlapping(
+                pub_.config.sample_capacity.to_le_bytes().as_ptr(),
+                base.add(GH_SAMPLE_CAPACITY),
+                4,
+            );
+            std::ptr::copy_nonoverlapping(
+                pub_.config.ring_depth.to_le_bytes().as_ptr(),
+                base.add(GH_RING_DEPTH),
+                4,
+            );
 
-        let pid = std::process::id() as u64;
-        pub_.mmap[GH_PID..GH_PID + 8].copy_from_slice(&pid.to_le_bytes());
+            let pid = std::process::id() as u64;
+            std::ptr::copy_nonoverlapping(pid.to_le_bytes().as_ptr(), base.add(GH_PID), 8);
 
-        let stale_us = pub_.config.stale_timeout.as_micros() as u64;
-        pub_.mmap[GH_STALE_TIMEOUT_US..GH_STALE_TIMEOUT_US + 8]
-            .copy_from_slice(&stale_us.to_le_bytes());
+            let stale_us = pub_.config.stale_timeout.as_micros() as u64;
+            std::ptr::copy_nonoverlapping(
+                stale_us.to_le_bytes().as_ptr(),
+                base.add(GH_STALE_TIMEOUT_US),
+                8,
+            );
+        }
 
         pub_.update_heartbeat();
 
@@ -409,7 +443,7 @@ impl ShmPublisher {
                 Ok(f) => f,
                 Err(_) => return,
             };
-            let mmap = match unsafe { memmap2::MmapMut::map_mut(&file) } {
+            let mmap = match RawMmap::from_file(&file) {
                 Ok(m) => m,
                 Err(_) => return,
             };
@@ -464,9 +498,17 @@ impl ShmPublisher {
         for &(h, idx) in &self.topics {
             if h == hash {
                 let off = topic_entry_off(idx);
-                let stored_len = self.mmap[off + TE_URI_LEN] as usize;
-                let stored_uri = &self.mmap[off + TE_URI_STR..off + TE_URI_STR + stored_len];
-                if stored_uri == uri.as_bytes() {
+                let stored_len =
+                    unsafe { self.mmap.as_ptr().add(off + TE_URI_LEN).read() } as usize;
+                let mut stored_buf = [0u8; MAX_URI_LEN];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        self.mmap.as_ptr().add(off + TE_URI_STR),
+                        stored_buf.as_mut_ptr(),
+                        stored_len,
+                    );
+                }
+                if &stored_buf[..stored_len] == uri.as_bytes() {
                     return Ok(TopicHandle {
                         topic_idx: idx,
                         publisher_id: self.id,
@@ -480,12 +522,21 @@ impl ShmPublisher {
             let active = unsafe { &*(self.mmap.as_ptr().add(off + TE_ACTIVE) as *const AtomicU32) };
 
             if active.load(Ordering::Acquire) == 0 {
-                // Write topic metadata
-                self.mmap[off + TE_URI_HASH..off + TE_URI_HASH + 8]
-                    .copy_from_slice(&hash.to_le_bytes());
-                self.mmap[off + TE_URI_LEN] = uri.len() as u8;
-                self.mmap[off + TE_URI_STR..off + TE_URI_STR + uri.len()]
-                    .copy_from_slice(uri.as_bytes());
+                // Write topic metadata via raw pointers
+                unsafe {
+                    let base = self.mmap.as_mut_ptr();
+                    std::ptr::copy_nonoverlapping(
+                        hash.to_le_bytes().as_ptr(),
+                        base.add(off + TE_URI_HASH),
+                        8,
+                    );
+                    base.add(off + TE_URI_LEN).write(uri.len() as u8);
+                    std::ptr::copy_nonoverlapping(
+                        uri.as_bytes().as_ptr(),
+                        base.add(off + TE_URI_STR),
+                        uri.len(),
+                    );
+                }
 
                 // Zero write_seq
                 let ws =
@@ -522,9 +573,17 @@ impl ShmPublisher {
             .filter(|(h, _)| *h == hash)
             .find(|(_, idx)| {
                 let off = topic_entry_off(*idx);
-                let stored_len = self.mmap[off + TE_URI_LEN] as usize;
-                let stored_uri = &self.mmap[off + TE_URI_STR..off + TE_URI_STR + stored_len];
-                stored_uri == uri.as_bytes()
+                let stored_len =
+                    unsafe { self.mmap.as_ptr().add(off + TE_URI_LEN).read() } as usize;
+                let mut stored_buf = [0u8; MAX_URI_LEN];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        self.mmap.as_ptr().add(off + TE_URI_STR),
+                        stored_buf.as_mut_ptr(),
+                        stored_len,
+                    );
+                }
+                &stored_buf[..stored_len] == uri.as_bytes()
             })
             .map(|(_, i)| *i)
             .ok_or_else(|| {
@@ -750,7 +809,7 @@ impl<'a> io::Write for ShmLoan<'a> {
 /// }
 /// ```
 pub struct ShmSubscriber {
-    mmap: Arc<memmap2::Mmap>,
+    mmap: Arc<RawMmapReadOnly>,
     config: PubSubConfig,
 }
 
@@ -787,33 +846,41 @@ impl ShmSubscriber {
             .open(&path)
             .map_err(|e| CrossbarError::ShmInvalidRegion(format!("open: {e}")))?;
 
-        let mmap = unsafe {
-            memmap2::Mmap::map(&file)
-                .map_err(|e| CrossbarError::ShmInvalidRegion(format!("mmap: {e}")))?
-        };
+        let mmap = RawMmapReadOnly::from_file(&file)
+            .map_err(|e| CrossbarError::ShmInvalidRegion(format!("mmap: {e}")))?;
 
-        // Validate header
-        if mmap.len() < GLOBAL_HEADER_SIZE || &mmap[0..8] != MAGIC {
+        // Validate header via raw pointers — no &[u8] to shared memory.
+        if mmap.len() < GLOBAL_HEADER_SIZE {
             return Err(CrossbarError::ShmInvalidRegion(
                 "magic mismatch (not a crossbar pub/sub region)".into(),
             ));
         }
-        let version = u32::from_le_bytes(mmap[GH_VERSION..GH_VERSION + 4].try_into().unwrap());
+        let mut magic_buf = [0u8; 8];
+        unsafe {
+            std::ptr::copy_nonoverlapping(mmap.as_ptr().add(GH_MAGIC), magic_buf.as_mut_ptr(), 8);
+        }
+        if &magic_buf != MAGIC {
+            return Err(CrossbarError::ShmInvalidRegion(
+                "magic mismatch (not a crossbar pub/sub region)".into(),
+            ));
+        }
+        let version = unsafe { (mmap.as_ptr().add(GH_VERSION) as *const u32).read_unaligned() };
+        let version = u32::from_le(version);
         if version != VERSION {
             return Err(CrossbarError::ShmInvalidRegion(format!(
                 "version mismatch: expected {VERSION}, got {version}"
             )));
         }
 
-        let max_topics =
-            u32::from_le_bytes(mmap[GH_MAX_TOPICS..GH_MAX_TOPICS + 4].try_into().unwrap());
-        let sample_capacity = u32::from_le_bytes(
-            mmap[GH_SAMPLE_CAPACITY..GH_SAMPLE_CAPACITY + 4]
-                .try_into()
-                .unwrap(),
-        );
-        let ring_depth =
-            u32::from_le_bytes(mmap[GH_RING_DEPTH..GH_RING_DEPTH + 4].try_into().unwrap());
+        let max_topics = u32::from_le(unsafe {
+            (mmap.as_ptr().add(GH_MAX_TOPICS) as *const u32).read_unaligned()
+        });
+        let sample_capacity = u32::from_le(unsafe {
+            (mmap.as_ptr().add(GH_SAMPLE_CAPACITY) as *const u32).read_unaligned()
+        });
+        let ring_depth = u32::from_le(unsafe {
+            (mmap.as_ptr().add(GH_RING_DEPTH) as *const u32).read_unaligned()
+        });
         if ring_depth == 0 {
             return Err(CrossbarError::ShmInvalidRegion(
                 "on-disk ring_depth is 0 (corrupted metadata)".into(),
@@ -827,11 +894,9 @@ impl ShmSubscriber {
         let effective_stale = if let Some(t) = caller_timeout {
             t
         } else {
-            let stored_stale_us = u64::from_le_bytes(
-                mmap[GH_STALE_TIMEOUT_US..GH_STALE_TIMEOUT_US + 8]
-                    .try_into()
-                    .unwrap_or([0; 8]),
-            );
+            let stored_stale_us = u64::from_le(unsafe {
+                (mmap.as_ptr().add(GH_STALE_TIMEOUT_US) as *const u64).read_unaligned()
+            });
             if stored_stale_us > 0 {
                 Duration::from_micros(stored_stale_us)
             } else {
@@ -898,22 +963,28 @@ impl ShmSubscriber {
                 continue;
             }
 
-            let stored = u64::from_le_bytes(
-                self.mmap[off + TE_URI_HASH..off + TE_URI_HASH + 8]
-                    .try_into()
-                    .unwrap(),
-            );
+            let stored = u64::from_le(unsafe {
+                (self.mmap.as_ptr().add(off + TE_URI_HASH) as *const u64).read_unaligned()
+            });
 
             if stored == hash {
                 // Full URI comparison to guard against hash collisions.
-                let stored_len = self.mmap[off + TE_URI_LEN] as usize;
+                let stored_len =
+                    unsafe { self.mmap.as_ptr().add(off + TE_URI_LEN).read() } as usize;
                 if stored_len > MAX_URI_LEN {
                     return Err(CrossbarError::ShmInvalidRegion(format!(
                         "topic {idx} has invalid URI length {stored_len} (max {MAX_URI_LEN})"
                     )));
                 }
-                let stored_uri = &self.mmap[off + TE_URI_STR..off + TE_URI_STR + stored_len];
-                if stored_uri != uri.as_bytes() {
+                let mut stored_buf = [0u8; MAX_URI_LEN];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        self.mmap.as_ptr().add(off + TE_URI_STR),
+                        stored_buf.as_mut_ptr(),
+                        stored_len,
+                    );
+                }
+                if &stored_buf[..stored_len] != uri.as_bytes() {
                     continue; // hash collision, keep searching
                 }
 
@@ -941,7 +1012,7 @@ impl ShmSubscriber {
 
 /// A subscription to one pub/sub topic. Yields zero-copy [`ShmSample`]s.
 pub struct ShmSubscription {
-    mmap: Arc<memmap2::Mmap>,
+    mmap: Arc<RawMmapReadOnly>,
     config: PubSubConfig,
     topic_idx: u32,
     last_seq: u64,
@@ -982,21 +1053,26 @@ impl ShmSubscription {
         Some(ShmSample { data: data.into() })
     }
 
-    /// Zero-allocation non-blocking recv. Returns a borrowed reference
+    /// Zero-allocation non-blocking recv. Returns a borrowed view
     /// directly into mmap — no `Arc::clone`, no heap, pure pointer.
     /// This is the iceoryx-equivalent read path.
     ///
-    /// **Caveat:** because this returns a raw mmap pointer, a fast publisher
-    /// can overwrite the underlying ring slot. Process data immediately
-    /// or use [`try_recv`](Self::try_recv) for guaranteed consistency.
+    /// The returned [`ShmSampleRef`] does **not** implement `Deref` or
+    /// `AsRef<[u8]>` because the publisher can overwrite the ring slot
+    /// concurrently. Use [`ShmSampleRef::copy_to_vec`] for a safe
+    /// snapshot, or [`ShmSampleRef::as_bytes_unchecked`] if you can
+    /// guarantee no concurrent writes.
+    ///
+    /// For guaranteed consistency without unsafe, prefer
+    /// [`try_recv`](Self::try_recv).
     #[inline]
     pub fn try_recv_ref(&mut self) -> Option<ShmSampleRef<'_>> {
         self.sync_inflight();
         let (s_off, data_len) = self.next_sample_inner()?;
         Some(ShmSampleRef {
-            mmap: &self.mmap,
-            offset: s_off + SAMPLE_HEADER_SIZE,
+            data_ptr: unsafe { self.mmap.as_ptr().add(s_off + SAMPLE_HEADER_SIZE) },
             len: data_len,
+            _marker: std::marker::PhantomData,
         })
     }
 
@@ -1234,9 +1310,17 @@ impl ShmSubscription {
             return None;
         }
 
-        // Copy data while we're inside the seqlock window
+        // Copy data while we're inside the seqlock window — via raw pointer,
+        // not &[u8], because the publisher can write concurrently.
         let data_start = s_off + SAMPLE_HEADER_SIZE;
-        let data = self.mmap[data_start..data_start + data_len].to_vec();
+        let mut data = vec![0u8; data_len];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.mmap.as_ptr().add(data_start),
+                data.as_mut_ptr(),
+                data_len,
+            );
+        }
 
         // Final seqlock check: if the slot was overwritten during our copy,
         // the data is inconsistent — discard it.
@@ -1326,38 +1410,72 @@ impl std::fmt::Debug for ShmSample {
     }
 }
 
-/// Borrowed zero-copy view into a sample. No `Arc::clone`, no heap —
-/// just a pointer into mmap. Returned by [`ShmSubscription::try_recv_ref`].
+/// Borrowed zero-copy view into a sample in shared memory. No `Arc::clone`,
+/// no heap — just a raw pointer into mmap.
 ///
-/// The reference is valid as long as the [`ShmSubscription`] is alive
-/// and no new `try_recv_ref` call has been made. Like [`ShmSample`],
-/// the underlying ring slot can be overwritten by a fast publisher —
-/// process data immediately for maximum correctness.
+/// Returned by [`ShmSubscription::try_recv_ref`].
+///
+/// `Deref` and `AsRef<[u8]>` are intentionally **not** implemented because
+/// the underlying ring slot can be overwritten by a concurrent publisher at
+/// any time. Creating `&[u8]` to memory with active data races is undefined
+/// behavior under Rust's aliasing model.
+///
+/// Use [`copy_to_vec`](Self::copy_to_vec) for a safe owned copy, or
+/// [`as_bytes_unchecked`](Self::as_bytes_unchecked) when you can guarantee
+/// no concurrent writes (e.g., publisher is paused or ring depth is large
+/// enough).
 pub struct ShmSampleRef<'a> {
-    mmap: &'a memmap2::Mmap,
-    offset: usize,
+    /// Raw pointer to the start of the sample data within the mmap region.
+    data_ptr: *const u8,
     len: usize,
+    /// Ties the lifetime to the subscription's mmap.
+    _marker: std::marker::PhantomData<&'a RawMmapReadOnly>,
 }
+
+// SAFETY: The underlying mmap is Send+Sync (shared memory mediated by atomics).
+// ShmSampleRef only reads via raw pointer and is bounded by the mmap lifetime.
+unsafe impl Send for ShmSampleRef<'_> {}
+unsafe impl Sync for ShmSampleRef<'_> {}
 
 impl ShmSampleRef<'_> {
     /// Raw byte length of the sample data.
     pub fn data_len(&self) -> usize {
         self.len
     }
-}
 
-impl AsRef<[u8]> for ShmSampleRef<'_> {
-    #[inline]
-    fn as_ref(&self) -> &[u8] {
-        &self.mmap[self.offset..self.offset + self.len]
+    /// Copies the sample data into a new `Vec<u8>`.
+    ///
+    /// This is the safe way to consume the data — the copy is a snapshot
+    /// that cannot be torn by a concurrent publisher write.
+    pub fn copy_to_vec(&self) -> Vec<u8> {
+        let mut buf = vec![0u8; self.len];
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.data_ptr, buf.as_mut_ptr(), self.len);
+        }
+        buf
     }
-}
 
-impl std::ops::Deref for ShmSampleRef<'_> {
-    type Target = [u8];
-    #[inline]
-    fn deref(&self) -> &[u8] {
-        self.as_ref()
+    /// Returns a raw const pointer to the sample data.
+    pub fn as_ptr(&self) -> *const u8 {
+        self.data_ptr
+    }
+
+    /// Returns the sample data as a byte slice **without** checking for
+    /// concurrent writes.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee that no other process is concurrently
+    /// writing to this ring slot for the duration of the returned
+    /// reference. In practice this means either:
+    /// - The publisher has been paused or dropped, or
+    /// - The ring depth is large enough that the publisher cannot wrap
+    ///   around to this slot during the reference's lifetime.
+    ///
+    /// Violating this invariant is undefined behavior (data race on
+    /// `&[u8]`).
+    pub unsafe fn as_bytes_unchecked(&self) -> &[u8] {
+        std::slice::from_raw_parts(self.data_ptr, self.len)
     }
 }
 

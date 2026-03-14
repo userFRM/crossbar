@@ -353,12 +353,12 @@ let client = ShmClient::connect("myapp").await?;
 let resp = client.get("/tick").await?;
 ```
 
-**How it works:** The server creates a memory-mapped region at `/dev/shm/crossbar-{name}`. The V2 architecture uses a block pool allocator (Treiber stack) for data blocks, with separate coordination slots for the request/response state machine. Reads are zero-copy via `Bytes::from_owner`.
+**How it works:** The server creates a memory-mapped region at `/dev/shm/crossbar-{name}` using direct `libc::mmap` with `MADV_HUGEPAGE` (transparent 2 MiB huge pages for TLB efficiency). The V2 architecture uses a block pool allocator (Treiber stack) for data blocks, with separate coordination slots for the request/response state machine. Reads are zero-copy via `Bytes::from_owner`.
 
 | Detail | Value |
 |---|---|
 | Coordination slots | 64 (configurable via `ShmConfig::slot_count`) |
-| Block count | 128 (configurable via `ShmConfig::block_count`) |
+| Block count | 192 (configurable via `ShmConfig::block_count`) |
 | Block size | 64 KiB (configurable via `ShmConfig::block_size`) |
 | Synchronization | spin → futex_wait (Linux) / poll (macOS) |
 | Crash recovery | Server heartbeat + stale slot CAS recovery |
@@ -428,6 +428,7 @@ crossbar/
       inproc.rs         InProcessClient (direct dispatch)
       shm/
         mod.rs          ShmServer, ShmClient, ShmHandle
+        mmap.rs         Raw libc::mmap wrappers (MAP_POPULATE, MADV_HUGEPAGE)
         region.rs       V2 memory-mapped region, block pool allocator
         notify.rs       Futex (Linux) / polling (macOS) wait/wake
         pubsub.rs       ShmPublisher, ShmSubscriber (zero-copy pub/sub)

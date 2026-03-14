@@ -38,12 +38,12 @@ pub enum CrossbarError {
     #[cfg(feature = "shm")]
     ShmServerDead,
 
-    /// The request payload exceeds the shared-memory slot capacity.
+    /// The request payload exceeds the shared-memory block capacity.
     #[cfg(feature = "shm")]
     ShmMessageTooLarge {
         /// Total request size in bytes.
         size: usize,
-        /// Configured slot data capacity.
+        /// Configured block data capacity.
         max: usize,
     },
 
@@ -59,7 +59,7 @@ pub enum CrossbarError {
     #[cfg(feature = "shm")]
     ShmInvalidRegion(String),
 
-    /// A header key, value, or count exceeds the u16 limit of the wire protocol.
+    /// A header key, value, or count exceeds the `u16` limit of the wire protocol.
     HeaderOverflow(String),
 }
 
@@ -78,7 +78,7 @@ impl fmt::Display for CrossbarError {
             CrossbarError::ShmMessageTooLarge { size, max } => {
                 write!(
                     f,
-                    "shared-memory message too large: {size} bytes (slot capacity {max})"
+                    "shared-memory message too large: {size} bytes (block capacity {max})"
                 )
             }
             #[cfg(feature = "shm")]

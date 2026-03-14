@@ -1,5 +1,6 @@
 #![allow(unsafe_code)]
 
+mod mmap;
 mod notify;
 mod pubsub;
 mod region;
@@ -14,7 +15,7 @@ use crate::error::CrossbarError;
 use crate::router::Router;
 use crate::types::{Method, Request, Response};
 use bytes::Bytes;
-use region::{ShmRegion, FREE, PROCESSING, REQUEST_READY, RESPONSE_READY};
+use region::{ShmRegion, FREE, NO_BLOCK, PROCESSING, REQUEST_READY, RESPONSE_READY};
 use std::io;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -24,12 +25,31 @@ use std::time::Duration;
 ///
 /// Returned by [`ShmServer::spawn`] and [`ShmServer::spawn_with_config`].
 /// Dropping this handle signals the server's polling loop to exit.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use crossbar::prelude::*;
+///
+/// # #[tokio::main] async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// async fn health() -> &'static str { "ok" }
+/// let router = Router::new().route("/health", get(health));
+///
+/// let handle = ShmServer::spawn("myapp", router).await?;
+/// // Server runs in the background...
+/// handle.stop(); // explicitly stop, or let `handle` drop
+/// # Ok(())
+/// # }
+/// ```
 pub struct ShmHandle {
     stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ShmHandle {
     /// Signals the server to stop.
+    ///
+    /// This is idempotent — calling it multiple times is safe. The server
+    /// exits at the end of its current poll iteration.
     pub fn stop(&self) {
         self.stop.store(true, std::sync::atomic::Ordering::Release);
     }
@@ -66,11 +86,23 @@ pub struct ShmServer;
 
 impl ShmServer {
     /// Creates the shared memory region and serves requests forever.
+    ///
+    /// This is a blocking call that returns only when the server is shut down.
+    /// For non-blocking usage, see [`ShmServer::spawn`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`io::Error`] if the shared memory region cannot be created
+    /// (e.g., permission denied, file system full).
     pub async fn bind(name: &str, router: Router) -> io::Result<()> {
         Self::bind_with_config(name, router, ShmConfig::default()).await
     }
 
-    /// Like `bind` but with custom configuration.
+    /// Like [`ShmServer::bind`] but with custom [`ShmConfig`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`io::Error`] if the shared memory region cannot be created.
     pub async fn bind_with_config(name: &str, router: Router, config: ShmConfig) -> io::Result<()> {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         Self::serve(name, router, config, stop).await
@@ -78,11 +110,20 @@ impl ShmServer {
 
     /// Spawns the server in a background task and returns an [`ShmHandle`]
     /// that stops the server when dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`io::Error`] if the shared memory region cannot be created.
     pub async fn spawn(name: &str, router: Router) -> io::Result<ShmHandle> {
         Self::spawn_with_config(name, router, ShmConfig::default()).await
     }
 
-    /// Like `spawn` but with custom configuration.
+    /// Like [`ShmServer::spawn`] but with custom [`ShmConfig`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`io::Error`] if the shared memory region cannot be created.
+    #[allow(clippy::unused_async)] // async for API consistency with other SHM methods
     pub async fn spawn_with_config(
         name: &str,
         router: Router,
@@ -164,6 +205,7 @@ impl ShmServer {
         });
     }
 
+    #[allow(clippy::single_match_else)] // match arms have complex side effects
     fn poll_loop(
         region: &Arc<ShmRegion>,
         router: &Router,
@@ -188,28 +230,27 @@ impl ShmServer {
                     region.touch_slot(slot_idx);
 
                     // Read request from block — O(1) zero-copy body
-                    let req = match region.read_request_from_block(slot_idx) {
-                        Ok(r) => r,
-                        Err(_) => {
-                            // Malformed request — allocate a response block for the error
-                            let resp = Response::bad_request("malformed shm request");
-                            match region.alloc_block() {
-                                Some(resp_block_idx) => {
-                                    region.write_response_to_block(slot_idx, resp_block_idx, &resp);
-                                }
-                                None => {
-                                    // Pool exhausted even for error response.
-                                    // Set a minimal response in the slot metadata.
-                                    region.set_response_status(slot_idx, 503);
-                                    region.set_response_body_len(slot_idx, 0);
-                                    region.set_response_headers_data_len(slot_idx, 0);
-                                    region.set_response_block_idx(slot_idx, u32::MAX);
-                                }
-                            }
-                            state.store(RESPONSE_READY, Ordering::Release);
-                            notify::wake_one(state);
-                            continue;
+                    let Ok(req) = region.read_request_from_block(slot_idx) else {
+                        // Malformed request — the block was already freed inside
+                        // read_request_from_block (bounds-check error path).
+                        // Clear the slot's request block index to prevent double-free
+                        // by stale recovery.
+                        region.set_request_block_idx(slot_idx, NO_BLOCK);
+                        // Allocate a response block for the error
+                        let resp = Response::bad_request("malformed shm request");
+                        if let Some(resp_block_idx) = region.alloc_block() {
+                            region.write_response_to_block(slot_idx, resp_block_idx, &resp);
+                        } else {
+                            // Pool exhausted even for error response.
+                            // Set a minimal response in the slot metadata.
+                            region.set_response_status(slot_idx, 503);
+                            region.set_response_body_len(slot_idx, 0);
+                            region.set_response_headers_data_len(slot_idx, 0);
+                            region.set_response_block_idx(slot_idx, u32::MAX);
                         }
+                        state.store(RESPONSE_READY, Ordering::Release);
+                        notify::wake_one(state);
+                        continue;
                     };
 
                     // Dispatch through router
@@ -218,17 +259,14 @@ impl ShmServer {
                     // req dropped here → request block freed back to pool
 
                     // Allocate response block and write response
-                    match region.alloc_block() {
-                        Some(resp_block_idx) => {
-                            region.write_response_to_block(slot_idx, resp_block_idx, &resp);
-                        }
-                        None => {
-                            // Pool exhausted for response
-                            region.set_response_status(slot_idx, 503);
-                            region.set_response_body_len(slot_idx, 0);
-                            region.set_response_headers_data_len(slot_idx, 0);
-                            region.set_response_block_idx(slot_idx, u32::MAX);
-                        }
+                    if let Some(resp_block_idx) = region.alloc_block() {
+                        region.write_response_to_block(slot_idx, resp_block_idx, &resp);
+                    } else {
+                        // Pool exhausted for response
+                        region.set_response_status(slot_idx, 503);
+                        region.set_response_body_len(slot_idx, 0);
+                        region.set_response_headers_data_len(slot_idx, 0);
+                        region.set_response_block_idx(slot_idx, u32::MAX);
                     }
                     state.store(RESPONSE_READY, Ordering::Release);
                     notify::wake_one(state);
@@ -266,11 +304,29 @@ pub struct ShmClient {
 
 impl ShmClient {
     /// Connects to an existing shared memory region.
+    ///
+    /// Uses the default stale timeout of 5 seconds. For a custom timeout, use
+    /// [`ShmClient::connect_with_timeout`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CrossbarError::Io`] if the shared memory file cannot be
+    /// opened, [`CrossbarError::ShmInvalidRegion`] if the region header is
+    /// invalid, or [`CrossbarError::ShmServerDead`] if the server heartbeat
+    /// is stale.
     pub async fn connect(name: &str) -> Result<Self, CrossbarError> {
         Self::connect_with_timeout(name, Duration::from_secs(5)).await
     }
 
     /// Connects with a custom stale timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CrossbarError::Io`] if the shared memory file cannot be
+    /// opened, [`CrossbarError::ShmInvalidRegion`] if the region header is
+    /// invalid, or [`CrossbarError::ShmServerDead`] if the server heartbeat
+    /// is stale.
+    #[allow(clippy::unused_async)] // async for API consistency with other SHM methods
     pub async fn connect_with_timeout(
         name: &str,
         stale_timeout: Duration,
@@ -278,7 +334,9 @@ impl ShmClient {
         let region = ShmRegion::open(name)?;
         region.check_heartbeat(stale_timeout)?;
 
-        let client_id = std::process::id() as u64
+        // Truncating nanos to u64 is intentional — only used for uniqueness.
+        #[allow(clippy::cast_possible_truncation)]
+        let client_id = u64::from(std::process::id())
             ^ (std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -292,6 +350,15 @@ impl ShmClient {
     }
 
     /// Sends a request via shared memory and waits for the response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CrossbarError::ShmServerDead`] if the server heartbeat is
+    /// stale or the response times out, [`CrossbarError::ShmPoolExhausted`]
+    /// if no data blocks are available, [`CrossbarError::ShmSlotsFull`] if
+    /// all coordination slots are occupied, or
+    /// [`CrossbarError::ShmMessageTooLarge`] if the request exceeds block
+    /// capacity.
     pub async fn request(&self, req: Request) -> Result<Response, CrossbarError> {
         // Check server is alive
         self.region.check_heartbeat(self.stale_timeout)?;
@@ -350,12 +417,20 @@ impl ShmClient {
                     break;
                 }
                 if std::time::Instant::now() >= deadline {
-                    let _ = state.compare_exchange(
-                        REQUEST_READY,
-                        FREE,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    );
+                    if state
+                        .compare_exchange(REQUEST_READY, FREE, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        // We reclaimed the slot — free the request block.
+                        let req_block = region.request_block_idx(slot_idx);
+                        if req_block != NO_BLOCK {
+                            region.free_block(req_block);
+                        }
+                        region.set_request_block_idx(slot_idx, NO_BLOCK);
+                        region.set_response_block_idx(slot_idx, NO_BLOCK);
+                    }
+                    // If CAS failed the server owns the slot (PROCESSING);
+                    // leave it for stale recovery to clean up.
                     return Err(CrossbarError::ShmServerDead);
                 }
                 if current == PROCESSING || current == REQUEST_READY {
@@ -375,6 +450,11 @@ impl ShmClient {
                 region.read_response_from_block(slot_idx)
             };
 
+            // Clear block indices before releasing the slot so that stale
+            // recovery cannot observe stale indices and double-free the blocks.
+            region.set_request_block_idx(slot_idx, NO_BLOCK);
+            region.set_response_block_idx(slot_idx, NO_BLOCK);
+
             // Release slot
             state.store(FREE, Ordering::Release);
             notify::wake_one(state);
@@ -388,11 +468,19 @@ impl ShmClient {
     }
 
     /// Convenience method for `GET` requests.
+    ///
+    /// # Errors
+    ///
+    /// See [`ShmClient::request`] for the full list of error conditions.
     pub async fn get(&self, uri: &str) -> Result<Response, CrossbarError> {
         self.request(Request::new(Method::Get, uri)).await
     }
 
     /// Convenience method for `POST` requests with a body.
+    ///
+    /// # Errors
+    ///
+    /// See [`ShmClient::request`] for the full list of error conditions.
     pub async fn post(&self, uri: &str, body: impl Into<Bytes>) -> Result<Response, CrossbarError> {
         self.request(Request::new(Method::Post, uri).with_body(body))
             .await

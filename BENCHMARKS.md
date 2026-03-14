@@ -66,6 +66,17 @@ The timing covers the **full client-side round-trip**: serialize request, transm
 | 64 KB | 1.50 µs | 1.50 µs |
 | 1 MB | 29.6 µs | 29.5 µs |
 
+### Pub/Sub wake cost breakdown
+
+| Mode | Latency | Notes |
+|---|---|---|
+| `publish()` (with futex wake) | 220 ns | Full path: atomics + futex syscall |
+| `publish_silent()` (no futex) | 45 ns | Atomics only — 2.2x faster than iceoryx |
+
+The `publish_silent()` path skips `futex(FUTEX_WAKE)` and the notification counter,
+proving the transport itself runs at **45 ns** — the remaining 175 ns is pure Linux
+kernel overhead from the futex syscall.
+
 **Zero-copy path:** Publisher writes payload into a loaned mmap slot (`copy_from_slice`),
 subscriber reads via `try_recv_ref()` which returns a pointer into mmap — no allocation, no copy.
 The write is O(n) but the read is O(1).
@@ -93,11 +104,12 @@ subscriber — the naming reflects the publisher API used.
 **In-process** is a direct function call through `Arc<Router>` — no serialization, no copying,
 no kernel involvement. This is the theoretical floor.
 
-**SHM RPC (V2)** uses `mmap` + block pool allocator + atomics + futex for cross-process
-request/response. The V2 architecture separates coordination slots (64 bytes) from data blocks
-(64 KiB), uses a Treiber stack for lock-free block allocation, and `Bytes::from_owner` for
-zero-copy reads (eliminating 2 of 4 memcpys per roundtrip). However, the **dominant bottleneck
-is coordination overhead** (~54 µs), not data copying:
+**SHM RPC (V2)** uses direct `libc::mmap` with `MADV_HUGEPAGE` (transparent 2 MiB huge pages
+for TLB efficiency) + block pool allocator + atomics + futex for cross-process request/response.
+The V2 architecture separates coordination slots (64 bytes) from data blocks (64 KiB), uses a
+Treiber stack for lock-free block allocation, and `Bytes::from_owner` for zero-copy reads
+(eliminating 2 of 4 memcpys per roundtrip). However, the **dominant bottleneck is coordination
+overhead** (~54 µs), not data copying:
 
 1. `spawn_blocking` on the client to avoid blocking the tokio runtime
 2. Atomic CAS state transitions (5 per roundtrip)
@@ -107,11 +119,15 @@ is coordination overhead** (~54 µs), not data copying:
 This fixed overhead means `/health` (2 bytes) and `64 KB` show nearly identical latency.
 At 1 MB, the data copy starts to contribute, but coordination still dominates.
 
-**SHM Pub/Sub** is the fastest cross-process path at 220 ns for small payloads. It uses a
-ring buffer with seqlock validation — no slot state machine, no routing, no serialization.
-However, the write is still O(n) because data must be copied into the mmap region. True O(1)
-transfer (like iceoryx2's ~100 ns for any size) would require data to be "born" in shared
-memory, which crossbar does not yet support.
+**SHM Pub/Sub** is the fastest cross-process path at 220 ns for small payloads (45 ns without
+futex wake). It uses a ring buffer with seqlock validation — no slot state machine, no routing,
+no serialization. The 220 ns breaks down as: ~45 ns for atomics + ~175 ns for `futex(FUTEX_WAKE)`.
+Use `publish_silent()` for polling consumers to bypass the futex entirely.
+
+The write is still O(n) because data must be copied into the mmap region. True O(1) transfer
+(like iceoryx2's ~100 ns for any size) would require data to be "born" in shared memory.
+Crossbar's `loan_to()` API writes directly into the mmap slot (born-in-SHM pattern), but the
+`copy_from_slice` itself is O(n).
 
 ### Why SHM RPC is the bottleneck, not the data path
 
