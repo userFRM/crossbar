@@ -1,11 +1,13 @@
 #![allow(unsafe_code)]
 
+mod bidi;
 mod mmap;
 mod notify;
 mod pool_pubsub;
 mod pubsub;
 pub(crate) mod region;
 
+pub use bidi::{BidiClient, BidiConfig, BidiServer};
 #[allow(unused_imports)] // used by consumers, not internally
 pub use pool_pubsub::{
     PoolPubSubConfig, PoolTopicHandle, ShmPoolPublisher, ShmPoolSampleGuard, ShmPoolSubscriber,

@@ -1322,3 +1322,172 @@ fn pool_pubsub_sequential_consistency() {
     }
     assert!(last.is_some(), "should have received at least one sample");
 }
+
+// ─── Bidirectional (RPC + Events) ──────────────────────────────────────────
+
+#[cfg(all(unix, feature = "shm"))]
+#[tokio::test]
+async fn bidi_rpc_and_events() {
+    let name = &format!("test-bidi-basic-{}", std::process::id());
+    let router = Router::new().route("/health", get(|| async { "ok" }));
+    let mut server = BidiServer::spawn(name, router).await.unwrap();
+
+    // Register event topic
+    let topic = server.register("/prices/AAPL").unwrap();
+
+    // Client connects and subscribes BEFORE publishing
+    let client = BidiClient::connect(name).await.unwrap();
+    let mut sub = client.subscribe("/prices/AAPL").unwrap();
+
+    // RPC works
+    let resp = client.get("/health").await.unwrap();
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body_str(), "ok");
+
+    // Publish event after subscriber is connected
+    let mut loan = server.loan(&topic);
+    loan.set_data(b"150.25");
+    loan.publish();
+
+    // Event subscription works
+    let sample = sub.try_recv().unwrap();
+    assert_eq!(&*sample, b"150.25");
+}
+
+#[cfg(all(unix, feature = "shm"))]
+#[tokio::test]
+async fn bidi_multiple_topics() {
+    let name = &format!("test-bidi-multi-{}", std::process::id());
+    let router = Router::new().route("/ping", get(|| async { "pong" }));
+    let mut server = BidiServer::spawn(name, router).await.unwrap();
+
+    let t1 = server.register("/events/a").unwrap();
+    let t2 = server.register("/events/b").unwrap();
+
+    let client = BidiClient::connect(name).await.unwrap();
+    let mut sub_a = client.subscribe("/events/a").unwrap();
+    let mut sub_b = client.subscribe("/events/b").unwrap();
+
+    // Publish to topic A
+    let mut loan = server.loan(&t1);
+    loan.set_data(b"alpha");
+    loan.publish();
+
+    // Publish to topic B
+    let mut loan = server.loan(&t2);
+    loan.set_data(b"beta");
+    loan.publish();
+
+    // Each subscription sees its own topic
+    assert_eq!(&*sub_a.try_recv().unwrap(), b"alpha");
+    assert_eq!(&*sub_b.try_recv().unwrap(), b"beta");
+
+    // RPC still works
+    let resp = client.get("/ping").await.unwrap();
+    assert_eq!(resp.body_str(), "pong");
+}
+
+#[cfg(all(unix, feature = "shm"))]
+#[tokio::test]
+async fn bidi_streaming_events() {
+    let name = &format!("test-bidi-stream-{}", std::process::id());
+    let router = Router::new().route("/health", get(|| async { "ok" }));
+    let mut server = BidiServer::spawn(name, router).await.unwrap();
+
+    let topic = server.register("/ticks").unwrap();
+
+    let client = BidiClient::connect(name).await.unwrap();
+    let mut sub = client.subscribe("/ticks").unwrap();
+
+    // Stream 50 events
+    for i in 0u32..50 {
+        let mut loan = server.loan(&topic);
+        loan.set_data(&i.to_le_bytes());
+        loan.publish();
+    }
+
+    // Read all available events
+    let mut count = 0u32;
+    while let Some(sample) = sub.try_recv() {
+        let val = u32::from_le_bytes(sample[..4].try_into().unwrap());
+        assert!(val < 50);
+        count += 1;
+    }
+    assert!(count > 0, "should have received at least one event");
+}
+
+#[cfg(all(unix, feature = "shm"))]
+#[tokio::test]
+async fn bidi_rpc_during_events() {
+    let name = &format!("test-bidi-interleave-{}", std::process::id());
+    let router = Router::new()
+        .route("/health", get(|| async { "ok" }))
+        .route(
+            "/echo",
+            post(|req: Request| async move { Response::ok().with_body(req.body.clone()) }),
+        );
+    let mut server = BidiServer::spawn(name, router).await.unwrap();
+    let topic = server.register("/updates").unwrap();
+
+    let client = BidiClient::connect(name).await.unwrap();
+    let mut sub = client.subscribe("/updates").unwrap();
+
+    // Interleave RPC and events
+    for i in 0u32..10 {
+        // Push event
+        let mut loan = server.loan(&topic);
+        loan.set_data(&i.to_le_bytes());
+        loan.publish();
+
+        // Make RPC call
+        let resp = client
+            .post("/echo", format!("msg-{i}").into_bytes())
+            .await
+            .unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body_str(), format!("msg-{i}"));
+    }
+
+    // Should have received events
+    let mut count = 0;
+    while sub.try_recv().is_some() {
+        count += 1;
+    }
+    assert!(count > 0);
+}
+
+#[cfg(all(unix, feature = "shm"))]
+#[tokio::test]
+async fn bidi_custom_config() {
+    let name = &format!("test-bidi-config-{}", std::process::id());
+    let config = BidiConfig {
+        rpc: ShmConfig {
+            slot_count: 8,
+            block_count: 24,
+            ..ShmConfig::default()
+        },
+        events: PoolPubSubConfig {
+            max_topics: 4,
+            block_count: 32,
+            ..PoolPubSubConfig::default()
+        },
+    };
+    let router = Router::new().route("/health", get(|| async { "ok" }));
+    let mut server = BidiServer::spawn_with_config(name, router, config)
+        .await
+        .unwrap();
+
+    let topic = server.register("/events/test").unwrap();
+
+    let client = BidiClient::connect(name).await.unwrap();
+    let mut sub = client.subscribe("/events/test").unwrap();
+
+    let resp = client.get("/health").await.unwrap();
+    assert_eq!(resp.status, 200);
+
+    let mut loan = server.loan(&topic);
+    loan.set_data(b"configured");
+    loan.publish();
+
+    assert_eq!(&*sub.try_recv().unwrap(), b"configured");
+}
