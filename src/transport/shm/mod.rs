@@ -605,8 +605,9 @@ impl ShmClient {
         slot_idx: u32,
     ) -> Result<Response, CrossbarError> {
         // CAS to claim the slot — prevents race with stale recovery.
-        // PROCESSING is skipped by recover_stale_slots and not targeted
-        // by try_acquire_slot, so this is a safe intermediate state.
+        // PROCESSING is skipped by recover_stale_slots (active work) and
+        // not targeted by try_acquire_slot (CASes from FREE only), so
+        // this is a safe intermediate state that protects the read.
         if region
             .slot_state(slot_idx)
             .compare_exchange(

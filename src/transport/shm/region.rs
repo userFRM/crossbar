@@ -1213,7 +1213,11 @@ impl ShmRegion {
             let state = self.slot_state(i);
             let current = state.load(Ordering::Acquire);
 
-            if current == FREE {
+            // Skip FREE (nothing to do) and PROCESSING (server or client
+            // is actively working on the slot — freeing blocks would cause
+            // use-after-free). If the server dies mid-PROCESSING, the client
+            // detects it via heartbeat and returns ShmServerDead.
+            if current == FREE || current == PROCESSING {
                 continue;
             }
 
