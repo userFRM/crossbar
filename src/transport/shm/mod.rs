@@ -2,9 +2,15 @@
 
 mod mmap;
 mod notify;
+mod pool_pubsub;
 mod pubsub;
 pub(crate) mod region;
 
+#[allow(unused_imports)] // used by consumers, not internally
+pub use pool_pubsub::{
+    PoolPubSubConfig, PoolTopicHandle, ShmPoolPublisher, ShmPoolSampleGuard, ShmPoolSubscriber,
+    ShmPoolSubscription,
+};
 pub use pubsub::{
     PubSubConfig, ShmLoan, ShmPublisher, ShmSample, ShmSampleRef, ShmSubscriber, ShmSubscription,
     TopicHandle,

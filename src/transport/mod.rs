@@ -17,8 +17,9 @@ pub(crate) mod shm;
 pub use inproc::InProcessClient;
 #[cfg(all(unix, feature = "shm"))]
 pub use shm::{
-    PubSubConfig, ShmClient, ShmConfig, ShmHandle, ShmLoan, ShmPublisher, ShmSample, ShmSampleRef,
-    ShmServer, ShmSubscriber, ShmSubscription, TopicHandle,
+    PoolPubSubConfig, PoolTopicHandle, PubSubConfig, ShmClient, ShmConfig, ShmHandle, ShmLoan,
+    ShmPoolPublisher, ShmPoolSampleGuard, ShmPoolSubscriber, ShmPoolSubscription, ShmPublisher,
+    ShmSample, ShmSampleRef, ShmServer, ShmSubscriber, ShmSubscription, TopicHandle,
 };
 
 #[cfg(feature = "shm")]

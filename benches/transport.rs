@@ -492,6 +492,118 @@ fn bench_throughput(c: &mut Criterion) {
 }
 
 // ====================================================
+// 5. Pool pub/sub -- O(1) zero-copy (shm feature)
+// ====================================================
+
+#[cfg(all(unix, feature = "shm"))]
+fn bench_pool_pubsub(c: &mut Criterion) {
+    let ps_name = "crossbar-bench-pool-ps";
+    let cfg = PoolPubSubConfig {
+        block_size: 1_048_576 + 8, // 1 MB data + 8B header
+        block_count: 64,
+        ring_depth: 8,
+        ..PoolPubSubConfig::default()
+    };
+    let mut pub_ = ShmPoolPublisher::create(ps_name, cfg).unwrap();
+    let h_8b = pub_.register("/bench/8b").unwrap();
+    let h_64kb = pub_.register("/bench/64kb").unwrap();
+    let h_1mb = pub_.register("/bench/1mb").unwrap();
+
+    let sub = ShmPoolSubscriber::connect(ps_name).unwrap();
+    let mut s_8b = sub.subscribe("/bench/8b").unwrap();
+    let mut s_64kb = sub.subscribe("/bench/64kb").unwrap();
+    let mut s_1mb = sub.subscribe("/bench/1mb").unwrap();
+
+    let payload_64kb = vec![42u8; 65_536];
+    let payload_1mb = vec![42u8; 1_048_576];
+
+    // -- O(1) transfer: born-in-SHM + safe Deref read --
+    {
+        let mut group = c.benchmark_group("pool_pubsub_o1");
+        group.measurement_time(Duration::from_secs(1));
+
+        // 8 bytes — measures pure O(1) transfer overhead
+        group.bench_function("8B", |b| {
+            b.iter(|| {
+                let mut loan = pub_.loan(&h_8b);
+                loan.as_mut_slice()[..8].copy_from_slice(&42u64.to_le_bytes());
+                loan.set_len(8);
+                loan.publish();
+                let g = s_8b.try_recv().unwrap();
+                black_box(&*g); // safe Deref!
+            })
+        });
+
+        // 64 KB — same O(1) ring transfer, different write cost
+        group.bench_function("64KB", |b| {
+            b.iter(|| {
+                let mut loan = pub_.loan(&h_64kb);
+                loan.as_mut_slice()[..payload_64kb.len()].copy_from_slice(&payload_64kb);
+                loan.set_len(payload_64kb.len());
+                loan.publish();
+                let g = s_64kb.try_recv().unwrap();
+                black_box(&*g);
+            })
+        });
+
+        // 1 MB
+        group.bench_function("1MB", |b| {
+            b.iter(|| {
+                let mut loan = pub_.loan(&h_1mb);
+                loan.as_mut_slice()[..payload_1mb.len()].copy_from_slice(&payload_1mb);
+                loan.set_len(payload_1mb.len());
+                loan.publish();
+                let g = s_1mb.try_recv().unwrap();
+                black_box(&*g);
+            })
+        });
+
+        group.finish();
+    }
+
+    // -- Throughput --
+    {
+        let mut group = c.benchmark_group("throughput_pool_pubsub");
+        group.measurement_time(Duration::from_secs(3));
+
+        group.throughput(Throughput::Bytes(65_536));
+        group.bench_function("64kb", |b| {
+            b.iter(|| {
+                let mut loan = pub_.loan(&h_64kb);
+                loan.as_mut_slice()[..payload_64kb.len()].copy_from_slice(&payload_64kb);
+                loan.set_len(payload_64kb.len());
+                loan.publish();
+                let g = s_64kb.try_recv().unwrap();
+                black_box(&*g);
+            })
+        });
+
+        group.finish();
+    }
+
+    {
+        let mut group = c.benchmark_group("throughput_pool_pubsub_1mb");
+        group.throughput(Throughput::Bytes(1_048_576));
+        group.measurement_time(Duration::from_secs(3));
+
+        group.bench_function("1mb", |b| {
+            b.iter(|| {
+                let mut loan = pub_.loan(&h_1mb);
+                loan.as_mut_slice()[..payload_1mb.len()].copy_from_slice(&payload_1mb);
+                loan.set_len(payload_1mb.len());
+                loan.publish();
+                let g = s_1mb.try_recv().unwrap();
+                black_box(&*g);
+            })
+        });
+
+        group.finish();
+    }
+
+    drop(pub_);
+}
+
+// ====================================================
 
 criterion_group!(
     benches_common,
@@ -507,7 +619,15 @@ criterion_group!(benches_shm, bench_shm,);
 criterion_group!(benches_pubsub, bench_pubsub,);
 
 #[cfg(all(unix, feature = "shm"))]
-criterion_main!(benches_common, benches_shm, benches_pubsub);
+criterion_group!(benches_pool_pubsub, bench_pool_pubsub,);
+
+#[cfg(all(unix, feature = "shm"))]
+criterion_main!(
+    benches_common,
+    benches_shm,
+    benches_pubsub,
+    benches_pool_pubsub
+);
 
 #[cfg(not(all(unix, feature = "shm")))]
 criterion_main!(benches_common);
