@@ -740,6 +740,11 @@ impl ShmClient {
 
         // Check if body is born-in-SHM (already in a pool block)
         let direct_block = if let Body::ShmDirect(ref mut guard) = req.body {
+            // Verify the block belongs to this client's region (provenance check)
+            assert!(
+                Arc::ptr_eq(&guard.region, &self.region),
+                "ShmDirect body belongs to a different SHM region"
+            );
             Some((guard.take_block_idx(), guard.body_len))
         } else {
             None
@@ -765,9 +770,7 @@ impl ShmClient {
                     break idx;
                 }
                 if std::time::Instant::now() >= deadline {
-                    if direct_block.is_none() {
-                        self.region.free_block(req_block_idx);
-                    }
+                    self.region.free_block(req_block_idx);
                     return Err(CrossbarError::ShmSlotsFull);
                 }
                 tokio::task::yield_now().await;

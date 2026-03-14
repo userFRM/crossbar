@@ -352,7 +352,11 @@ impl ShmResponseLoan {
     /// Sets the number of bytes actually written to the block.
     #[inline]
     pub fn set_len(&mut self, len: usize) {
-        debug_assert!(len <= self.capacity());
+        assert!(
+            len <= self.capacity(),
+            "set_len({len}) exceeds capacity ({})",
+            self.capacity()
+        );
         self.body_len = len;
     }
 

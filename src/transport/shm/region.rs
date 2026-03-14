@@ -860,19 +860,9 @@ impl ShmRegion {
             }
         }
 
-        // Body at offset 0 — zero-copy via Body::Mmap
-        let body = if body_len == 0 {
-            Body::Empty
-        } else {
-            Body::Mmap(ShmBodyGuard {
-                region: Arc::clone(self),
-                block_idx,
-                offset: 0,
-                len: body_len,
-            })
-        };
-
-        // URI after body
+        // Parse URI and headers BEFORE creating Body::Mmap to avoid
+        // double-free: if we created Body::Mmap first, then free_block on
+        // error, the Mmap guard would also free on drop.
         let uri_slice = self.block_slice(block_idx, body_len, uri_len);
         let Ok(uri_str) = std::str::from_utf8(uri_slice) else {
             self.free_block(block_idx);
@@ -882,7 +872,6 @@ impl ShmRegion {
             )));
         };
 
-        // Headers after URI
         let headers_off = body_len + uri_len;
         let headers = if headers_data_len == 0 {
             std::collections::HashMap::new()
@@ -895,6 +884,19 @@ impl ShmRegion {
                     return Err(e);
                 }
             }
+        };
+
+        // Body at offset 0 — zero-copy via Body::Mmap
+        // Created after URI/headers parsing so block ownership is clear.
+        let body = if body_len == 0 {
+            Body::Empty
+        } else {
+            Body::Mmap(ShmBodyGuard {
+                region: Arc::clone(self),
+                block_idx,
+                offset: 0,
+                len: body_len,
+            })
         };
 
         let mut req = Request::new(method, uri_str).with_body(body);
