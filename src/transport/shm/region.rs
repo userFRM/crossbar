@@ -185,10 +185,11 @@ impl ShmRegion {
                 "block_count must be > 0".into(),
             ));
         }
-        if config.block_size == 0 {
-            return Err(CrossbarError::ShmInvalidRegion(
-                "block_size must be > 0".into(),
-            ));
+        if config.block_size < 64 {
+            return Err(CrossbarError::ShmInvalidRegion(format!(
+                "block_size must be >= 64 (got {})",
+                config.block_size
+            )));
         }
         let path = shm_path(name);
         let size = region_size(config)
@@ -325,6 +326,11 @@ impl ShmRegion {
                 return Err(CrossbarError::ShmInvalidRegion(format!(
                     "region size {} < expected {expected_size}",
                     mmap.len()
+                )));
+            }
+            if block_size < 64 {
+                return Err(CrossbarError::ShmInvalidRegion(format!(
+                    "block_size must be >= 64 (got {block_size})"
                 )));
             }
 

@@ -738,28 +738,9 @@ impl ShmClient {
             self.region.check_heartbeat(self.stale_timeout)?;
         }
 
-        // Check if body is born-in-SHM (already in a pool block)
-        let direct_block = if let Body::ShmDirect(ref mut guard) = req.body {
-            // Verify the block belongs to this client's region (provenance check)
-            assert!(
-                Arc::ptr_eq(&guard.region, &self.region),
-                "ShmDirect body belongs to a different SHM region"
-            );
-            Some((guard.take_block_idx(), guard.body_len))
-        } else {
-            None
-        };
-
-        // Allocate a request block from the pool (unless born-in-SHM)
-        let req_block_idx = if let Some((block_idx, _)) = direct_block {
-            block_idx
-        } else {
-            self.region
-                .alloc_block()
-                .ok_or(CrossbarError::ShmPoolExhausted)?
-        };
-
-        // Acquire a slot — try once without Instant::now() (saves ~25 ns)
+        // Acquire a slot FIRST — before any block allocation.
+        // This ensures no block is held across an await point (yield_now),
+        // preventing block leaks on async cancellation.
         let slot_idx = if let Some(idx) = self.region.try_acquire_slot(self.client_id) {
             idx
         } else {
@@ -770,15 +751,35 @@ impl ShmClient {
                     break idx;
                 }
                 if std::time::Instant::now() >= deadline {
-                    self.region.free_block(req_block_idx);
                     return Err(CrossbarError::ShmSlotsFull);
                 }
                 tokio::task::yield_now().await;
             }
         };
 
+        // Slot acquired — no more await points until response wait.
+        // Now safe to extract/allocate the block.
+        let (req_block_idx, direct_body_len) = if let Body::ShmDirect(ref mut guard) = req.body {
+            // Verify the block belongs to this client's region (provenance check)
+            assert!(
+                Arc::ptr_eq(&guard.region, &self.region),
+                "ShmDirect body belongs to a different SHM region"
+            );
+            (guard.take_block_idx(), Some(guard.body_len))
+        } else {
+            match self.region.alloc_block() {
+                Some(idx) => (idx, None),
+                None => {
+                    self.region
+                        .slot_state(slot_idx)
+                        .store(FREE, Ordering::Release);
+                    return Err(CrossbarError::ShmPoolExhausted);
+                }
+            }
+        };
+
         // Write request into block (state is WRITING from try_acquire_slot)
-        let write_result = if let Some((_, body_len)) = direct_block {
+        let write_result = if let Some(body_len) = direct_body_len {
             // Born-in-SHM: body already at offset 0, just append URI + headers
             self.region.write_request_direct(
                 slot_idx,
