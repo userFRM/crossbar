@@ -21,6 +21,7 @@ use crate::error::CrossbarError;
 use crate::router::Router;
 use crate::types::{Body, Method, Request, Response};
 use region::{ShmRegion, FREE, NO_BLOCK, PROCESSING, REQUEST_READY, RESPONSE_READY};
+use std::future::Future;
 use std::io;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -210,7 +211,27 @@ impl ShmServer {
         });
     }
 
-    #[allow(clippy::single_match_else)] // match arms have complex side effects
+    /// Dispatches a request, bypassing tokio when the handler resolves immediately.
+    ///
+    /// Most handlers resolve on first poll (no yield points). For these,
+    /// a single `poll()` with a no-op waker is sufficient — no tokio runtime
+    /// context needed. Only truly async handlers (that return `Pending`) fall
+    /// back to `block_on`.
+    #[inline]
+    fn dispatch_fast(
+        router: &Router,
+        req: Request,
+        rt_handle: &tokio::runtime::Handle,
+    ) -> Response {
+        let mut fut = std::pin::pin!(router.dispatch(req));
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        match fut.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(resp) => resp,
+            std::task::Poll::Pending => rt_handle.block_on(fut),
+        }
+    }
+
     fn poll_loop(
         region: &Arc<ShmRegion>,
         router: &Router,
@@ -234,47 +255,33 @@ impl ShmServer {
                     found_work = true;
                     region.touch_slot(slot_idx);
 
-                    // Read request from block — O(1) zero-copy body
                     let Ok(req) = region.read_request_from_block(slot_idx) else {
-                        // Malformed request — the block was already freed inside
-                        // read_request_from_block (bounds-check error path).
-                        // Clear the slot's request block index to prevent double-free
-                        // by stale recovery.
                         region.set_request_block_idx(slot_idx, NO_BLOCK);
-                        // Allocate a response block for the error
                         let resp = Response::bad_request("malformed shm request");
                         if let Some(resp_block_idx) = region.alloc_block() {
                             region.write_response_to_block(slot_idx, resp_block_idx, &resp);
                         } else {
-                            // Pool exhausted even for error response.
-                            // Set a minimal response in the slot metadata.
                             region.set_response_status(slot_idx, 503);
                             region.set_response_body_len(slot_idx, 0);
                             region.set_response_headers_data_len(slot_idx, 0);
                             region.set_response_block_idx(slot_idx, u32::MAX);
                         }
                         state.store(RESPONSE_READY, Ordering::Release);
-                        // No wake needed — client poller spins, not futex-waits.
                         continue;
                     };
 
-                    // Dispatch through router
-                    // (request body Body::Mmap holds ShmBodyGuard — block freed when req dropped)
-                    let resp = rt_handle.block_on(router.dispatch(req));
-                    // req dropped here → request block freed back to pool
+                    // Try-poll: skip tokio for sync-like handlers
+                    let resp = Self::dispatch_fast(router, req, rt_handle);
 
-                    // Allocate response block and write response
                     if let Some(resp_block_idx) = region.alloc_block() {
                         region.write_response_to_block(slot_idx, resp_block_idx, &resp);
                     } else {
-                        // Pool exhausted for response
                         region.set_response_status(slot_idx, 503);
                         region.set_response_body_len(slot_idx, 0);
                         region.set_response_headers_data_len(slot_idx, 0);
                         region.set_response_block_idx(slot_idx, u32::MAX);
                     }
                     state.store(RESPONSE_READY, Ordering::Release);
-                    // No wake needed — client poller spins, not futex-waits.
                 }
             }
 
@@ -291,6 +298,108 @@ struct InflightRequest {
     tx: Option<tokio::sync::oneshot::Sender<Result<Response, CrossbarError>>>,
     deadline: std::time::Instant,
 }
+
+// -- Poller wake mechanism (eventfd on Linux, pipe on other Unix) --
+
+/// Zero-latency wake for the poller thread.
+///
+/// Uses `eventfd` on Linux (single fd, 8-byte counter) or a self-pipe on
+/// other Unix. Either way, `wake()` is a single write syscall and
+/// `try_drain()` is a non-blocking read that resets the wake signal.
+struct PollerWake {
+    #[cfg(target_os = "linux")]
+    fd: std::os::fd::OwnedFd,
+    #[cfg(all(unix, not(target_os = "linux")))]
+    read_fd: std::os::fd::OwnedFd,
+    #[cfg(all(unix, not(target_os = "linux")))]
+    write_fd: std::os::fd::OwnedFd,
+}
+
+#[cfg(target_os = "linux")]
+impl PollerWake {
+    fn new() -> io::Result<Self> {
+        use std::os::fd::FromRawFd;
+        // SAFETY: eventfd returns a valid fd or -1 on error.
+        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fd is valid (checked above).
+        Ok(Self {
+            fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) },
+        })
+    }
+
+    /// Signal the poller thread to wake up (non-blocking, idempotent).
+    fn wake(&self) {
+        use std::os::fd::AsRawFd;
+        let val: u64 = 1;
+        // SAFETY: writing 8 bytes to an eventfd is well-defined.
+        unsafe {
+            libc::write(
+                self.fd.as_raw_fd(),
+                std::ptr::from_ref(&val).cast(),
+                std::mem::size_of::<u64>(),
+            );
+        }
+    }
+
+    /// Drain the eventfd counter (non-blocking). Returns true if a wake
+    /// was pending.
+    fn try_drain(&self) -> bool {
+        use std::os::fd::AsRawFd;
+        let mut val: u64 = 0;
+        // SAFETY: reading 8 bytes from an eventfd is well-defined.
+        let n = unsafe {
+            libc::read(
+                self.fd.as_raw_fd(),
+                std::ptr::from_mut(&mut val).cast(),
+                std::mem::size_of::<u64>(),
+            )
+        };
+        n > 0
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+impl PollerWake {
+    fn new() -> io::Result<Self> {
+        use std::os::fd::FromRawFd;
+        let mut fds = [0i32; 2];
+        // SAFETY: pipe2 writes two valid fds or returns -1.
+        let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fds are valid (checked above).
+        Ok(Self {
+            read_fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) },
+            write_fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[1]) },
+        })
+    }
+
+    fn wake(&self) {
+        use std::os::fd::AsRawFd;
+        let buf: [u8; 1] = [1];
+        // SAFETY: writing 1 byte to a pipe is well-defined.
+        unsafe {
+            libc::write(self.write_fd.as_raw_fd(), buf.as_ptr().cast(), 1);
+        }
+    }
+
+    fn try_drain(&self) -> bool {
+        use std::os::fd::AsRawFd;
+        let mut buf = [0u8; 64];
+        // SAFETY: reading from a pipe is well-defined.
+        let n = unsafe { libc::read(self.read_fd.as_raw_fd(), buf.as_mut_ptr().cast(), 64) };
+        n > 0
+    }
+}
+
+// Send + Sync are safe: the fd(s) are only accessed via atomic-like
+// read/write syscalls (no shared mutable state).
+unsafe impl Send for PollerWake {}
+unsafe impl Sync for PollerWake {}
 
 /// Shared-memory IPC client (V2 — dedicated poller, zero-copy reads).
 ///
@@ -317,15 +426,18 @@ pub struct ShmClient {
     stale_timeout: Duration,
     poller_tx: std::sync::mpsc::Sender<InflightRequest>,
     poller_stop: Arc<std::sync::atomic::AtomicBool>,
+    poller_wake: Arc<PollerWake>,
     poller_thread: Option<std::thread::JoinHandle<()>>,
+    /// Counter-based heartbeat: only check every 1024 requests (like pub/sub).
+    request_count: std::sync::atomic::AtomicU32,
 }
 
 impl Drop for ShmClient {
     fn drop(&mut self) {
         self.poller_stop
             .store(true, std::sync::atomic::Ordering::Release);
+        self.poller_wake.wake();
         if let Some(handle) = self.poller_thread.take() {
-            handle.thread().unpark();
             let _ = handle.join();
         }
     }
@@ -374,15 +486,22 @@ impl ShmClient {
 
         let region = Arc::new(region);
         let poller_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let poller_wake = Arc::new(PollerWake::new().map_err(CrossbarError::Io)?);
         let (poller_tx, poller_rx) = std::sync::mpsc::channel::<InflightRequest>();
 
         // Spawn dedicated poller thread
         let poller_region = Arc::clone(&region);
         let poller_stop_clone = Arc::clone(&poller_stop);
+        let poller_wake_clone = Arc::clone(&poller_wake);
         let poller_thread = std::thread::Builder::new()
             .name("crossbar-poller".into())
             .spawn(move || {
-                Self::poller_loop(poller_region, poller_rx, poller_stop_clone);
+                Self::poller_loop(
+                    poller_region,
+                    poller_rx,
+                    poller_stop_clone,
+                    poller_wake_clone,
+                );
             })
             .map_err(CrossbarError::Io)?;
 
@@ -392,29 +511,50 @@ impl ShmClient {
             stale_timeout,
             poller_tx,
             poller_stop,
+            poller_wake,
             poller_thread: Some(poller_thread),
+            request_count: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
+    /// Adaptive spin constants for the poller loop.
+    const SPIN_ITERS: u32 = 64;
+    const YIELD_ITERS: u32 = 8;
+    const PARK_MIN_US: u64 = 50;
+    const PARK_MAX_US: u64 = 5000;
+
     /// Dedicated response poller — runs on its own OS thread.
     ///
-    /// Spins/yields checking in-flight slots for RESPONSE_READY, avoiding
-    /// the ~15-20 µs `spawn_blocking` overhead entirely.
+    /// Uses a three-phase adaptive spin strategy:
+    /// 1. **Tight spin** (`spin_loop()`) for `SPIN_ITERS` iterations — fastest
+    ///    response detection, keeps the cache line hot.
+    /// 2. **Yield** (`yield_now()`) for `YIELD_ITERS` iterations — lets other
+    ///    threads on the same core make progress.
+    /// 3. **Park with exponential backoff** — starts at `PARK_MIN_US`, doubles
+    ///    up to `PARK_MAX_US`. Resets to phase 1 on any completed response or
+    ///    new request arrival (via eventfd/pipe wake).
     fn poller_loop(
         region: Arc<ShmRegion>,
         rx: std::sync::mpsc::Receiver<InflightRequest>,
         stop: Arc<std::sync::atomic::AtomicBool>,
+        wake: Arc<PollerWake>,
     ) {
         let mut inflight: Vec<InflightRequest> = Vec::with_capacity(16);
+        let mut miss_count: u32 = 0;
 
         while !stop.load(Ordering::Relaxed) {
+            // Check for new-request wake signal
+            let woke = wake.try_drain();
+
             // Drain new requests (non-blocking)
             while let Ok(req) = rx.try_recv() {
                 inflight.push(req);
+                miss_count = 0; // reset backoff on new work
             }
 
             if inflight.is_empty() {
-                // Nothing to poll — park until a new request arrives or stop
+                // Nothing to poll — park until a new request arrives or stop.
+                // Use park_timeout so the stop flag is checked periodically.
                 std::thread::park_timeout(Duration::from_millis(10));
                 continue;
             }
@@ -480,9 +620,27 @@ impl ShmClient {
                 true // keep polling
             });
 
-            if !any_completed && !inflight.is_empty() {
-                // Responses pending but not ready — brief yield
-                core::hint::spin_loop();
+            if any_completed || woke {
+                // Response found or new work arrived — reset adaptive backoff
+                miss_count = 0;
+            } else if !inflight.is_empty() {
+                // Adaptive three-phase backoff
+                miss_count = miss_count.saturating_add(1);
+
+                if miss_count <= Self::SPIN_ITERS {
+                    // Phase 1: tight spin — keeps cache line hot
+                    core::hint::spin_loop();
+                } else if miss_count <= Self::SPIN_ITERS + Self::YIELD_ITERS {
+                    // Phase 2: yield — let sibling hyperthreads run
+                    std::thread::yield_now();
+                } else {
+                    // Phase 3: park with exponential backoff
+                    let backoff_step = miss_count - Self::SPIN_ITERS - Self::YIELD_ITERS;
+                    let park_us = Self::PARK_MIN_US
+                        .saturating_mul(1u64.wrapping_shl(backoff_step.min(16)))
+                        .min(Self::PARK_MAX_US);
+                    std::thread::park_timeout(Duration::from_micros(park_us));
+                }
             }
         }
     }
@@ -498,8 +656,14 @@ impl ShmClient {
     /// [`CrossbarError::ShmMessageTooLarge`] if the request exceeds block
     /// capacity.
     pub async fn request(&self, req: Request) -> Result<Response, CrossbarError> {
-        // Check server is alive
-        self.region.check_heartbeat(self.stale_timeout)?;
+        // Counter-based heartbeat: only check every 1024 requests (~20 ns saved)
+        let count = self
+            .request_count
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        if count & 0x3FF == 0 {
+            self.region.check_heartbeat(self.stale_timeout)?;
+        }
 
         // Allocate a request block from the pool
         let req_block_idx = self
@@ -507,24 +671,18 @@ impl ShmClient {
             .alloc_block()
             .ok_or(CrossbarError::ShmPoolExhausted)?;
 
-        // Acquire a slot (with backoff retry)
+        // Acquire a slot (with bounded retry)
         let slot_idx = {
-            let mut attempts = 0u32;
+            let deadline = std::time::Instant::now() + Duration::from_millis(100);
             loop {
                 if let Some(idx) = self.region.try_acquire_slot(self.client_id) {
                     break idx;
                 }
-                attempts += 1;
-                if attempts > 5000 {
+                if std::time::Instant::now() >= deadline {
                     self.region.free_block(req_block_idx);
                     return Err(CrossbarError::ShmSlotsFull);
                 }
-                if attempts < 64 {
-                    tokio::task::yield_now().await;
-                } else {
-                    // Back off to let the server process and free slots
-                    tokio::time::sleep(Duration::from_micros(50)).await;
-                }
+                tokio::task::yield_now().await;
             }
         };
 
@@ -555,10 +713,8 @@ impl ShmClient {
             })
             .map_err(|_| CrossbarError::ShmServerDead)?;
 
-        // Wake the poller thread
-        if let Some(ref handle) = self.poller_thread {
-            handle.thread().unpark();
-        }
+        // Wake the poller thread via eventfd/pipe (zero-latency)
+        self.poller_wake.wake();
 
         // Await response — non-blocking in tokio
         rx.await.map_err(|_| CrossbarError::ShmServerDead)?

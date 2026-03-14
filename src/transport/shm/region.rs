@@ -8,6 +8,36 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Returns the current monotonic timestamp in milliseconds (for slot timestamps).
+///
+/// Uses `clock_gettime(CLOCK_MONOTONIC_COARSE)` on Linux for ~6 ns cost
+/// instead of `SystemTime::now()` at ~25 ns. Falls back to `Instant` on
+/// other platforms.
+#[inline]
+fn monotonic_ms() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: ts is a valid mutable pointer to a timespec struct.
+        unsafe {
+            libc::clock_gettime(libc::CLOCK_MONOTONIC_COARSE, &mut ts);
+        }
+        ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Fallback: use a process-start epoch so values are comparable.
+        use std::sync::OnceLock;
+        use std::time::Instant;
+        static EPOCH: OnceLock<Instant> = OnceLock::new();
+        let epoch = EPOCH.get_or_init(Instant::now);
+        epoch.elapsed().as_millis() as u64
+    }
+}
+
 /// Magic bytes identifying a V2 shared memory region: `XBAR_V2\0`.
 pub const MAGIC: &[u8; 8] = b"XBAR_V2\0";
 /// Wire protocol version for the shared memory region layout.
@@ -511,12 +541,11 @@ impl ShmRegion {
     }
 
     /// Updates the slot timestamp to now (offset 0x10).
-    #[allow(clippy::cast_possible_truncation)] // millis since epoch fits in u64
+    ///
+    /// Uses `monotonic_ms()` (~6 ns on Linux) instead of `SystemTime::now()`
+    /// (~25 ns) to avoid vDSO overhead on the hot path.
     pub fn touch_slot(&self, idx: u32) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let now = monotonic_ms();
         unsafe {
             let ptr = self.slot_base(idx).add(0x10);
             std::ptr::copy_nonoverlapping(now.to_le_bytes().as_ptr(), ptr, 8);
@@ -999,9 +1028,28 @@ impl ShmRegion {
 
     // -- Slot acquisition --
 
+    /// Returns a reference to the slot hint index (global header offset 0x34).
+    ///
+    /// The hint tracks the last successfully acquired slot index so that
+    /// `try_acquire_slot` can start scanning from there instead of always
+    /// starting at slot 0. This avoids O(N) worst-case scanning when
+    /// contention is low and most early slots are busy.
+    #[allow(clippy::cast_ptr_alignment)] // offset 0x34 is 4-byte aligned within the header
+    #[inline]
+    fn slot_hint(&self) -> &AtomicU32 {
+        unsafe { &*self.mmap.as_ptr().add(0x34).cast::<AtomicU32>() }
+    }
+
     /// Tries to acquire a FREE slot via CAS. Returns the slot index or None.
+    ///
+    /// Scanning starts at the hint index (last-acquired slot + 1) and wraps
+    /// around, giving O(1) amortised acquisition under low contention.
+    #[inline]
     pub fn try_acquire_slot(&self, client_id: u64) -> Option<u32> {
-        for i in 0..self.slot_count {
+        let n = self.slot_count;
+        let start = self.slot_hint().load(Ordering::Relaxed) % n;
+        for offset in 0..n {
+            let i = (start + offset) % n;
             let state = self.slot_state(i);
             if state
                 .compare_exchange(FREE, WRITING, Ordering::AcqRel, Ordering::Acquire)
@@ -1010,6 +1058,8 @@ impl ShmRegion {
                 self.set_slot_client_id(i, client_id);
                 self.slot_sequence(i).fetch_add(1, Ordering::Relaxed);
                 self.touch_slot(i);
+                // Advance the hint past this slot for the next caller.
+                self.slot_hint().store(i.wrapping_add(1), Ordering::Relaxed);
                 return Some(i);
             }
         }
@@ -1017,12 +1067,8 @@ impl ShmRegion {
     }
 
     /// Scans for stale slots and resets them to [`FREE`].
-    #[allow(clippy::cast_possible_truncation)] // millis since epoch fits in u64
     pub fn recover_stale_slots(&self, stale_timeout: Duration) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let now = monotonic_ms();
 
         for i in 0..self.slot_count {
             let state = self.slot_state(i);
