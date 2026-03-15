@@ -1,0 +1,3 @@
+[workspace]
+members = ["crossbar-ipc", "crossbar-inproc", "crossbar-macros"]
+resolver = "2"

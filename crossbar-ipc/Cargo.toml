@@ -1,0 +1,37 @@
+[package]
+name = "crossbar-ipc"
+version = "0.1.0"
+edition = "2021"
+description = "Zero-copy pub/sub over shared memory with O(1) transport."
+license = "MIT OR Apache-2.0"
+keywords = ["ipc", "shared-memory", "pubsub", "zero-copy", "streaming"]
+categories = ["network-programming"]
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.183"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
+] }
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[target.'cfg(unix)'.dev-dependencies]
+iceoryx2 = "0.8.1"
+
+[[example]]
+name = "publisher"
+
+[[example]]
+name = "subscriber"
+
+[[bench]]
+name = "pubsub"
+harness = false
