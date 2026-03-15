@@ -144,7 +144,7 @@ impl RawMmap {
         // PAGE_READWRITE creates a read-write section object.
         let mapping = unsafe {
             CreateFileMappingW(
-                handle as *mut core::ffi::c_void,
+                handle,
                 std::ptr::null(),
                 PAGE_READWRITE,
                 len_high,

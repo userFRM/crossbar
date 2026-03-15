@@ -178,7 +178,7 @@ fn exclusive_lock(file: &std::fs::File, name: &str) -> Result<(), IpcError> {
 #[cfg(windows)]
 fn exclusive_lock(file: &std::fs::File, name: &str) -> Result<(), IpcError> {
     use std::os::windows::io::AsRawHandle;
-    let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+    let handle = file.as_raw_handle();
     let mut overlapped: windows_sys::Win32::System::IO::OVERLAPPED = unsafe { std::mem::zeroed() };
     let ok = unsafe {
         windows_sys::Win32::Storage::FileSystem::LockFileEx(
@@ -216,7 +216,7 @@ fn file_identity(path: &std::path::Path) -> u64 {
         Ok(f) => f,
         Err(_) => return 0,
     };
-    let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+    let handle = file.as_raw_handle();
     let mut info: windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION =
         unsafe { std::mem::zeroed() };
     let ok = unsafe {
