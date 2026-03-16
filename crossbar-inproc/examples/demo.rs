@@ -1,212 +1,62 @@
+// Copyright (c) 2026 The Crossbar Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Kairos-style market data pub/sub demo.
+
 use crossbar_inproc::prelude::*;
+use std::sync::Arc;
+use std::thread;
 
-// -- Handlers ----
-// In-process endpoint-style dispatch.
-
-fn health() -> &'static str {
-    "ok"
-}
-
-#[derive(serde::Serialize)]
-struct OhlcData {
-    symbol: String,
-    venue: String,
-    open: f64,
-    high: f64,
-    low: f64,
-    close: f64,
+#[derive(Debug)]
+struct MarketQuote {
+    symbol: &'static str,
+    price: f64,
     volume: u64,
 }
 
-fn get_ohlc(req: Request) -> Response {
-    let symbol = req.path_param("symbol").unwrap_or("???").to_string();
-    let venue = req.query_param("venue").unwrap_or_else(|| "default".into());
-    let data = OhlcData {
-        symbol,
-        venue,
-        open: 150.25,
-        high: 155.80,
-        low: 149.10,
-        close: 153.42,
-        volume: 48_392_100,
-    };
-    let bytes = serde_json::to_vec(&data).unwrap();
-    Response::ok()
-        .with_body(bytes)
-        .with_header("content-type", "application/json")
-}
+fn main() {
+    let bus = Bus::<MarketQuote>::new();
 
-#[derive(serde::Deserialize)]
-struct OrderRequest {
-    symbol: String,
-    side: String,
-    qty: u32,
-}
+    // Pre-resolve topic handles (no hash lookup on publish)
+    let aapl_topic = bus.topic("quote:stock:AAPL");
+    let all_quotes = bus.topic("all:quotes");
 
-#[derive(serde::Serialize)]
-struct OrderResponse {
-    order_id: String,
-    symbol: String,
-    side: String,
-    qty: u32,
-    status: String,
-}
+    // Subscriber 1: AAPL-only feed
+    let aapl_sub = bus.subscribe("quote:stock:AAPL");
 
-fn create_order(req: Request) -> Response {
-    let order: OrderRequest = match serde_json::from_slice(&req.body) {
-        Ok(o) => o,
-        Err(_) => return Response::bad_request("invalid JSON body"),
-    };
-    let resp = OrderResponse {
-        order_id: "ORD-000042".into(),
-        symbol: order.symbol,
-        side: order.side,
-        qty: order.qty,
-        status: "filled".into(),
-    };
-    let bytes = serde_json::to_vec(&resp).unwrap();
-    Response::ok()
-        .with_body(bytes)
-        .with_header("content-type", "application/json")
-}
+    // Subscriber 2: all-quotes aggregator
+    let all_sub = bus.subscribe("all:quotes");
 
-// -- Main ----
+    // Publisher thread
+    let handle = thread::spawn(move || {
+        for i in 0..5 {
+            let quote = Arc::new(MarketQuote {
+                symbol: "AAPL",
+                price: 150.0 + i as f64,
+                volume: 1000 * (i + 1),
+            });
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!();
-    println!("  +==========================================================+");
-    println!("  |  CROSSBAR -- URI Router + Shared-Memory Streams          |");
-    println!("  |  In-process dispatch with the same endpoint style.       |");
-    println!("  +==========================================================+");
-    println!();
+            // Fan-out: same Arc to both topics (~3 ns per Arc::clone)
+            aapl_topic.publish(Arc::clone(&quote));
+            all_quotes.publish(quote);
+        }
+    });
 
-    // Build router once
-    let router = Router::new()
-        .route("/health", get(health))
-        .route("/v3/stock/snapshot/ohlc/:symbol", get(get_ohlc))
-        .route("/v3/stock/order", post(create_order));
+    handle.join().unwrap();
 
-    // Show registered routes
-    println!("  Routes:");
-    for (method, pattern) in router.routes_info() {
-        println!("    {:<6} {}", method, pattern);
+    // Drain AAPL subscriber
+    println!("=== AAPL subscriber ===");
+    while let Some(msg) = aapl_sub.try_recv() {
+        println!("  {} @ {:.2} vol={}", msg.symbol, msg.price, msg.volume);
     }
 
-    let order_body = serde_json::to_vec(&serde_json::json!({
-        "symbol": "AAPL", "side": "buy", "qty": 100
-    }))?;
-
-    // -- In-process ---
-    println!("\n  --- In-process (sub-us) ---");
-    let mem = InProcessClient::new(router.clone());
-
-    let r = mem.get("/health");
-    println!("    GET  /health -> {} {}", r.status, r.body_str());
-
-    {
-        let r = mem.get("/v3/stock/snapshot/ohlc/AAPL?venue=nqb");
-        println!(
-            "    GET  /v3/stock/snapshot/ohlc/AAPL -> {} {}",
-            r.status,
-            truncate(r.body_str(), 60)
-        );
-
-        let r = mem.post("/v3/stock/order", order_body.clone());
-        println!(
-            "    POST /v3/stock/order -> {} {}",
-            r.status,
-            truncate(r.body_str(), 60)
-        );
+    // Drain all-quotes subscriber
+    println!("\n=== All quotes subscriber ===");
+    while let Some(msg) = all_sub.try_recv() {
+        println!("  {} @ {:.2} vol={}", msg.symbol, msg.price, msg.volume);
     }
 
-    let r = mem.get("/nonexistent");
-    println!("    GET  /nonexistent -> {}", r.status);
-
-    // -- Latency comparison ---
-    println!("\n  --- Latency Comparison ---");
-    println!("    Warming up...");
-    let uri = "/v3/stock/snapshot/ohlc/AAPL?venue=nqb";
-    let n_warmup = 500;
-    let n_measure = 5000;
-
-    // Warm up
-    for _ in 0..n_warmup {
-        mem.get(uri);
-    }
-
-    // Measure in-process
-    let stats_mem = bench_transport(n_measure, || mem.get(uri));
-
-    println!();
-    println!(
-        "    {:<10} {:>10} {:>10} {:>10} {:>10}",
-        "Transport", "min", "avg", "p99", "max"
-    );
-    println!("    {}", "-".repeat(54));
-    print_stats("InProc", &stats_mem);
-
-    println!();
-    println!("    One router. Endpoint-style dispatch without HTTP.");
-    println!();
-
-    Ok(())
-}
-
-// -- Bench helpers ----
-
-struct Stats {
-    min_ns: u128,
-    avg_ns: u128,
-    p99_ns: u128,
-    max_ns: u128,
-}
-
-fn bench_transport<F>(n: usize, f: F) -> Stats
-where
-    F: Fn() -> Response,
-{
-    let mut times = Vec::with_capacity(n);
-    for _ in 0..n {
-        let start = std::time::Instant::now();
-        let _ = std::hint::black_box(f());
-        times.push(start.elapsed().as_nanos());
-    }
-    times.sort_unstable();
-    let sum: u128 = times.iter().sum();
-    let p99_idx = (n as f64 * 0.99) as usize;
-    Stats {
-        min_ns: times[0],
-        avg_ns: sum / n as u128,
-        p99_ns: times[p99_idx.min(n - 1)],
-        max_ns: *times.last().unwrap(),
-    }
-}
-
-fn format_duration(ns: u128) -> String {
-    if ns < 1_000 {
-        format!("{} ns", ns)
-    } else if ns < 1_000_000 {
-        format!("{:.1} us", ns as f64 / 1_000.0)
-    } else {
-        format!("{:.2} ms", ns as f64 / 1_000_000.0)
-    }
-}
-
-fn print_stats(name: &str, s: &Stats) {
-    println!(
-        "    {:<10} {:>10} {:>10} {:>10} {:>10}",
-        name,
-        format_duration(s.min_ns),
-        format_duration(s.avg_ns),
-        format_duration(s.p99_ns),
-        format_duration(s.max_ns),
-    );
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max])
-    }
+    println!("\nTopics: {:?}", bus.topics());
+    println!("AAPL drops: {}", aapl_sub.drops());
+    println!("All-quotes drops: {}", all_sub.drops());
 }

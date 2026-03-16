@@ -1,23 +1,21 @@
 [package]
 name = "crossbar-inproc"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "In-process URI router with handler dispatch."
+description = "Ultra-fast in-process pub/sub bus with type-safe topics."
 license = "MIT OR Apache-2.0"
-keywords = ["router", "dispatch", "handler", "uri"]
-categories = ["network-programming"]
+keywords = ["pubsub", "bus", "inproc", "streaming", "zero-copy"]
+categories = ["concurrency"]
 
 [dependencies]
-crossbar-macros = { path = "../crossbar-macros" }
+arc-swap = "1"
 
 [dev-dependencies]
 criterion = "0.8.2"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
 
 [[example]]
 name = "demo"
 
 [[bench]]
-name = "dispatch"
+name = "bus"
 harness = false
