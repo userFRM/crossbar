@@ -6,13 +6,14 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! # crossbar-ipc
+//! # crossbar
 //!
-//! **Zero-copy O(1) pub/sub over shared memory.**
+//! **Zero-copy pub/sub over shared memory. URI-addressed. ~55 ns.**
 //!
 //! Allocates blocks from a lock-free pool (Treiber stack), writes data
 //! directly into the mmap'd region, and transfers ownership via an 8-byte
-//! descriptor. Subscribers get safe zero-copy access through [`SampleGuard`].
+//! descriptor. Subscribers read directly from shared memory via [`SampleGuard`]
+//! — no copy, no deserialization.
 //!
 //! Supported platforms: Linux, macOS, Windows.
 //!
@@ -27,7 +28,7 @@
 //!
 //! let mut loan = pub_.loan(&topic);
 //! loan.set_data(b"hello");
-//! loan.publish();
+//! loan.publish(); // O(1) — writes 8 bytes to ring
 //! ```
 
 #![no_std]

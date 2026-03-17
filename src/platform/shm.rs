@@ -6,9 +6,7 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-#![allow(dead_code)] // Types are used by consumers; not internally cross-referenced
-
-//! SHM publisher and subscriber -- file management, lock management.
+//! SHM publisher and subscriber.
 
 use alloc::format;
 use alloc::string::ToString;

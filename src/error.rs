@@ -6,7 +6,7 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Error types for crossbar-ipc.
+//! Error types for shared-memory pub/sub operations.
 
 use core::fmt;
 

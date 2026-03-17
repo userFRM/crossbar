@@ -1,4 +1,5 @@
 /target
+/benchmarks/criterion-*/
 *.swp
 *.swo
 *~

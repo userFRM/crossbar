@@ -1,189 +1,27 @@
 # crossbar
 
 [![CI](https://github.com/userFRM/crossbar/actions/workflows/ci.yml/badge.svg)](https://github.com/userFRM/crossbar/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/crossbar.svg)](https://crates.io/crates/crossbar)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
-[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org)
 
-**Fastest zero-copy IPC. Typed pub/sub over shared memory. 58 ns transport, 4.1x faster than iceoryx2.**
+**Zero-copy pub/sub over shared memory. URI-addressed. ~55 ns end-to-end.**
 
-> [!NOTE]
-> Crossbar is **not** an HTTP server. It moves data between processes via shared
-> memory (`/dev/shm`). Think URI-addressed channels at hardware speed. If you
-> need HTTP, use [axum](https://github.com/tokio-rs/axum).
+Allocates blocks from a lock-free pool, writes data into the mmap'd region, and transfers ownership via an 8-byte descriptor. Subscribers read directly from shared memory — no copy, no deserialization.
 
 ---
 
-## What is crossbar?
+## When to use crossbar
 
-Crossbar is a single Rust crate for zero-copy pub/sub over shared memory.
-Allocates blocks from a lock-free Treiber stack pool, writes data directly into
-the mmap'd region, and transfers ownership via an 8-byte descriptor. O(1)
-transport regardless of payload size. Subscribers get safe `SampleGuard`
-references with `Deref<Target=[u8]>` -- the block is held alive by atomic
-refcounting via a seqlock ring.
+- High-frequency small messages: market data ticks, sensor readings, telemetry, game state
+- Rust-native multi-process pipelines where latency compounds (10 000+ msg/s)
+- Topics that need to be discovered at runtime by URI, not wired at compile time
+- You want one crate with no heavy dependencies
 
-### Features
+## When not to use crossbar
 
-- **O(1) transport** -- publishes an 8-byte descriptor; latency is constant regardless of payload size
-- **Zero-copy reads** -- subscribers deref directly into the mmap'd shared memory region
-- **Lock-free pool** -- Treiber stack allocation with ABA-safe generation counters
-- **URI-addressed topics** -- subscribe to `"/prices/AAPL"` by name, no compile-time wiring
-- **Typed pub/sub** -- `Pod` trait for safe zero-copy reads of structured types via `register_typed` / `loan_typed` / `try_recv_typed`
-- **Smart wake** -- futex-based notification that skips the syscall when no subscribers are waiting
-- **Cross-platform** -- Linux, macOS, Windows
-
----
-
-## Performance
-
-![crossbar vs iceoryx2 benchmark comparison](assets/benchmark_comparison.svg)
-
-**Left:** O(1) transport proof -- we write a fixed 8 bytes into backing buffers from 64 B to 1 MB. Latency is flat for both frameworks. The transfer (writing an 8-byte descriptor to a ring) is always O(1). Crossbar is **4.1x faster** (57 ns vs 231 ns).
-
-**Right:** End-to-end with full payload -- both write the entire payload into SHM before transfer. At small sizes, crossbar's lower overhead wins. At 64 KB+, both converge to the same speed because `memcpy` dominates.
-
-Both benchmarks use the same operations: `loan buffer` -> `write data` -> `publish` -> `receive` -> `deref`. Apples-to-apples, same process, same Criterion harness.
-
-> **Benchmark system:** Intel i7-10700KF @ 3.80 GHz, Linux 6.8, rustc stable.
-> iceoryx2 claims ~100 ns on an i7-13700H -- our 237 ns measurement reflects our
-> older hardware. Run on yours: `cargo bench -- "head_to_head"`
-
-| | crossbar | iceoryx2 |
-|---|---|---|
-| **Transport** | **57 ns** | ~231 ns (our hw) / ~100 ns (theirs) |
-| **Pool allocator** | Treiber stack (lock-free CAS) | Lock-free pool |
-| **Above pub/sub** | URI/topic names | Service discovery + POSIX config |
-| **API style** | URI-addressed pub/sub + typed pub/sub | Typed pub/sub channels |
-| **`no_std`** | No | Yes |
-| **Platforms** | Linux, macOS, Windows | Linux, macOS, Windows, QNX, ... |
-
-Crossbar is faster because it skips iceoryx2's service discovery and POSIX configuration layer -- it goes straight from user code to atomics.
-
----
-
-## Quick start
-
-### Byte-oriented pub/sub
-
-**Publisher** writes data directly into shared memory:
-
-```rust
-use crossbar::*;
-
-let mut pub_ = ShmPublisher::create("market", PubSubConfig::default())?;
-let topic = pub_.register("/prices/AAPL")?;
-
-let mut loan = pub_.loan(&topic);
-loan.set_data(b"42.50");
-loan.publish(); // O(1) -- writes 8 bytes to ring
-```
-
-**Subscriber** reads the data in-place -- zero copies, no `unsafe`:
-
-```rust
-use crossbar::*;
-
-let sub = ShmSubscriber::connect("market")?;
-let stream = sub.subscribe("/prices/AAPL")?;
-
-if let Some(guard) = stream.try_recv() {
-    println!("AAPL: {}", std::str::from_utf8(&guard).unwrap());
-}
-// guard dropped -> block freed back to pool
-```
-
-### Typed pub/sub
-
-The `Pod` trait enables safe zero-copy reads of structured types. Any `Copy + 'static` struct that is valid for all bit patterns can implement `Pod`.
-
-**Publisher** writes a typed value directly into shared memory:
-
-```rust
-use crossbar::*;
-
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct Tick {
-    price: f64,
-    volume: u64,
-}
-
-unsafe impl Pod for Tick {}
-
-let mut pub_ = ShmPublisher::create("market", PubSubConfig::default())?;
-let topic = pub_.register_typed::<Tick>("/prices/AAPL")?;
-
-let mut loan = pub_.loan_typed::<Tick>(&topic);
-*loan = Tick { price: 42.50, volume: 1000 };
-loan.publish();
-```
-
-**Subscriber** reads the typed value in-place:
-
-```rust
-use crossbar::*;
-
-let sub = ShmSubscriber::connect("market")?;
-let stream = sub.subscribe("/prices/AAPL")?;
-
-if let Some(guard) = stream.try_recv_typed::<Tick>() {
-    println!("AAPL: ${:.2} x {}", guard.price, guard.volume);
-}
-// TypedSampleGuard dropped -> block freed back to pool
-```
-
-### Running the examples
-
-```sh
-cargo run --example publisher
-cargo run --example subscriber
-```
-
----
-
-## How it works
-
-```mermaid
-sequenceDiagram
-    participant P as Publisher
-    participant SHM as Shared Memory<br/>(mmap)
-    participant S as Subscriber
-
-    P->>SHM: alloc block from Treiber stack (CAS)
-    P->>SHM: write data via set_data() / as_mut_slice()<br/>(born-in-SHM, no copy)
-    P->>SHM: publish() — write 8B descriptor to ring
-
-    Note over P,SHM: O(1) transfer · 57 ns
-
-    S->>SHM: try_recv() — read descriptor from ring
-    S->>SHM: CAS-increment block refcount
-    S->>SHM: seqlock re-check (detect overwrite race)
-    SHM->>S: SampleGuard — safe Deref<[u8]> into mmap
-
-    Note over S: guard dropped → refcount decremented → block freed
-```
-
-```mermaid
-graph LR
-    subgraph "Process A"
-        PUB["ShmPublisher"]
-    end
-
-    subgraph "Shared Memory (/dev/shm)"
-        POOL["Block Pool<br/>Treiber Stack"]
-        RING["Seqlock Ring<br/>8B descriptors"]
-    end
-
-    subgraph "Process B"
-        SUB["ShmSubscriber"]
-        GUARD["SampleGuard<br/>Deref<[u8]>"]
-    end
-
-    PUB -->|"loan + publish"| POOL
-    POOL -->|"descriptor"| RING
-    RING -->|"try_recv"| SUB
-    SUB -->|"CAS refcount"| GUARD
-```
+- You need C or C++ consumers — use [iceoryx2](https://github.com/eclipse-iceoryx/iceoryx2)
+- You need request/response — use a channel or iceoryx2
+- Payload > 64 KB and you're copying into the block — both frameworks are memcpy-bound at that point and latency is equal
 
 ---
 
@@ -196,73 +34,186 @@ crossbar = "0.2"
 
 ---
 
-## Configuration
+## Quick start
 
-### `PubSubConfig`
+### Byte-oriented
 
-| Field | Default | Description |
-|---|---|---|
-| `max_topics` | 16 | Maximum concurrent topics |
-| `block_count` | 256 | Pool blocks available |
-| `block_size` | 64 KiB | Bytes per block (usable: block_size - 8) |
-| `ring_depth` | 8 | Samples before overwrite |
-| `heartbeat_interval` | 100 ms | Publisher liveness signal |
-| `stale_timeout` | 5 s | Publisher considered dead after this |
+**Publisher** — write any bytes into shared memory:
+
+```rust
+use crossbar::*;
+
+let mut pub_ = ShmPublisher::create("market", PubSubConfig::default())?;
+let topic = pub_.register("/prices/AAPL")?;
+
+let mut loan = pub_.loan(&topic);
+loan.set_data(b"42.50");
+loan.publish(); // O(1) — writes 8 bytes to ring
+```
+
+**Subscriber** — read in-place, zero copies, no `unsafe`:
+
+```rust
+use crossbar::*;
+
+let sub = ShmSubscriber::connect("market")?;
+let stream = sub.subscribe("/prices/AAPL")?;
+
+if let Some(guard) = stream.try_recv() {
+    println!("{}", std::str::from_utf8(&guard).unwrap());
+} // guard drops → block freed back to pool
+```
+
+### Typed
+
+Any `Copy + 'static` struct where every bit pattern is valid can implement `Pod` for direct zero-copy reads:
+
+```rust
+use crossbar::*;
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct Tick { price: f64, volume: u64 }
+
+unsafe impl Pod for Tick {}
+
+// Publisher
+let mut pub_ = ShmPublisher::create("market", PubSubConfig::default())?;
+let topic = pub_.register_typed::<Tick>("/prices/AAPL")?;
+let mut loan = pub_.loan_typed::<Tick>(&topic);
+*loan.as_mut() = Tick { price: 42.50, volume: 1000 };
+loan.publish();
+
+// Subscriber
+let sub = ShmSubscriber::connect("market")?;
+let stream = sub.subscribe("/prices/AAPL")?;
+
+if let Some(guard) = stream.try_recv_typed::<Tick>() {
+    println!("${:.2} × {}", guard.price, guard.volume);
+}
+```
+
+### Blocking receive
+
+```rust
+// Default: three-phase spin → yield → futex/WFE
+let guard = stream.recv()?;
+
+// Or pick a strategy
+let guard = stream.recv_with(WaitStrategy::BusySpin)?;
+```
+
+### Born-in-SHM (zero-copy publish)
+
+Write directly into the pool block — no intermediate buffer, no copy at any payload size:
+
+```rust
+let mut loan = pub_.loan(&topic);
+let buf = loan.as_mut_slice();
+// write directly into shared memory
+encode_frame(&mut buf[..frame_len]);
+loan.set_len(frame_len);
+loan.publish();
+```
 
 ---
 
-## Benchmarks
+## Performance
 
-### Shared-memory pub/sub latency
+All measurements: Criterion, same-process publisher + subscriber, `try_recv` (no futex).
 
-| Mode | Latency |
-|---|---|
-| `publish()` + `try_recv()` (smart wake) | **58 ns** |
-| `publish_silent()` + `try_recv()` | **59 ns** |
+### Apple M1 Pro · macOS · rustc 1.92
 
-### Shared-memory pub/sub throughput
+| | crossbar | iceoryx2 | speedup |
+|---|---|---|---|
+| 8 B (transport overhead) | **52 ns** | 189 ns | **3.6×** |
+| 1 KB | 77 ns | 210 ns | 2.7× |
+| 64 KB | 1.27 µs | 1.35 µs | 1.1× |
+| 256 KB | 5.10 µs | 5.20 µs | ~1× |
+| 1 MB | 23.9 µs | 23.5 µs | ~1× |
 
-| Payload | Throughput |
-|---|---|
-| 64 KB | **46.7 GiB/s** |
-| 1 MB | **31.4 GiB/s** |
+### Intel i7-10700KF · Linux 6.8 · rustc stable
+
+| | crossbar | iceoryx2 | speedup |
+|---|---|---|---|
+| 8 B (transport overhead) | **57 ns** | 231 ns | **4.1×** |
+| 1 KB | 65 ns | 231 ns | 3.6× |
+| 64 KB | 1.40 µs | 1.35 µs | ~1× |
+| 1 MB | 30.8 µs | 32.0 µs | ~1× |
+
+**The win is in the overhead.** At small payloads crossbar's lighter path (no service discovery, no POSIX config layer) is 3.5–4× faster. At 64 KB+ both frameworks are memcpy-bound and converge. The 8-byte descriptor is always O(1) — payload latency scales with how long you take to write into the block.
+
+Reproduce: `cargo bench -- head_to_head` (requires `iceoryx2` dev-dep, Unix only).
+
+---
+
+## Configuration
+
+```rust
+PubSubConfig {
+    max_topics:          16,    // concurrent topics
+    block_count:        256,    // pool blocks
+    block_size:       65536,    // bytes per block (usable: block_size - 8)
+    ring_depth:           8,    // samples before overwrite
+    heartbeat_interval: 100ms,  // liveness signal period
+    stale_timeout:        5s,   // publisher dead after this
+}
+```
+
+The pool is a Treiber stack — lock-free allocation at any payload size. Blocks are refcounted; a subscriber holding a `SampleGuard` keeps the block alive.
 
 ---
 
 ## Project layout
 
 ```
-crossbar/
-  src/
-    lib.rs               Crate root, re-exports
-    pubsub.rs            ShmPublisher, ShmSubscriber, SampleGuard
-    mmap.rs              Raw mmap wrappers (MADV_HUGEPAGE)
-    notify.rs            Futex (Linux) / WaitOnAddress (Windows) / polling (macOS)
-    wait.rs              WaitStrategy for blocking recv
-    error.rs             IpcError enum
-  benches/pubsub.rs      Criterion benchmarks (incl. iceoryx2 head-to-head)
-  examples/
-    publisher.rs         Cross-process latency benchmark (publisher)
-    subscriber.rs        Cross-process latency benchmark (subscriber)
+src/
+  lib.rs                 Crate root (#![no_std], feature gates)
+  pod.rs                 Pod trait — marker for safe zero-copy SHM reads
+  error.rs               IpcError
+  wait.rs                WaitStrategy (BusySpin / YieldSpin / BackoffSpin / Adaptive)
+
+  protocol/              no_std core — pure atomics, no OS calls
+    layout.rs            SHM layout constants and offset helpers
+    config.rs            PubSubConfig
+    region.rs            Region — Treiber stack, seqlock, refcount
+
+  platform/              std only — mmap, futex, file I/O
+    mmap.rs              RawMmap (MADV_HUGEPAGE on Linux)
+    notify.rs            futex (Linux) / WaitOnAddress (Windows) / WFE (aarch64)
+    shm.rs               ShmPublisher, ShmSubscriber
+    subscription.rs      Subscription, SampleGuard, TypedSampleGuard
+    loan.rs              ShmLoan, TypedShmLoan, TopicHandle
+
+tests/
+  pubsub.rs              Integration tests
+  typed_pubsub.rs        Typed pub/sub integration tests
+benches/pubsub.rs        Criterion benchmarks (+ iceoryx2 head-to-head, Unix)
+examples/
+  publisher.rs           Cross-process latency benchmark — publisher side
+  subscriber.rs          Cross-process latency benchmark — subscriber side
+scripts/
+  gen_benchmark_chart.py Regenerate assets/benchmark_comparison.svg
 ```
 
 ---
 
-## Contributing
+## no_std
 
-```sh
-cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+The protocol core (`src/protocol/`, `src/pod.rs`, `src/wait.rs`, `src/error.rs`) is `no_std` + `alloc`. The platform layer (mmap, futex, file I/O) requires `std` and is gated behind `features = ["std"]` (the default).
+
+Requirement: `target_has_atomic = "64"` — the ABA-safe Treiber stack uses 64-bit CAS.
+
+```toml
+# no_std + alloc only (protocol core, no ShmPublisher/ShmSubscriber)
+crossbar = { version = "0.2", default-features = false }
+
+# std (default — includes everything)
+crossbar = "0.2"
 ```
 
 ---
 
 ## License
 
-Licensed under either of
-
-- **MIT License** ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
-- **Apache License, Version 2.0** ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
-
-at your option.
+MIT OR Apache-2.0 — your choice.
