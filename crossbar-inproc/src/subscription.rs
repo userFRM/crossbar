@@ -13,14 +13,15 @@ use std::sync::Arc;
 
 use crate::ring::Ring;
 use crate::topic::TopicInner;
+use crate::wait::WaitStrategy;
 
-/// A subscription to a topic. Receives messages via a dedicated ring buffer.
+/// A subscription to a topic. Receives messages from a dedicated SPSC ring.
 ///
 /// Created by [`Bus::subscribe()`](crate::Bus::subscribe). Automatically
 /// unsubscribes when dropped.
 ///
-/// `Subscription` is `Send` but not `Clone` — each subscription has its own
-/// independent ring buffer and read position.
+/// Each subscription has its own ring, so there is no contention between
+/// subscribers on the read path.
 pub struct Subscription<T> {
     ring: Arc<Ring<T>>,
     topic: Arc<TopicInner<T>>,
@@ -42,45 +43,62 @@ impl<T: Send + Sync + 'static> Subscription<T> {
 
     /// Receive the next message, blocking until one is available.
     ///
-    /// Uses a three-phase wait strategy:
+    /// Uses the default [`WaitStrategy::Adaptive`] with three phases:
     /// 1. **Spin** (32 iterations) — lowest latency for burst traffic
     /// 2. **Yield** (32 iterations) — gives other threads a chance
     /// 3. **Condvar wait** — parks the thread for idle periods
+    ///
+    /// For custom wait behaviour, use [`recv_with`](Self::recv_with).
     pub fn recv(&self) -> Arc<T> {
-        // Phase 1: spin
-        for _ in 0..32 {
-            if let Some(msg) = self.ring.pop() {
-                return msg;
-            }
-            std::hint::spin_loop();
-        }
-
-        // Phase 2: yield
-        for _ in 0..32 {
-            if let Some(msg) = self.ring.pop() {
-                return msg;
-            }
-            std::thread::yield_now();
-        }
-
-        // Phase 3: condvar
-        self.topic.waiters.fetch_add(1, Ordering::Release);
-        let result = loop {
-            if let Some(msg) = self.ring.pop() {
-                break msg;
-            }
-            let guard = self.topic.wake_mutex.lock().unwrap();
-            // Double-check after acquiring lock
-            if let Some(msg) = self.ring.pop() {
-                break msg;
-            }
-            let _guard = self.topic.wake_condvar.wait(guard).unwrap();
-        };
-        self.topic.waiters.fetch_sub(1, Ordering::Release);
-        result
+        self.recv_with(WaitStrategy::default())
     }
 
-    /// Number of messages currently pending in this subscription's ring.
+    /// Receive the next message using a custom wait strategy.
+    ///
+    /// The strategy controls how the thread waits between checks:
+    /// - [`BusySpin`](WaitStrategy::BusySpin): lowest latency, burns 100% CPU
+    /// - [`YieldSpin`](WaitStrategy::YieldSpin): PAUSE/WFE hint, good for shared cores
+    /// - [`BackoffSpin`](WaitStrategy::BackoffSpin): exponential backoff, reduces CPU over time
+    /// - [`Adaptive`](WaitStrategy::Adaptive): spin -> yield -> condvar (default, most balanced)
+    pub fn recv_with(&self, strategy: WaitStrategy) -> Arc<T> {
+        let mut iter: u32 = 0;
+
+        loop {
+            if let Some(msg) = self.try_recv() {
+                return msg;
+            }
+
+            // For Adaptive strategy, transition to condvar after spin+yield phases
+            if let WaitStrategy::Adaptive {
+                spin_iters,
+                yield_iters,
+            } = strategy
+            {
+                if iter >= spin_iters + yield_iters {
+                    // Phase 3: condvar (OS sleep)
+                    self.topic.waiters.fetch_add(1, Ordering::Release);
+                    let result = loop {
+                        if let Some(msg) = self.try_recv() {
+                            break msg;
+                        }
+                        let guard = self.topic.wake_mutex.lock().unwrap();
+                        // Double-check after acquiring lock
+                        if let Some(msg) = self.try_recv() {
+                            break msg;
+                        }
+                        let _guard = self.topic.wake_condvar.wait(guard).unwrap();
+                    };
+                    self.topic.waiters.fetch_sub(1, Ordering::Release);
+                    return result;
+                }
+            }
+
+            strategy.wait(iter);
+            iter = iter.saturating_add(1);
+        }
+    }
+
+    /// Approximate number of messages pending for this subscriber.
     #[inline]
     pub fn pending(&self) -> usize {
         self.ring.len()

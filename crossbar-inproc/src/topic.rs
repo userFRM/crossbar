@@ -6,18 +6,20 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Topic management: `TopicHandle` for O(1) publish, `TopicInner` for state.
-
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+//! Topic management: `TopicHandle` for publish, `TopicInner` for state.
+//!
+//! Each subscriber gets a dedicated SPSC ring. Publishing iterates all
+//! subscriber rings and pushes `Arc::clone` into each.
 
 use arc_swap::ArcSwap;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::ring::Ring;
 
 /// Opaque handle to a topic. Obtained from [`Bus::topic()`](crate::Bus::topic).
 ///
-/// Holds a direct pointer to the topic's subscriber list, avoiding
+/// Holds a direct pointer to the topic's inner state, avoiding
 /// any hash lookup on the publish hot path.
 ///
 /// `TopicHandle` is `Clone`, `Send`, and `Sync`.
@@ -38,11 +40,8 @@ impl<T> Clone for TopicHandle<T> {
 impl<T: Send + Sync + 'static> TopicHandle<T> {
     /// Publish a message to all current subscribers.
     ///
-    /// Each subscriber's ring receives an `Arc::clone()` of the message.
-    /// If a subscriber's ring is full, the oldest message in that ring is
-    /// dropped (lossy semantics).
-    ///
-    /// This is the hot path — no hash lookup, no lock acquisition.
+    /// Iterates subscriber rings and pushes `Arc::clone` into each — O(N)
+    /// in subscriber count, but each push is ~19ns.
     #[inline]
     pub fn publish(&self, msg: Arc<T>) {
         let subs = self.inner.subscribers.load();
@@ -80,17 +79,16 @@ impl<T: Send + Sync + 'static> TopicHandle<T> {
 
 /// Internal state for a single topic.
 pub(crate) struct TopicInner<T> {
-    /// Current set of subscriber rings. Swapped atomically on
-    /// subscribe/unsubscribe.
+    /// Subscriber rings — one per subscriber. Swapped atomically via ArcSwap.
     pub(crate) subscribers: ArcSwap<Vec<Arc<Ring<T>>>>,
 
-    /// Per-subscriber IDs for removal tracking.
+    /// Subscriber IDs, parallel to `subscribers` vec.
     pub(crate) sub_ids: ArcSwap<Vec<u64>>,
 
-    /// Serializes subscribe/unsubscribe (cold path only).
+    /// Mutex guarding subscribe/unsubscribe mutations.
     sub_mutex: Mutex<()>,
 
-    /// Next subscriber ID (monotonically increasing).
+    /// Next subscriber ID to assign.
     pub(crate) next_sub_id: AtomicU64,
 
     /// Notification counter (bumped on every publish).
@@ -112,8 +110,8 @@ pub(crate) struct TopicInner<T> {
 impl<T> TopicInner<T> {
     pub(crate) fn new() -> Self {
         Self {
-            subscribers: ArcSwap::new(Arc::new(Vec::new())),
-            sub_ids: ArcSwap::new(Arc::new(Vec::new())),
+            subscribers: ArcSwap::from_pointee(Vec::new()),
+            sub_ids: ArcSwap::from_pointee(Vec::new()),
             sub_mutex: Mutex::new(()),
             next_sub_id: AtomicU64::new(0),
             notify: AtomicU32::new(0),
@@ -124,44 +122,35 @@ impl<T> TopicInner<T> {
         }
     }
 
-    /// Add a subscriber with a dedicated ring. Returns (id, ring).
-    pub(crate) fn add_subscriber(&self, ring_depth: usize) -> (u64, Arc<Ring<T>>) {
-        let _guard = self.sub_mutex.lock().unwrap();
-
+    /// Register a new subscriber with the given ring. Returns the subscriber ID.
+    pub(crate) fn add_subscriber(&self, ring: Arc<Ring<T>>) -> u64 {
+        let _lock = self.sub_mutex.lock().unwrap();
         let id = self.next_sub_id.fetch_add(1, Ordering::Relaxed);
-        let ring = Arc::new(Ring::new(ring_depth));
 
-        let old_subs = self.subscribers.load();
-        let old_ids = self.sub_ids.load();
+        let mut subs = (**self.subscribers.load()).clone();
+        subs.push(ring);
+        self.subscribers.store(Arc::new(subs));
 
-        let mut new_subs = (**old_subs).clone();
-        let mut new_ids = (**old_ids).clone();
+        let mut ids = (**self.sub_ids.load()).clone();
+        ids.push(id);
+        self.sub_ids.store(Arc::new(ids));
 
-        new_subs.push(Arc::clone(&ring));
-        new_ids.push(id);
-
-        self.subscribers.store(Arc::new(new_subs));
-        self.sub_ids.store(Arc::new(new_ids));
-
-        (id, ring)
+        id
     }
 
     /// Remove a subscriber by ID.
     pub(crate) fn remove_subscriber(&self, id: u64) {
-        let _guard = self.sub_mutex.lock().unwrap();
+        let _lock = self.sub_mutex.lock().unwrap();
 
         let old_ids = self.sub_ids.load();
-        let old_subs = self.subscribers.load();
-
         if let Some(pos) = old_ids.iter().position(|&x| x == id) {
-            let mut new_subs = (**old_subs).clone();
-            let mut new_ids = (**old_ids).clone();
+            let mut subs = (**self.subscribers.load()).clone();
+            subs.remove(pos);
+            self.subscribers.store(Arc::new(subs));
 
-            new_subs.remove(pos);
-            new_ids.remove(pos);
-
-            self.subscribers.store(Arc::new(new_subs));
-            self.sub_ids.store(Arc::new(new_ids));
+            let mut ids = (**old_ids).clone();
+            ids.remove(pos);
+            self.sub_ids.store(Arc::new(ids));
         }
     }
 }

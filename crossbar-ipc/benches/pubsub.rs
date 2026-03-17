@@ -22,9 +22,9 @@ fn bench_pubsub(c: &mut Criterion) {
     let h_1mb = pub_.register("/bench/1mb").unwrap();
 
     let sub = ShmSubscriber::connect(ps_name).unwrap();
-    let mut s_8b = sub.subscribe("/bench/8b").unwrap();
-    let mut s_64kb = sub.subscribe("/bench/64kb").unwrap();
-    let mut s_1mb = sub.subscribe("/bench/1mb").unwrap();
+    let s_8b = sub.subscribe("/bench/8b").unwrap();
+    let s_64kb = sub.subscribe("/bench/64kb").unwrap();
+    let s_1mb = sub.subscribe("/bench/1mb").unwrap();
 
     let payload_64kb = vec![42u8; 65_536];
     let payload_1mb = vec![42u8; 1_048_576];
@@ -237,7 +237,7 @@ fn bench_iceoryx2_vs_crossbar(c: &mut Criterion) {
             let mut pub_ = ShmPublisher::create(&ps_name, cfg).unwrap();
             let handle = pub_.register("/bench/o1").unwrap();
             let sub = ShmSubscriber::connect(&ps_name).unwrap();
-            let mut s = sub.subscribe("/bench/o1").unwrap();
+            let s = sub.subscribe("/bench/o1").unwrap();
 
             group.bench_function(format!("crossbar/8B_on_{label}"), |b| {
                 b.iter(|| {
@@ -313,7 +313,7 @@ fn bench_iceoryx2_vs_crossbar(c: &mut Criterion) {
             })
             .collect();
         let sub = ShmSubscriber::connect(ps_name).unwrap();
-        let mut subs: Vec<_> = sizes
+        let subs: Vec<_> = sizes
             .iter()
             .map(|&(label, _)| {
                 let topic = format!("/bench/{label}");
@@ -323,7 +323,7 @@ fn bench_iceoryx2_vs_crossbar(c: &mut Criterion) {
 
         for (i, &(label, ref payload)) in payloads.iter().enumerate() {
             let handle = &handles[i].1;
-            let sub_handle = &mut subs[i].1;
+            let sub_handle = &subs[i].1;
 
             group.bench_function(format!("crossbar/{label}"), |b| {
                 b.iter(|| {

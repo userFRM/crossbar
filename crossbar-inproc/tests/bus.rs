@@ -5,7 +5,7 @@ use crossbar_inproc::prelude::*;
 use std::sync::Arc;
 use std::thread;
 
-// ─── Basic pub/sub ───────────────────────────────────────────────
+// --- Basic pub/sub ---
 
 #[test]
 fn publish_and_try_recv() {
@@ -42,6 +42,8 @@ fn message_ordering_fifo() {
 
 #[test]
 fn arc_identity_preserved() {
+    // With per-subscriber SPSC rings, the subscriber gets an Arc::clone
+    // of the published Arc — Arc::ptr_eq should hold.
     let bus = Bus::<String>::new();
     let topic = bus.topic("t");
     let sub = bus.subscribe("t");
@@ -50,15 +52,17 @@ fn arc_identity_preserved() {
     topic.publish(Arc::clone(&msg));
 
     let received = sub.try_recv().unwrap();
-    assert!(Arc::ptr_eq(&msg, &received));
+    assert!(Arc::ptr_eq(&received, &msg));
 }
 
 #[test]
 fn publish_via_bus_convenience() {
     let bus = Bus::<u64>::new();
-    let _sub = bus.subscribe("t");
+    let sub = bus.subscribe("t");
 
     bus.publish("t", Arc::new(99));
+    assert_eq!(*sub.try_recv().unwrap(), 99);
+
     // Convenience publish to nonexistent topic is a no-op
     bus.publish("nonexistent", Arc::new(1));
 }
@@ -69,7 +73,7 @@ fn publish_to_nonexistent_topic_is_noop() {
     bus.publish("no_such_topic", Arc::new(1)); // should not panic
 }
 
-// ─── TopicHandle ─────────────────────────────────────────────────
+// --- TopicHandle ---
 
 #[test]
 fn topic_handle_reuse() {
@@ -116,7 +120,7 @@ fn topic_handle_publish_count() {
     assert_eq!(topic.publish_count(), 2);
 }
 
-// ─── Multi-subscriber ────────────────────────────────────────────
+// --- Multi-subscriber ---
 
 #[test]
 fn two_subscribers_independent() {
@@ -160,7 +164,7 @@ fn late_joiner_misses_prior_messages() {
     assert!(sub.try_recv().is_none()); // missed both
 }
 
-// ─── Ring overflow ───────────────────────────────────────────────
+// --- Ring overflow ---
 
 #[test]
 fn ring_overflow_drops_oldest() {
@@ -170,25 +174,28 @@ fn ring_overflow_drops_oldest() {
 
     topic.publish(Arc::new(1));
     topic.publish(Arc::new(2));
-    topic.publish(Arc::new(3));
+    topic.publish(Arc::new(3)); // drops 1
 
-    assert_eq!(sub.drops(), 1);
     assert_eq!(*sub.try_recv().unwrap(), 2);
     assert_eq!(*sub.try_recv().unwrap(), 3);
+    assert!(sub.try_recv().is_none());
+    assert_eq!(sub.drops(), 1);
 }
 
 #[test]
 fn ring_depth_1() {
+    // Capacity 1 ring — each new publish overwrites the previous.
     let bus = Bus::<u64>::new();
     let sub = bus.subscribe_with_depth("t", 1);
     let topic = bus.topic("t");
 
     topic.publish(Arc::new(1));
-    topic.publish(Arc::new(2));
-    topic.publish(Arc::new(3));
+    topic.publish(Arc::new(2)); // drops 1
+    topic.publish(Arc::new(3)); // drops 2
 
-    assert_eq!(sub.drops(), 2);
     assert_eq!(*sub.try_recv().unwrap(), 3);
+    assert!(sub.try_recv().is_none());
+    assert_eq!(sub.drops(), 2);
 }
 
 #[test]
@@ -201,7 +208,11 @@ fn drops_counter() {
         topic.publish(Arc::new(i));
     }
 
-    assert_eq!(sub.drops(), 96); // 100 - 4 kept = 96 dropped
+    // Ring holds last 4 values: 96, 97, 98, 99.
+    // 96 values were dropped.
+    let msg = sub.try_recv().unwrap();
+    assert_eq!(*msg, 96);
+    assert_eq!(sub.drops(), 96);
 }
 
 #[test]
@@ -219,7 +230,7 @@ fn pending_count() {
     assert_eq!(sub.pending(), 1);
 }
 
-// ─── Dynamic subscribe/unsubscribe ──────────────────────────────
+// --- Dynamic subscribe/unsubscribe ---
 
 #[test]
 fn drop_unsubscribes() {
@@ -261,7 +272,7 @@ fn resubscribe_cycle() {
     }
 }
 
-// ─── Multi-topic ─────────────────────────────────────────────────
+// --- Multi-topic ---
 
 #[test]
 fn independent_topics() {
@@ -314,7 +325,7 @@ fn topic_listing() {
     assert_eq!(topics, vec!["a", "b", "c"]);
 }
 
-// ─── Blocking recv ───────────────────────────────────────────────
+// --- Blocking recv ---
 
 #[test]
 fn blocking_recv_cross_thread() {
@@ -343,7 +354,7 @@ fn blocking_recv_immediate() {
     assert_eq!(*sub.recv(), 42); // should return immediately
 }
 
-// ─── Concurrent access ──────────────────────────────────────────
+// --- Concurrent access ---
 
 #[test]
 fn multi_thread_publish() {
@@ -370,8 +381,6 @@ fn multi_thread_publish() {
     while sub.try_recv().is_some() {
         count += 1;
     }
-    // All 400 messages should arrive (ring default 64 is small, but
-    // subscribers created before publishers — they just drop old ones)
     // With default ring_depth=64, we'll have drops. Just check we got some.
     assert!(count > 0);
 }
@@ -417,7 +426,7 @@ fn bus_clone_shares_state() {
     assert_eq!(*sub.try_recv().unwrap(), 99);
 }
 
-// ─── BusConfig ───────────────────────────────────────────────────
+// --- BusConfig ---
 
 #[test]
 fn custom_ring_depth() {
@@ -427,27 +436,28 @@ fn custom_ring_depth() {
 
     topic.publish(Arc::new(1));
     topic.publish(Arc::new(2));
-    topic.publish(Arc::new(3));
+    topic.publish(Arc::new(3)); // drops 1
 
-    assert_eq!(sub.drops(), 1);
     assert_eq!(*sub.try_recv().unwrap(), 2);
+    assert_eq!(*sub.try_recv().unwrap(), 3);
+    assert_eq!(sub.drops(), 1);
 }
 
 #[test]
 fn default_config() {
     let bus = Bus::<u64>::default();
-    let _sub = bus.subscribe("t");
+    let sub = bus.subscribe("t");
     let topic = bus.topic("t");
 
-    // Default ring_depth is 64, so 64 messages fit
+    // Default ring_depth is 64. 64 messages fit without overflow.
     for i in 0..64 {
         topic.publish(Arc::new(i));
     }
-    assert_eq!(_sub.drops(), 0);
-    assert_eq!(_sub.pending(), 64);
+    assert_eq!(sub.drops(), 0);
+    assert_eq!(sub.pending(), 64);
 }
 
-// ─── Stress ──────────────────────────────────────────────────────
+// --- Stress ---
 
 #[test]
 fn stress_1m_messages() {
@@ -461,7 +471,7 @@ fn stress_1m_messages() {
     }
 
     // Should have last 1024 messages
-    let mut count = 0;
+    let mut count = 0u64;
     while sub.try_recv().is_some() {
         count += 1;
     }

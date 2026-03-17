@@ -34,7 +34,7 @@ fn mono_nanos() -> u64 {
 
 fn main() {
     let sub = ShmSubscriber::connect("bench-xproc").unwrap();
-    let mut stream = sub.subscribe("/tick").unwrap();
+    let stream = sub.subscribe("/tick").unwrap();
 
     println!("subscriber connected, polling...");
 

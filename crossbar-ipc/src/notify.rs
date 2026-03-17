@@ -35,6 +35,16 @@ pub fn wait_until_not(addr: &AtomicU32, current: u32, timeout: Duration) -> Resu
         if val != current {
             return Ok(val);
         }
+        // Platform-specific yield hint:
+        // aarch64: SEVL + WFE puts the core into a low-power state until a
+        // cache-line invalidation event (from the publisher's store) wakes it.
+        // x86: PAUSE yields the pipeline to the SMT sibling (~140 cycles).
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            core::arch::asm!("sevl", options(nomem, nostack));
+            core::arch::asm!("wfe", options(nomem, nostack));
+        }
+        #[cfg(not(target_arch = "aarch64"))]
         core::hint::spin_loop();
     }
 
@@ -132,17 +142,50 @@ mod platform {
 
     /// Fallback wait for non-Linux Unix (e.g. macOS).
     ///
-    /// Sleeps for `min(timeout, 1ms)` since there is no futex equivalent.
-    /// The spin+yield phases in [`wait_until_not`](super::wait_until_not)
-    /// handle the fast path; this covers the slow/idle case.
-    pub fn futex_wait(_addr: &AtomicU32, _expected: u32, timeout: Option<Duration>) {
-        let sleep_time = timeout
-            .map(|d| d.min(Duration::from_millis(1)))
-            .unwrap_or(Duration::from_millis(1));
-        std::thread::sleep(sleep_time);
+    /// On aarch64 (Apple Silicon): uses WFE for cache-line-aware low-power
+    /// wait. WFE wakes on cache-line invalidation (~30 ns) vs sleep(1 ms).
+    /// On x86: falls back to short sleep (no WFE equivalent).
+    pub fn futex_wait(addr: &AtomicU32, expected: u32, timeout: Option<Duration>) {
+        let deadline = timeout.map(|d| std::time::Instant::now() + d);
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            // WFE-based spin with backoff
+            let mut backoff = 1u32;
+            loop {
+                let val = addr.load(std::sync::atomic::Ordering::Acquire);
+                if val != expected {
+                    return;
+                }
+                if let Some(dl) = deadline {
+                    if std::time::Instant::now() >= dl {
+                        return;
+                    }
+                }
+                for _ in 0..backoff {
+                    unsafe {
+                        core::arch::asm!("wfe", options(nomem, nostack));
+                    }
+                }
+                backoff = (backoff * 2).min(64);
+            }
+        }
+
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = (addr, expected, deadline);
+            // x86 macOS: no WFE equivalent, use short sleep
+            let sleep_time = timeout
+                .map(|d| d.min(Duration::from_millis(1)))
+                .unwrap_or(Duration::from_millis(1));
+            std::thread::sleep(sleep_time);
+        }
     }
 
-    /// No-op on non-Linux: the polling loop in `wait_until_not` picks up changes.
+    /// On non-Linux: WFE wakes on cache-line invalidation automatically.
+    /// The publisher's atomic store to the notify counter invalidates
+    /// the subscriber's cached copy, generating the event.
+    /// No explicit wake needed.
     pub fn futex_wake(_addr: &AtomicU32, _count: i32) {}
 }
 

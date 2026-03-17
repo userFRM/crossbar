@@ -29,24 +29,27 @@
 //! # Architecture
 //!
 //! - **[`Bus<T>`]** — central registry of topics and subscriptions (cold path)
-//! - **[`TopicHandle<T>`]** — pre-resolved handle for O(1) publish (hot path)
-//! - **[`Subscription<T>`]** — per-subscriber ring buffer receiver
+//! - **[`TopicHandle<T>`]** — pre-resolved handle for O(N) publish (hot path)
+//! - **[`Subscription<T>`]** — per-subscriber SPSC ring consumer
 //!
-//! The publish hot path is lock-free: `ArcSwap::load()` reads the subscriber
-//! list, then each subscriber's ring receives an `Arc::clone()` of the message.
-
-#![deny(unsafe_code)]
+//! Each subscriber gets a dedicated lock-free SPSC ring. Publishing iterates
+//! all subscriber rings and pushes `Arc::clone` into each — O(N) in subscriber
+//! count, but each push is ~19ns.
 
 mod bus;
+#[allow(unsafe_code)]
 pub(crate) mod ring;
 mod subscription;
 mod topic;
+#[allow(unsafe_code)]
+pub mod wait;
 
 pub use bus::{Bus, BusConfig};
 pub use subscription::Subscription;
 pub use topic::TopicHandle;
+pub use wait::WaitStrategy;
 
 /// Convenience re-exports for `use crossbar_inproc::prelude::*`.
 pub mod prelude {
-    pub use crate::{Bus, BusConfig, Subscription, TopicHandle};
+    pub use crate::{Bus, BusConfig, Subscription, TopicHandle, WaitStrategy};
 }

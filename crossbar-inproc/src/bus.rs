@@ -11,12 +11,13 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use crate::ring::Ring;
 use crate::subscription::Subscription;
 use crate::topic::{TopicHandle, TopicInner};
 
 /// Configuration for a [`Bus`].
 pub struct BusConfig {
-    /// Default ring depth for new subscribers. Default: 64.
+    /// Default ring depth per subscriber. Default: 64.
     pub ring_depth: usize,
 }
 
@@ -32,6 +33,12 @@ impl Default for BusConfig {
 /// All messages are shared via `Arc<T>` for zero-copy fan-out.
 ///
 /// The bus is `Clone` (cheap `Arc` clone) and can be shared across threads.
+///
+/// # Architecture
+///
+/// Each subscriber gets a dedicated lock-free SPSC ring. Publishing iterates
+/// all subscriber rings and pushes `Arc::clone` into each — O(N) in subscriber
+/// count, but each push is ~19ns.
 ///
 /// # Example
 ///
@@ -116,11 +123,16 @@ impl<T: Send + Sync + 'static> Bus<T> {
     ///
     /// Creates the topic if it doesn't exist. The returned
     /// [`Subscription`] automatically unsubscribes on drop.
+    ///
+    /// New subscribers start with an empty ring — they will not see
+    /// messages published before they subscribed.
     pub fn subscribe(&self, topic: &str) -> Subscription<T> {
         self.subscribe_with_depth(topic, self.inner.config.ring_depth)
     }
 
     /// Subscribe to a topic with a custom ring depth.
+    ///
+    /// Each subscriber gets its own dedicated SPSC ring of the given depth.
     pub fn subscribe_with_depth(&self, topic: &str, depth: usize) -> Subscription<T> {
         let mut topics = self.inner.topics.lock().unwrap();
         let inner = topics
@@ -129,7 +141,8 @@ impl<T: Send + Sync + 'static> Bus<T> {
             .clone();
         drop(topics); // release lock before subscriber ops
 
-        let (id, ring) = inner.add_subscriber(depth);
+        let ring = Arc::new(Ring::new(depth));
+        let id = inner.add_subscriber(Arc::clone(&ring));
         Subscription::new(ring, inner, id)
     }
 
