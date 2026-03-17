@@ -4,7 +4,7 @@
  * C API. Link against libcrossbar.so / libcrossbar.dylib / crossbar.dll.
  * Build: cargo build --release --features ffi
  *
- * MIT OR Apache-2.0
+ * Apache-2.0
  */
 
 #ifndef CROSSBAR_H

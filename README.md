@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/userFRM/crossbar/actions/workflows/ci.yml/badge.svg)](https://github.com/userFRM/crossbar/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/crossbar.svg)](https://crates.io/crates/crossbar)
-[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE-APACHE)
 
 **Zero-copy pub/sub over shared memory. URI-addressed. O(1) transfer at any payload size.**
 
@@ -305,4 +305,4 @@ crossbar = "0.2"
 
 ## License
 
-MIT OR Apache-2.0 — your choice.
+Apache-2.0.
