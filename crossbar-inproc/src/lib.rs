@@ -6,43 +6,50 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! # crossbar-inproc
+//! Ultra-fast in-process pub/sub bus with type-safe topics.
 //!
-//! **In-process URI router with handler dispatch.**
+//! `crossbar-inproc` provides a generic [`Bus<T>`] for zero-copy message
+//! fan-out within a single process. Messages are shared via `Arc<T>`,
+//! avoiding serialization entirely.
 //!
-//! Register handlers by URI pattern, dispatch requests directly with no
-//! serialization or I/O. ~143 ns for a `/health -> "ok"` roundtrip.
+//! # Quick Start
 //!
-//! ## Quick Start
-//!
-//! ```rust
-//! use crossbar_inproc::prelude::*;
-//!
-//! fn health() -> &'static str { "ok" }
-//!
-//! let router = Router::new().route("/health", get(health));
-//! let client = InProcessClient::new(router);
-//! let resp = client.get("/health");
-//! assert_eq!(resp.status, 200);
 //! ```
+//! use crossbar_inproc::prelude::*;
+//! use std::sync::Arc;
+//!
+//! let bus = Bus::<u64>::new();
+//! let topic = bus.topic("prices");
+//! let sub = bus.subscribe("prices");
+//!
+//! topic.publish(Arc::new(42));
+//! assert_eq!(*sub.try_recv().unwrap(), 42);
+//! ```
+//!
+//! # Architecture
+//!
+//! - **[`Bus<T>`]** — central registry of topics and subscriptions (cold path)
+//! - **[`TopicHandle<T>`]** — pre-resolved handle for O(N) publish (hot path)
+//! - **[`Subscription<T>`]** — per-subscriber SPSC ring consumer
+//!
+//! Each subscriber gets a dedicated lock-free SPSC ring. Publishing iterates
+//! all subscriber rings and pushes `Arc::clone` into each — O(N) in subscriber
+//! count, but each push is ~19ns.
 
-#![warn(missing_docs)]
-#![deny(unsafe_code)]
+mod bus;
+#[allow(unsafe_code)]
+pub(crate) mod ring;
+mod subscription;
+mod topic;
+#[allow(unsafe_code)]
+pub mod wait;
 
-pub mod handler;
-mod inproc;
-pub mod router;
-pub mod types;
+pub use bus::{Bus, BusConfig};
+pub use subscription::Subscription;
+pub use topic::TopicHandle;
+pub use wait::WaitStrategy;
 
-/// Re-export procedural macros from `crossbar-macros`.
-pub use crossbar_macros::handler;
-
-/// Convenient re-exports of everything you need for typical usage.
+/// Convenience re-exports for `use crossbar_inproc::prelude::*`.
 pub mod prelude {
-    pub use crate::handler::*;
-    pub use crate::inproc::InProcessClient;
-    pub use crate::router::*;
-    pub use crate::types::*;
+    pub use crate::{Bus, BusConfig, Subscription, TopicHandle, WaitStrategy};
 }
-
-pub use inproc::InProcessClient;

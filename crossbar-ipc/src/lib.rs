@@ -39,9 +39,12 @@ mod mmap;
 mod notify;
 #[allow(unsafe_code)]
 mod pubsub;
+#[allow(unsafe_code)]
+mod wait;
 
 pub mod error;
 
 pub use pubsub::{
     PubSubConfig, SampleGuard, ShmLoan, ShmPublisher, ShmSubscriber, Subscription, TopicHandle,
 };
+pub use wait::WaitStrategy;

@@ -21,6 +21,7 @@
 //! On ring overwrite, publisher decrements old block's refcount. Guard decrements
 //! on drop. Block freed when refcount hits 0.
 
+use std::cell::Cell;
 use std::io;
 use std::ops::Deref;
 use std::path::PathBuf;
@@ -31,11 +32,12 @@ use std::time::Duration;
 use crate::error::IpcError;
 use crate::mmap::RawMmap;
 use crate::notify;
+use crate::wait::WaitStrategy;
 
 // ─── Layout constants ────────────────────────────────────────────────────
 
 const MAGIC: &[u8; 8] = b"XBAR_ZC\0";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 const HEADER_SIZE: usize = 128;
 const TOPIC_ENTRY_SIZE: usize = 128;
@@ -60,11 +62,11 @@ const GH_STALE_TIMEOUT_US: usize = 0x38;
 const TE_ACTIVE: usize = 0; // AtomicU32
 const TE_NOTIFY: usize = 4; // AtomicU32
 const TE_WRITE_SEQ: usize = 8; // AtomicU64
-const TE_URI_HASH: usize = 0x10;
-const TE_URI_LEN: usize = 0x18;
-const TE_URI: usize = 0x1C;
-const TE_URI_MAX: usize = 64;
-const TE_WAITERS: usize = 0x5C; // AtomicU32, tracks # of subscribers in futex_wait
+const TE_WAITERS: usize = 0x10; // AtomicU32 — moved from 0x5C to 1st cache line
+const TE_URI_LEN: usize = 0x14; // u32
+const TE_URI_HASH: usize = 0x18; // u64
+const TE_URI: usize = 0x20; // char[64]
+const TE_URI_MAX: usize = 64; // unchanged (0x60 - 0x20 = 64)
 
 // Ring entry offsets (relative to entry start)
 const RE_SEQ: usize = 0; // AtomicU64 (seqlock)
@@ -281,11 +283,8 @@ impl Region {
             if idx == NO_BLOCK {
                 return None;
             }
-            let next = unsafe {
-                let mut buf = [0u8; 4];
-                std::ptr::copy_nonoverlapping(self.block_ptr(idx), buf.as_mut_ptr(), 4);
-                u32::from_le_bytes(buf)
-            };
+            let next =
+                unsafe { &*(self.block_ptr(idx) as *const AtomicU32) }.load(Ordering::Relaxed);
             let new_head = pack(gen.wrapping_add(1), next);
             if self
                 .pool_head()
@@ -306,13 +305,8 @@ impl Region {
             let head = self.pool_head().load(Ordering::Acquire);
             let (gen, old_head_idx) = unpack(head);
             // Write next pointer into the block's free-list link (offset 0)
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    old_head_idx.to_le_bytes().as_ptr(),
-                    self.block_ptr(idx),
-                    4,
-                );
-            }
+            unsafe { &*(self.block_ptr(idx) as *const AtomicU32) }
+                .store(old_head_idx, Ordering::Relaxed);
             let new_head = pack(gen.wrapping_add(1), idx);
             if self
                 .pool_head()
@@ -331,12 +325,10 @@ impl Region {
             } else {
                 NO_BLOCK
             };
-            unsafe {
-                let ptr = self.block_ptr(i);
-                std::ptr::copy_nonoverlapping(next.to_le_bytes().as_ptr(), ptr, 4);
-                // Zero refcount
-                (ptr.add(BK_REFCOUNT) as *mut u32).write(0);
-            }
+            let ptr = self.block_ptr(i);
+            unsafe { &*(ptr as *const AtomicU32) }.store(next, Ordering::Relaxed);
+            // Zero refcount
+            unsafe { &*(ptr.add(BK_REFCOUNT) as *const AtomicU32) }.store(0, Ordering::Relaxed);
         }
         self.pool_head().store(pack(0, 0), Ordering::Release);
     }
@@ -761,7 +753,8 @@ impl<'a> ShmLoan<'a> {
         let entry_ptr = unsafe { self.region.mmap.as_mut_ptr().add(entry_off) };
 
         // 1. Read old block_idx from the ring slot we're about to overwrite
-        let old_block_idx = unsafe { (entry_ptr.add(RE_BLOCK_IDX) as *const u32).read() };
+        let old_block_idx =
+            unsafe { &*(entry_ptr.add(RE_BLOCK_IDX) as *const AtomicU32) }.load(Ordering::Relaxed);
 
         // 2. Set new block's refcount to 1 (ring holds one reference)
         self.region
@@ -773,10 +766,10 @@ impl<'a> ShmLoan<'a> {
         entry_seq.store(0, Ordering::Release);
 
         // 4. Write new block_idx and data_len
-        unsafe {
-            (entry_ptr.add(RE_BLOCK_IDX) as *mut u32).write(self.block_idx);
-            (entry_ptr.add(RE_DATA_LEN) as *mut u32).write(self.len as u32);
-        }
+        unsafe { &*(entry_ptr.add(RE_BLOCK_IDX) as *const AtomicU32) }
+            .store(self.block_idx, Ordering::Relaxed);
+        unsafe { &*(entry_ptr.add(RE_DATA_LEN) as *const AtomicU32) }
+            .store(self.len as u32, Ordering::Relaxed);
 
         // 5. Validate seq (seqlock close) — data visible to subscribers
         entry_seq.store(self.seq, Ordering::Release);
@@ -847,11 +840,11 @@ impl<'a> io::Write for ShmLoan<'a> {
 /// use crossbar_ipc::*;
 ///
 /// let sub = ShmSubscriber::connect("prices").unwrap();
-/// let mut stream = sub.subscribe("/tick/AAPL").unwrap();
+/// let stream = sub.subscribe("/tick/AAPL").unwrap();
 ///
 /// if let Some(sample) = stream.try_recv() {
 ///     println!("data: {:?}", &*sample); // safe Deref<Target=[u8]>
-/// }
+/// };
 /// ```
 pub struct ShmSubscriber {
     region: Arc<Region>,
@@ -976,7 +969,7 @@ impl ShmSubscriber {
             return Ok(Subscription {
                 region: Arc::clone(&self.region),
                 topic_idx: i,
-                last_seq: current,
+                last_seq: Cell::new(current),
             });
         }
 
@@ -994,7 +987,7 @@ impl ShmSubscriber {
 pub struct Subscription {
     region: Arc<Region>,
     topic_idx: u32,
-    last_seq: u64,
+    last_seq: Cell<u64>,
 }
 
 impl Subscription {
@@ -1018,16 +1011,16 @@ impl Subscription {
     /// The returned guard implements `Deref<Target=[u8]>` — safe to read
     /// without `unsafe`. The block is held alive until the guard is dropped.
     #[inline]
-    pub fn try_recv(&mut self) -> Option<SampleGuard> {
+    pub fn try_recv(&self) -> Option<SampleGuard<'_>> {
         let current_seq = self.write_seq_atom().load(Ordering::Acquire);
-        if current_seq <= self.last_seq {
+        if current_seq <= self.last_seq.get() {
             return None;
         }
 
-        let target = if current_seq - self.last_seq > self.region.config.ring_depth as u64 {
+        let target = if current_seq - self.last_seq.get() > self.region.config.ring_depth as u64 {
             current_seq // fell behind — skip to latest
         } else {
-            self.last_seq + 1
+            self.last_seq.get() + 1
         };
 
         if let Some(guard) = self.try_read_slot(target) {
@@ -1036,7 +1029,7 @@ impl Subscription {
 
         // Slot was overwritten — retry with latest
         let latest = self.write_seq_atom().load(Ordering::Acquire);
-        if latest > self.last_seq && latest != target {
+        if latest > self.last_seq.get() && latest != target {
             self.try_read_slot(latest)
         } else {
             None
@@ -1044,7 +1037,7 @@ impl Subscription {
     }
 
     #[inline]
-    fn try_read_slot(&mut self, seq: u64) -> Option<SampleGuard> {
+    fn try_read_slot(&self, seq: u64) -> Option<SampleGuard<'_>> {
         let ring_depth = self.region.config.ring_depth;
         let slot = (seq % ring_depth as u64) as u32;
         let entry_off = ring_entry_off(&self.region.config, self.topic_idx, slot);
@@ -1057,8 +1050,10 @@ impl Subscription {
         }
 
         // Read block_idx and data_len
-        let block_idx = unsafe { (entry_ptr.add(RE_BLOCK_IDX) as *const u32).read() };
-        let data_len = unsafe { (entry_ptr.add(RE_DATA_LEN) as *const u32).read() };
+        let block_idx =
+            unsafe { &*(entry_ptr.add(RE_BLOCK_IDX) as *const AtomicU32) }.load(Ordering::Relaxed);
+        let data_len =
+            unsafe { &*(entry_ptr.add(RE_DATA_LEN) as *const AtomicU32) }.load(Ordering::Relaxed);
 
         if block_idx == NO_BLOCK {
             return None;
@@ -1094,49 +1089,84 @@ impl Subscription {
             return None;
         }
 
-        self.last_seq = seq;
+        self.last_seq.set(seq);
 
         Some(SampleGuard {
-            region: Arc::clone(&self.region),
+            region: &self.region,
             block_idx,
             len: data_len as usize,
         })
     }
 
-    /// Blocking: waits for the next sample. Uses spin → futex.
+    /// Blocking: waits for the next sample using the given [`WaitStrategy`].
     ///
-    /// Returns `Err(ShmPublisherDead)` if the publisher heartbeat goes stale.
-    pub fn recv(&mut self) -> Result<SampleGuard, IpcError> {
+    /// For `BusySpin`/`YieldSpin`/`BackoffSpin`: loops calling `try_recv()`
+    /// with the strategy's wait hint, checking heartbeat periodically.
+    ///
+    /// For `Adaptive`: uses spin/yield phases, then falls through to the
+    /// OS-assisted sleep path (`futex`/`WaitOnAddress`/`WFE`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpcError::PublisherDead`] if the publisher heartbeat goes stale.
+    pub fn recv_with(&self, strategy: WaitStrategy) -> Result<SampleGuard<'_>, IpcError> {
+        // Fast path: check immediately
+        if let Some(g) = self.try_recv() {
+            return Ok(g);
+        }
+
         let poll_ms = (self.region.config.stale_timeout.as_millis() as u64 / 3).clamp(1, 50);
+        let mut iter: u32 = 0;
 
         loop {
             if let Some(g) = self.try_recv() {
                 return Ok(g);
             }
 
-            let cur = self.notify_atom().load(Ordering::Acquire);
+            match strategy {
+                WaitStrategy::Adaptive {
+                    spin_iters,
+                    yield_iters,
+                } if iter >= spin_iters + yield_iters => {
+                    // Phase 3: OS sleep (existing futex/WaitOnAddress/WFE path)
+                    let cur = self.notify_atom().load(Ordering::Acquire);
+                    if let Some(g) = self.try_recv() {
+                        return Ok(g);
+                    }
+                    self.waiters_atom().fetch_add(1, Ordering::Release);
+                    let result = notify::wait_until_not(
+                        self.notify_atom(),
+                        cur,
+                        Duration::from_millis(poll_ms),
+                    );
+                    self.waiters_atom().fetch_sub(1, Ordering::Release);
 
-            // Re-check after loading counter
-            if let Some(g) = self.try_recv() {
-                return Ok(g);
+                    // Check heartbeat on timeout
+                    if result.is_err() {
+                        self.region.check_heartbeat()?;
+                    }
+                }
+                _ => {
+                    strategy.wait(iter);
+                    iter = iter.saturating_add(1);
+
+                    // Periodic heartbeat check for non-OS-sleep strategies
+                    if iter.is_multiple_of(1024) {
+                        self.region.check_heartbeat()?;
+                    }
+                }
             }
-
-            // Signal that we're about to sleep — publisher checks this to
-            // decide whether futex_wake is needed (smart wake).
-            self.waiters_atom().fetch_add(1, Ordering::AcqRel);
-
-            // Re-check after incrementing waiters to avoid missed-wake:
-            // a publish between last try_recv and waiters increment would
-            // have skipped futex_wake (saw waiters=0).
-            if let Some(g) = self.try_recv() {
-                self.waiters_atom().fetch_sub(1, Ordering::Release);
-                return Ok(g);
-            }
-
-            notify::wait_until_not(self.notify_atom(), cur, Duration::from_millis(poll_ms)).ok();
-            self.waiters_atom().fetch_sub(1, Ordering::Release);
-            self.region.check_heartbeat()?;
         }
+    }
+
+    /// Blocking: waits for the next sample using the default [`WaitStrategy`]
+    /// (three-phase adaptive: spin -> yield -> OS sleep).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpcError::PublisherDead`] if the publisher heartbeat goes stale.
+    pub fn recv(&self) -> Result<SampleGuard<'_>, IpcError> {
+        self.recv_with(WaitStrategy::default())
     }
 }
 
@@ -1151,22 +1181,18 @@ impl Subscription {
 /// # Safety (internal)
 ///
 /// This is safe because:
-/// 1. The mmap is kept alive via `Arc<Region>`.
+/// 1. The mmap is kept alive via the borrowed `&Region` (which itself is
+///    inside an `Arc<Region>` held by the `Subscription`).
 /// 2. The block cannot be freed while refcount > 0.
 /// 3. No writer touches the block's data region after publishing.
 /// 4. The data region does not overlap the free-list link field.
-pub struct SampleGuard {
-    region: Arc<Region>,
+pub struct SampleGuard<'a> {
+    region: &'a Region,
     block_idx: u32,
     len: usize,
 }
 
-// SAFETY: The guard only reads immutable data in the mmap. The refcount
-// prevents the block from being freed or reallocated while the guard exists.
-unsafe impl Send for SampleGuard {}
-unsafe impl Sync for SampleGuard {}
-
-impl SampleGuard {
+impl SampleGuard<'_> {
     /// Returns the data length.
     pub fn len(&self) -> usize {
         self.len
@@ -1188,7 +1214,7 @@ impl SampleGuard {
     }
 }
 
-impl Deref for SampleGuard {
+impl Deref for SampleGuard<'_> {
     type Target = [u8];
 
     fn deref(&self) -> &[u8] {
@@ -1199,13 +1225,13 @@ impl Deref for SampleGuard {
     }
 }
 
-impl AsRef<[u8]> for SampleGuard {
+impl AsRef<[u8]> for SampleGuard<'_> {
     fn as_ref(&self) -> &[u8] {
         self.deref()
     }
 }
 
-impl std::fmt::Debug for SampleGuard {
+impl std::fmt::Debug for SampleGuard<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SampleGuard")
             .field("block_idx", &self.block_idx)
@@ -1214,7 +1240,7 @@ impl std::fmt::Debug for SampleGuard {
     }
 }
 
-impl Drop for SampleGuard {
+impl Drop for SampleGuard<'_> {
     fn drop(&mut self) {
         let refcount = self.region.block_refcount(self.block_idx);
         let prev = refcount.fetch_sub(1, Ordering::AcqRel);

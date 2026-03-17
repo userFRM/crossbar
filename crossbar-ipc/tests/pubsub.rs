@@ -9,7 +9,7 @@ fn pubsub_basic_publish_subscribe() {
     let topic = pub_.register("/test").unwrap();
 
     let sub = ShmSubscriber::connect(name).unwrap();
-    let mut stream = sub.subscribe("/test").unwrap();
+    let stream = sub.subscribe("/test").unwrap();
 
     // Publish a sample
     let mut loan = pub_.loan(&topic);
@@ -30,7 +30,7 @@ fn pubsub_safe_deref() {
     let topic = pub_.register("/tick").unwrap();
 
     let sub = ShmSubscriber::connect(name).unwrap();
-    let mut stream = sub.subscribe("/tick").unwrap();
+    let stream = sub.subscribe("/tick").unwrap();
 
     let mut loan = pub_.loan(&topic);
     loan.as_mut_slice()[..8].copy_from_slice(&42u64.to_le_bytes());
@@ -56,7 +56,7 @@ fn pubsub_guard_survives_ring_overwrite() {
     let topic = pub_.register("/data").unwrap();
 
     let sub = ShmSubscriber::connect(name).unwrap();
-    let mut stream = sub.subscribe("/data").unwrap();
+    let stream = sub.subscribe("/data").unwrap();
 
     // Publish first sample
     let mut loan = pub_.loan(&topic);
@@ -87,8 +87,8 @@ fn pubsub_multiple_topics() {
     let t2 = pub_.register("/b").unwrap();
 
     let sub = ShmSubscriber::connect(name).unwrap();
-    let mut s1 = sub.subscribe("/a").unwrap();
-    let mut s2 = sub.subscribe("/b").unwrap();
+    let s1 = sub.subscribe("/a").unwrap();
+    let s2 = sub.subscribe("/b").unwrap();
 
     let mut loan = pub_.loan(&t1);
     loan.set_data(b"alpha");
@@ -136,7 +136,7 @@ fn pubsub_born_in_shm_pattern() {
     let topic = pub_.register("/sensor").unwrap();
 
     let sub = ShmSubscriber::connect(name).unwrap();
-    let mut stream = sub.subscribe("/sensor").unwrap();
+    let stream = sub.subscribe("/sensor").unwrap();
 
     // Write a struct directly into SHM (born-in-SHM)
     let mut loan = pub_.loan(&topic);
@@ -162,7 +162,7 @@ fn pubsub_sequential_consistency() {
     let topic = pub_.register("/seq").unwrap();
 
     let sub = ShmSubscriber::connect(name).unwrap();
-    let mut stream = sub.subscribe("/seq").unwrap();
+    let stream = sub.subscribe("/seq").unwrap();
 
     // Publish 100 sequential values
     for i in 0u64..100 {
