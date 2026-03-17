@@ -70,17 +70,17 @@ pub fn wait_until_not(addr: &AtomicU32, current: u32, timeout: Duration) -> Resu
         if std::time::Instant::now() >= deadline {
             return Err(());
         }
-        platform::futex_wait(addr, current, Some(chunk));
+        os_platform::futex_wait(addr, current, Some(chunk));
     }
 }
 
 /// Wake all threads waiting on `addr`.
 pub fn wake_all(addr: &AtomicU32) {
-    platform::futex_wake(addr, i32::MAX);
+    os_platform::futex_wake(addr, i32::MAX);
 }
 
 #[cfg(target_os = "linux")]
-mod platform {
+mod os_platform {
     use std::sync::atomic::AtomicU32;
     use std::time::Duration;
 
@@ -136,7 +136,7 @@ mod platform {
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-mod platform {
+mod os_platform {
     use std::sync::atomic::AtomicU32;
     use std::time::Duration;
 
@@ -190,7 +190,7 @@ mod platform {
 }
 
 #[cfg(windows)]
-mod platform {
+mod os_platform {
     use std::sync::atomic::AtomicU32;
     use std::time::Duration;
 

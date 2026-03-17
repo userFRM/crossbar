@@ -1,114 +1,52 @@
-# Architecture: Two Fast Paths
+# Architecture: Zero-Copy SHM Pub/Sub
 
-Crossbar is a workspace with two crates, each providing a distinct fast path:
-
-- **`crossbar-inproc`** — in-process pub/sub via `Bus<T>` with `Arc<T>` fan-out
-- **`crossbar-ipc`** — zero-copy pub/sub over shared memory (`/dev/shm`)
-
-Both crates solve the same problem — **named pub/sub channels at hardware
-speed** — at different scopes. `crossbar-inproc` operates within a single
-process (threads share `Arc<T>`). `crossbar-ipc` operates across processes
-(they share mmap'd memory). Same mental model, same topic naming, same
-lossy-ring semantics. The only thing that changes is whether you cross an
-address space boundary.
+Crossbar is a single crate providing zero-copy pub/sub over shared memory
+(`/dev/shm`). It moves data between processes at O(1) cost regardless of
+payload size by transferring only an 8-byte descriptor (block index + data
+length) through a seqlock ring.
 
 ---
 
-## Side by side
+## Overview
 
 ```
-  crossbar-inproc (57 ns)             crossbar-ipc (58 ns)
-  ========================            =======================
+  crossbar (58 ns)                    iceoryx2 (~231 ns on same hw)
+  ========================            ================================
 
-  TopicHandle::publish()              ShmLoan::publish()
+  ShmLoan::publish()                  publisher.loan()?.write_payload()
           |                                   |
           v                                   v
-  ArcSwap::load()                     alloc block (Treiber CAS)
-  [load subscriber list]              write payload into SHM
+  alloc block (Treiber CAS)           alloc from lock-free pool
+  write payload into SHM              write payload into SHM
           |                                   |
           v                                   v
-  +---+---+---+                       set refcount = 1
-  |   |   |   |                       seqlock open (seq=0)
-  v   v   v   v                       write 8B descriptor
-  Ring Ring Ring Ring                  seqlock close (seq=N)
-  [Arc::clone per sub]                bump write_seq
-  [CAS push into SPSC]                free old block if rc=0
-          |                           smart wake (futex)
-          v                                   |
-  Subscription::try_recv()                    v
-  [CAS pop from SPSC]                Subscription::try_recv()
-          |                           [load write_seq]
-          v                           [seqlock check 1]
-  Arc<T> — user's message             [read block_idx + data_len]
-                                      [CAS refcount increment]
-                                      [seqlock check 2]
-                                              |
-                                              v
-                                      SampleGuard — Deref<[u8]>
-                                      [reads directly from mmap]
+  set refcount = 1                    service discovery layer
+  seqlock open (seq=0)                POSIX configuration layer
+  write 8B descriptor                 publish descriptor
+  seqlock close (seq=N)                       |
+  bump write_seq                              v
+  free old block if rc=0              subscriber.receive()
+  smart wake (futex)                  [event-based notification]
+          |
+          v
+  Subscription::try_recv()
+  [load write_seq]
+  [seqlock check 1]
+  [read block_idx + data_len]
+  [CAS refcount increment]
+  [seqlock check 2]
+          |
+          v
+  SampleGuard — Deref<[u8]>
+  [reads directly from mmap]
 ```
+
+Crossbar is faster because it skips iceoryx2's service discovery and POSIX
+configuration layer -- it goes straight from user code to atomics.
 
 ---
 
-## In-process path (`crossbar-inproc`)
-
-The `Bus<T>` manages topics and subscriptions. Each subscriber gets a dedicated
-lock-free SPSC ring buffer. There is no Mutex on the hot path.
-
-### Publish flow
-
-1. `TopicHandle::publish()` calls `ArcSwap::load()` to get the current subscriber
-   list — this is a lock-free atomic load, no hash lookup.
-2. For each subscriber, `Arc::clone()` the message and push into that subscriber's
-   dedicated SPSC ring.
-3. If a ring is full, the producer CAS-advances the tail to drop the oldest message
-   (lossy semantics). The CAS loop handles the concurrent-pop race.
-4. Bump the notification counter (`AtomicU32`). If any subscriber is blocked in
-   `recv()`, notify via condvar.
-
-### Ring buffer internals
-
-```
-  Ring<T> (lock-free SPSC, cache-line padded)
-  ============================================
-
-  head: CacheAligned<AtomicU64>       [64-byte aligned, producer-owned]
-  tail: CacheAligned<AtomicU64>       [64-byte aligned, shared CAS]
-  slots: Box<[UnsafeCell<MaybeUninit<Arc<T>>>]>
-
-  Push (producer):                    Pop (consumer):
-  +--------------------------+        +-------------------------+
-  | load head (Relaxed)      |        | load tail (Relaxed)     |
-  | load tail (Acquire)      |        | load head (Acquire)     |
-  | if full:                 |        | if empty: return None   |
-  |   CAS tail++ (drop old)  |        | CAS tail++ (AcqRel)    |
-  | write slot[head % cap]   |        | read slot[tail % cap]   |
-  | store head++ (Release)   |        | return Arc<T>           |
-  +--------------------------+        +-------------------------+
-```
-
-Head and tail live on separate cache lines (`#[repr(align(64))]`) to prevent
-false sharing between producer and consumer cores.
-
-### Receive flow
-
-`Subscription::recv()` uses a three-phase wait:
-
-1. **Spin** (32 iterations) — `spin_loop()` hint, lowest latency for burst traffic
-2. **Yield** (32 iterations) — `thread::yield_now()`, gives other threads a chance
-3. **Condvar** — parks the thread, woken by the publisher's smart-wake check
-
-`try_recv()` is a single `ring.pop()` — CAS on the tail index.
-
-### Subscribe / unsubscribe (cold path)
-
-Adding or removing subscribers is serialized by a `Mutex`. The subscriber list
-is replaced atomically via `ArcSwap::store()`, so the publish hot path never
-blocks on subscribe/unsubscribe operations.
-
----
-
-## Shared-memory path (`crossbar-ipc`)
+## Shared-memory path
 
 The SHM path moves data between processes at O(1) cost regardless of payload
 size. Transfer writes only 8 bytes (block index + data length) to a ring slot.
@@ -116,7 +54,7 @@ size. Transfer writes only 8 bytes (block index + data length) to a ring slot.
 ### Borrowed `SampleGuard`
 
 `SampleGuard<'a>` borrows `&'a Region` (no `Arc::clone` per receive) and holds
-a block index and length. It implements `Deref<Target=[u8]>` — subscribers read
+a block index and length. It implements `Deref<Target=[u8]>` -- subscribers read
 directly from the mmap'd region. The block is held alive by atomic refcounting;
 the guard decrements the refcount on drop, freeing the block when it hits zero.
 
@@ -126,13 +64,13 @@ Each topic has a ring of `(seq, block_idx, data_len)` entries. The publisher
 uses a seqlock protocol:
 
 1. Invalidate the slot's sequence to 0 (seqlock open)
-2. Write block_idx and data_len via `AtomicU32` stores (`Relaxed` ordering) —
+2. Write block_idx and data_len via `AtomicU32` stores (`Relaxed` ordering) --
    bracketed by the seqlock sequence stores
 3. Store the new sequence (seqlock close, Release ordering)
 
 The subscriber:
 
-1. Loads the slot sequence (Acquire) — skips if 0 or mismatched
+1. Loads the slot sequence (Acquire) -- skips if 0 or mismatched
 2. Reads block_idx and data_len via `AtomicU32` loads (`Relaxed`)
 3. CAS-increments the block's refcount (`AtomicU32`, AcqRel)
 4. Re-checks the slot sequence to detect an overwrite race
@@ -164,6 +102,7 @@ instructions on all platforms (the seqlock bracket provides the actual ordering)
   |     0x14 URI_LEN  (u32)   |
   |     0x18 URI_HASH (u64)   |
   |     0x20 URI      (64B)   |
+  |     0x60 TYPE_SIZE(u32)   |  <-- typed pub/sub: expected sizeof(T)
   +---------------------------+
   | Topic Entry 1 ...         |
   +---------------------------+
@@ -185,7 +124,8 @@ instructions on all platforms (the seqlock bracket provides the actual ordering)
 
 Hot fields (`TE_ACTIVE`, `TE_NOTIFY`, `TE_WRITE_SEQ`, `TE_WAITERS`) are packed
 into the first cache line (offsets 0x00-0x13) of each topic entry to minimize
-cache misses on the subscriber's polling path.
+cache misses on the subscriber's polling path. `TE_TYPE_SIZE` at offset 0x60
+stores the `mem::size_of::<T>()` for typed topics -- zero for untyped topics.
 
 ### Treiber stack pool
 
@@ -211,11 +151,11 @@ The block pool is a lock-free Treiber stack using a 64-bit packed
 
 ### Receive flow
 
-1. Load `write_seq` — if unchanged, return `None`
+1. Load `write_seq` -- if unchanged, return `None`
 2. Compute target slot from sequence
 3. Seqlock-read: check seq, read block_idx + data_len (AtomicU32 Relaxed)
 4. CAS-increment block refcount (Acquire load, AcqRel CAS)
-5. Seqlock re-check — undo refcount if slot was overwritten
+5. Seqlock re-check -- undo refcount if slot was overwritten
 6. Return `SampleGuard<'a>` (deref reads directly from mmap)
 7. On guard drop: `fetch_sub(1, AcqRel)` on refcount; free block if it hits 0
 
@@ -238,18 +178,61 @@ Subscribers call `check_heartbeat()` when blocking in `recv()`:
 
 ---
 
+## Pod trait and typed pub/sub
+
+The byte-oriented API (`loan` / `set_data` / `SampleGuard<[u8]>`) is the
+foundation. On top of it, crossbar provides **typed pub/sub** for structured
+data.
+
+### The `Pod` trait
+
+`Pod` (Plain Old Data) marks types that are safe to interpret directly from
+shared memory bytes. A type is `Pod` if:
+
+1. It is `Copy + 'static`
+2. Every bit pattern is a valid value (no padding-dependent invariants)
+3. It has `#[repr(C)]` layout (deterministic field ordering)
+
+```rust
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct Tick {
+    price: f64,
+    volume: u64,
+}
+
+unsafe impl Pod for Tick {}
+```
+
+The `unsafe` impl is the programmer's promise that the type satisfies these
+invariants. Crossbar performs a runtime size check (`TE_TYPE_SIZE`) to catch
+mismatched publisher/subscriber types.
+
+### Typed API
+
+| Byte API | Typed API | Description |
+|---|---|---|
+| `register(uri)` | `register_typed::<T>(uri)` | Register a topic, recording `size_of::<T>()` in the topic entry |
+| `loan(handle)` | `loan_typed::<T>(handle)` | Loan a block, returning a typed mutable reference |
+| `try_recv()` | `try_recv_typed::<T>()` | Receive a `TypedSampleGuard<T>` with `Deref<Target=T>` |
+
+`TypedSampleGuard<T>` wraps `SampleGuard` and provides `Deref<Target=T>` --
+the subscriber reads the struct directly from shared memory, zero copies,
+zero deserialization.
+
+---
+
 ## Comparison to iceoryx2
 
-The `crossbar-ipc` crate is the closest analogue to `iceoryx2`.
-
-| Aspect | crossbar-ipc | iceoryx2 |
+| Aspect | crossbar | iceoryx2 |
 |---|---|---|
 | Pool allocation | Treiber stack (ABA-safe via generation) | lock-free pool |
 | Publication | seqlock ring of 8B descriptors | ring of descriptors |
 | Read API | `SampleGuard<'a>` with `Deref<[u8]>` (borrowed) | typed zero-copy sample API |
+| Typed API | `Pod` trait + `TypedSampleGuard<T>` | built-in typed pub/sub |
 | Notification | futex-based smart wake (skip if no waiters) | event-based notification |
 | Higher-level API | URI/topic names | typed service/topic configuration |
 
-Crossbar's distinction is the API layer: URI-addressed subscriptions and a
-separate in-process `Bus<T>` for same-process fan-out. The SHM primitive itself
-is deliberately minimal — Treiber stack + seqlock ring + refcounted guards.
+Crossbar's distinction is the combination of URI-addressed subscriptions with
+typed zero-copy access. The SHM primitive itself is deliberately minimal --
+Treiber stack + seqlock ring + refcounted guards.

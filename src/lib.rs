@@ -19,7 +19,7 @@
 //! ## Quick Start
 //!
 //! ```rust,no_run
-//! use crossbar_ipc::*;
+//! use crossbar::*;
 //!
 //! // Publisher
 //! let mut pub_ = ShmPublisher::create("prices", PubSubConfig::default()).unwrap();
@@ -30,21 +30,36 @@
 //! loan.publish();
 //! ```
 
+#![no_std]
 #![warn(missing_docs)]
 #![deny(unsafe_code)]
 
+#[cfg(feature = "std")]
+extern crate std;
+
+extern crate alloc;
+
 #[allow(unsafe_code)]
-mod mmap;
+mod pod;
 #[allow(unsafe_code)]
-mod notify;
+pub mod protocol;
 #[allow(unsafe_code)]
-mod pubsub;
-#[allow(unsafe_code)]
-mod wait;
+pub mod wait;
 
 pub mod error;
 
-pub use pubsub::{
-    PubSubConfig, SampleGuard, ShmLoan, ShmPublisher, ShmSubscriber, Subscription, TopicHandle,
-};
+#[cfg(feature = "std")]
+#[allow(unsafe_code)]
+mod platform;
+
+// Always available (no_std)
+pub use pod::Pod;
+pub use protocol::{PubSubConfig, Region};
 pub use wait::WaitStrategy;
+
+// std-only exports
+#[cfg(feature = "std")]
+pub use platform::{
+    SampleGuard, ShmLoan, ShmPublisher, ShmSubscriber, Subscription, TopicHandle, TypedSampleGuard,
+    TypedShmLoan,
+};

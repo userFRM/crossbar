@@ -1,4 +1,4 @@
-use crossbar_ipc::*;
+use crossbar::*;
 
 // ─── O(1) pub/sub tests ─────────────────────────────────────────────────
 

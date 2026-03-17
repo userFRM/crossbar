@@ -1,10 +1,7 @@
 # Benchmarks
 
 All numbers come from [Criterion](https://github.com/bheisler/criterion.rs)
-benchmarks in the workspace:
-
-- `crossbar-inproc/benches/bus.rs` — in-process `Bus<T>` pub/sub
-- `crossbar-ipc/benches/pubsub.rs` — shared-memory pub/sub (+ iceoryx2 head-to-head)
+benchmarks in `benches/pubsub.rs` (shared-memory pub/sub + iceoryx2 head-to-head).
 
 ## Environment
 
@@ -20,30 +17,7 @@ benchmarks in the workspace:
 
 ---
 
-## In-process pub/sub (`crossbar-inproc`)
-
-| Benchmark | Latency |
-|---|---|
-| 1-subscriber roundtrip (publish + try_recv) | **57 ns** |
-| Fan-out to 0 subscribers | 37 ns |
-| Fan-out to 1 subscriber | 57 ns |
-| Fan-out to 2 subscribers | 75 ns |
-| Fan-out to 5 subscribers | 132 ns |
-| Fan-out to 10 subscribers | **224 ns** |
-| Publish only (1 sub, no recv) | 61 ns |
-| TopicHandle (pre-resolved) | 57 ns |
-| bus.publish() (HashMap lookup) | 111 ns |
-| Arc::new + Arc::clone + drop | 26 ns |
-| Subscribe + unsubscribe | 644 ns |
-| try_recv (empty ring) | 1 ns |
-
-The lock-free SPSC ring with CAS-based overflow adds ~19 ns per subscriber
-during fan-out (vs ~37 ns base overhead). The ring uses cache-line padded
-head/tail indices to prevent false sharing across cores.
-
----
-
-## Shared-memory pub/sub (`crossbar-ipc`)
+## Shared-memory pub/sub (`crossbar`)
 
 ### Latency
 
@@ -85,14 +59,11 @@ rises with payload size even though the publication step itself remains constant
 ## Reproducing
 
 ```sh
-# In-process benchmarks
-cargo bench -p crossbar-inproc
-
-# Shared-memory benchmarks (+ iceoryx2 head-to-head, Unix only)
-cargo bench -p crossbar-ipc
+# All shared-memory benchmarks (+ iceoryx2 head-to-head, Unix only)
+cargo bench
 
 # Only head-to-head comparison
-cargo bench -p crossbar-ipc -- "head_to_head"
+cargo bench -- "head_to_head"
 ```
 
 Criterion reports are written to `target/criterion/`.

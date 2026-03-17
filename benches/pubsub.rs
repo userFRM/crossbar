@@ -1,6 +1,6 @@
 use criterion::Throughput;
 use criterion::{criterion_group, criterion_main, Criterion};
-use crossbar_ipc::*;
+use crossbar::*;
 use std::hint::black_box;
 use std::time::Duration;
 

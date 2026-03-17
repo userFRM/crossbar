@@ -1,3 +1,41 @@
-[workspace]
-members = ["crossbar-ipc", "crossbar-inproc"]
-resolver = "2"
+[package]
+name = "crossbar"
+version = "0.2.0"
+edition = "2021"
+description = "Zero-copy pub/sub over shared memory. Typed, O(1), 58ns transport."
+license = "MIT OR Apache-2.0"
+keywords = ["ipc", "shared-memory", "pubsub", "zero-copy", "low-latency"]
+categories = ["network-programming"]
+
+[features]
+default = ["std"]
+std = ["libc", "windows-sys"]
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2.183", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
+] }
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[target.'cfg(unix)'.dev-dependencies]
+iceoryx2 = "0.8.1"
+
+[[example]]
+name = "publisher"
+
+[[example]]
+name = "subscriber"
+
+[[bench]]
+name = "pubsub"
+harness = false

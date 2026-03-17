@@ -1,0 +1,229 @@
+// Copyright (c) 2026 The Crossbar Contributors
+//
+// This source code is licensed under the MIT license or Apache License 2.0,
+// at your option. See LICENSE-MIT and LICENSE-APACHE files in the project
+// root for details.
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Region: shared state for the mmap region.
+//!
+//! Works on raw pointers -- no OS dependency. The platform layer constructs
+//! a `Region` from an mmap'd pointer.
+
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+use super::config::PubSubConfig;
+use super::layout::*;
+
+#[cfg(feature = "std")]
+use crate::platform::notify;
+
+/// Shared state for the mmap region -- held by both publisher/subscriber
+/// and by `SampleGuard` (via `Arc`) to keep the mmap alive.
+pub struct Region {
+    pub(crate) base: *mut u8,
+    #[allow(dead_code)]
+    pub(crate) len: usize,
+    pub(crate) config: PubSubConfig,
+    pub(crate) pool_offset: usize,
+}
+
+// SAFETY: The mmap region is process-shared memory backed by a named file in
+// /dev/shm. All cross-process access is mediated by atomic operations in the
+// caller. The raw pointer is never dereferenced without explicit unsafe blocks.
+unsafe impl Send for Region {}
+unsafe impl Sync for Region {}
+
+impl Region {
+    /// Construct a Region from a raw pointer and length.
+    ///
+    /// # Safety
+    ///
+    /// `base` must point to a valid, mmap'd region of at least `len` bytes
+    /// that remains valid for the lifetime of this Region.
+    pub unsafe fn from_raw(base: *mut u8, len: usize, config: PubSubConfig) -> Self {
+        let pool_offset = block_pool_offset(&config);
+        Self {
+            base,
+            len,
+            config,
+            pool_offset,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn pool_head(&self) -> &AtomicU64 {
+        unsafe { &*(self.base.add(GH_POOL_HEAD) as *const AtomicU64) }
+    }
+
+    #[inline]
+    pub(crate) fn block_ptr(&self, idx: u32) -> *mut u8 {
+        debug_assert!((idx as usize) < self.config.block_count as usize);
+        unsafe {
+            self.base
+                .add(self.pool_offset + idx as usize * self.config.block_size as usize)
+        }
+    }
+
+    #[inline]
+    pub(crate) fn block_refcount(&self, idx: u32) -> &AtomicU32 {
+        unsafe { &*(self.block_ptr(idx).add(BK_REFCOUNT) as *const AtomicU32) }
+    }
+
+    #[inline]
+    pub(crate) fn alloc_block(&self) -> Option<u32> {
+        loop {
+            let head = self.pool_head().load(Ordering::Acquire);
+            let (gen, idx) = unpack(head);
+            if idx == NO_BLOCK {
+                return None;
+            }
+            let next =
+                unsafe { &*(self.block_ptr(idx) as *const AtomicU32) }.load(Ordering::Relaxed);
+            let new_head = pack(gen.wrapping_add(1), next);
+            if self
+                .pool_head()
+                .compare_exchange(head, new_head, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                // Clear refcount for the newly allocated block
+                self.block_refcount(idx).store(0, Ordering::Release);
+                return Some(idx);
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn free_block(&self, idx: u32) {
+        debug_assert!((idx as usize) < self.config.block_count as usize);
+        loop {
+            let head = self.pool_head().load(Ordering::Acquire);
+            let (gen, old_head_idx) = unpack(head);
+            // Write next pointer into the block's free-list link (offset 0)
+            unsafe { &*(self.block_ptr(idx) as *const AtomicU32) }
+                .store(old_head_idx, Ordering::Relaxed);
+            let new_head = pack(gen.wrapping_add(1), idx);
+            if self
+                .pool_head()
+                .compare_exchange(head, new_head, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    pub(crate) fn init_free_list(&self) {
+        for i in 0..self.config.block_count {
+            let next = if i + 1 < self.config.block_count {
+                i + 1
+            } else {
+                NO_BLOCK
+            };
+            let ptr = self.block_ptr(i);
+            unsafe { &*(ptr as *const AtomicU32) }.store(next, Ordering::Relaxed);
+            // Zero refcount
+            unsafe { &*(ptr.add(BK_REFCOUNT) as *const AtomicU32) }.store(0, Ordering::Relaxed);
+        }
+        self.pool_head().store(pack(0, 0), Ordering::Release);
+    }
+
+    /// Data capacity per block (block_size minus the 8-byte header).
+    pub(crate) fn data_capacity(&self) -> usize {
+        self.config.block_size as usize - BLOCK_DATA_OFFSET
+    }
+
+    pub(crate) fn heartbeat_atom(&self) -> &AtomicU64 {
+        unsafe { &*(self.base.add(GH_HEARTBEAT) as *const AtomicU64) }
+    }
+
+    #[cfg(feature = "std")]
+    #[allow(clippy::cast_possible_truncation)]
+    pub(crate) fn update_heartbeat(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
+        self.heartbeat_atom().store(now, Ordering::Release);
+    }
+
+    #[cfg(feature = "std")]
+    #[allow(clippy::cast_possible_truncation)]
+    pub(crate) fn check_heartbeat(&self) -> Result<(), crate::error::IpcError> {
+        let hb = self.heartbeat_atom().load(Ordering::Acquire);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
+        if now.saturating_sub(hb) > self.config.stale_timeout.as_micros() as u64 {
+            return Err(crate::error::IpcError::PublisherDead);
+        }
+        Ok(())
+    }
+
+    /// Shared commit logic for both `ShmLoan` and `TypedShmLoan`.
+    #[cfg(feature = "std")]
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_to_ring(
+        &self,
+        block_idx: u32,
+        data_len: u32,
+        seq: u64,
+        topic_idx: u32,
+        write_seq_atom: &AtomicU64,
+        notify_atom: &AtomicU32,
+        waiters_atom: &AtomicU32,
+        wake: bool,
+    ) {
+        let ring_depth = self.config.ring_depth;
+        let slot = (seq % ring_depth as u64) as u32;
+        let entry_off = ring_entry_off(&self.config, topic_idx, slot);
+        let entry_ptr = unsafe { self.base.add(entry_off) };
+
+        // 1. Read old block_idx from the ring slot we're about to overwrite
+        let old_block_idx =
+            unsafe { &*(entry_ptr.add(RE_BLOCK_IDX) as *const AtomicU32) }.load(Ordering::Relaxed);
+
+        // 2. Set new block's refcount to 1 (ring holds one reference)
+        self.block_refcount(block_idx).store(1, Ordering::Release);
+
+        // 3. Invalidate seq (seqlock open) -- prevents subscribers from reading mid-write
+        let entry_seq = unsafe { &*(entry_ptr.add(RE_SEQ) as *const AtomicU64) };
+        entry_seq.store(0, Ordering::Release);
+
+        // 4. Write new block_idx and data_len
+        unsafe { &*(entry_ptr.add(RE_BLOCK_IDX) as *const AtomicU32) }
+            .store(block_idx, Ordering::Relaxed);
+        unsafe { &*(entry_ptr.add(RE_DATA_LEN) as *const AtomicU32) }
+            .store(data_len, Ordering::Relaxed);
+
+        // 5. Validate seq (seqlock close) -- data visible to subscribers
+        entry_seq.store(seq, Ordering::Release);
+
+        // 6. Bump topic write_seq
+        write_seq_atom.store(seq, Ordering::Release);
+
+        // 7. Release old block (decrement refcount; free if no subscribers hold it)
+        if old_block_idx != NO_BLOCK {
+            let prev = self
+                .block_refcount(old_block_idx)
+                .fetch_sub(1, Ordering::AcqRel);
+            if prev == 1 {
+                self.free_block(old_block_idx);
+            }
+        }
+
+        // 8. Smart wake: always bump notification counter, but only issue the
+        //    expensive futex_wake syscall (~170ns) when a subscriber is actually
+        //    blocked in recv(). When all subscribers poll with try_recv(), this
+        //    path costs ~8ns instead of ~170ns.
+        if wake {
+            notify_atom.fetch_add(1, Ordering::Release);
+            if waiters_atom.load(Ordering::Acquire) > 0 {
+                notify::wake_all(notify_atom);
+            }
+        }
+    }
+}

@@ -24,8 +24,8 @@
 //!
 //! On **aarch64**, `YieldSpin` and `BackoffSpin` use the `WFE` (Wait For
 //! Event) instruction instead of `core::hint::spin_loop()` (which maps to
-//! `YIELD`). `WFE` puts the core into a low-power state until an event —
-//! such as a cache line invalidation from the publisher's store — wakes it.
+//! `YIELD`). `WFE` puts the core into a low-power state until an event --
+//! such as a cache line invalidation from the publisher's store -- wakes it.
 //! The `SEVL` + `WFE` pattern is used: `SEVL` sets the local event register
 //! so the first `WFE` doesn't block unconditionally.
 //!
@@ -95,7 +95,7 @@ impl WaitStrategy {
     /// `try_recv` returns `None`.
     ///
     /// `iter` is the zero-based iteration count since the last successful
-    /// receive — it drives phase transitions in `Adaptive` and `BackoffSpin`.
+    /// receive -- it drives phase transitions in `Adaptive` and `BackoffSpin`.
     #[inline]
     pub(crate) fn wait(&self, iter: u32) {
         match self {
@@ -197,7 +197,7 @@ mod tests {
     #[test]
     fn debug_format() {
         let ws = WaitStrategy::BusySpin;
-        let s = format!("{ws:?}");
+        let s = alloc::format!("{ws:?}");
         assert!(s.contains("BusySpin"));
     }
 }

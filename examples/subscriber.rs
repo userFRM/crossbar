@@ -1,7 +1,7 @@
 //! Cross-process pub/sub latency benchmark — subscriber side.
 //! Reads timestamps written by `pubsub_publisher` and computes one-way latency.
 
-use crossbar_ipc::*;
+use crossbar::*;
 
 /// Returns monotonic nanoseconds shared across processes.
 #[cfg(unix)]

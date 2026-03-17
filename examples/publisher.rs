@@ -1,7 +1,7 @@
 //! Cross-process pub/sub latency benchmark — publisher side.
 //! Run alongside `pubsub_subscriber` to measure true cross-process latency.
 
-use crossbar_ipc::*;
+use crossbar::*;
 use std::time::Duration;
 
 /// Returns monotonic nanoseconds shared across processes.

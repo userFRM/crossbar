@@ -16,7 +16,7 @@
 //! On Linux, applies `MADV_HUGEPAGE` after mapping to hint the kernel to
 //! back the region with transparent 2 MiB huge pages, reducing TLB misses.
 //! Our 12.6 MiB default SHM region spans ~3,072 regular 4 KiB pages but
-//! only ~7 huge pages — fewer TLB entries, fewer misses (~100 ns each).
+//! only ~7 huge pages -- fewer TLB entries, fewer misses (~100 ns each).
 //!
 //! Pages are faulted lazily on first access (`MAP_SHARED` without
 //! `MAP_POPULATE`), so overprovisioned configurations don't consume
@@ -31,13 +31,13 @@ use std::os::unix::io::AsRawFd;
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 
-// ─── Read-write mapping ─────────────────────────────────────────────────
+// ---- Read-write mapping ----
 
 /// Read-write memory-mapped region with optimized kernel flags.
 ///
 /// `Deref<Target=[u8]>` is intentionally **not** implemented. This memory is
 /// shared with other processes via `MAP_SHARED`, so creating `&[u8]` or
-/// `&mut [u8]` references would violate Rust's aliasing model — another
+/// `&mut [u8]` references would violate Rust's aliasing model -- another
 /// process can write to the region at any time, making `&[u8]` unsound,
 /// and `&mut [u8]` is never exclusive. Use [`as_ptr`](Self::as_ptr),
 /// [`as_mut_ptr`](Self::as_mut_ptr), and [`len`](Self::len) to access
@@ -104,7 +104,7 @@ impl RawMmap {
 
         #[cfg(target_os = "linux")]
         // SAFETY: ptr is a valid mmap region of `len` bytes. MADV_HUGEPAGE is
-        // advisory — failure is silently ignored if THP is disabled system-wide.
+        // advisory -- failure is silently ignored if THP is disabled system-wide.
         unsafe {
             libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
         }
@@ -119,7 +119,7 @@ impl RawMmap {
     ///
     /// Uses `CreateFileMappingW` + `MapViewOfFile` to create a shared,
     /// read-write view of the file. The file-mapping handle is closed
-    /// immediately after mapping — the view keeps the mapping alive.
+    /// immediately after mapping -- the view keeps the mapping alive.
     #[cfg(windows)]
     pub fn from_file_with_len(file: &std::fs::File, len: usize) -> io::Result<Self> {
         use windows_sys::Win32::Foundation::CloseHandle;
@@ -161,7 +161,7 @@ impl RawMmap {
         // FILE_MAP_ALL_ACCESS gives read-write access to the view.
         let view = unsafe { MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, len) };
 
-        // Close the mapping handle — the view keeps the mapping alive.
+        // Close the mapping handle -- the view keeps the mapping alive.
         // SAFETY: mapping is a valid handle returned by CreateFileMappingW.
         unsafe {
             CloseHandle(mapping);

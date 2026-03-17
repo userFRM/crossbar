@@ -4,34 +4,33 @@
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org)
 
-**URI-addressed pub/sub for local communication. In-process fan-out and zero-copy shared-memory transport.**
+**Fastest zero-copy IPC. Typed pub/sub over shared memory. 58 ns transport, 4.1x faster than iceoryx2.**
 
 > [!NOTE]
-> Crossbar is **not** an HTTP server. It moves data between threads via `Arc<T>`
-> (in-process) or between processes via shared memory (`/dev/shm`). Think
-> URI-addressed channels at hardware speed. If you need HTTP, use
-> [axum](https://github.com/tokio-rs/axum).
+> Crossbar is **not** an HTTP server. It moves data between processes via shared
+> memory (`/dev/shm`). Think URI-addressed channels at hardware speed. If you
+> need HTTP, use [axum](https://github.com/tokio-rs/axum).
 
 ---
 
-## Two crates
+## What is crossbar?
 
-Crossbar is a workspace with two independent crates. Use one or both.
+Crossbar is a single Rust crate for zero-copy pub/sub over shared memory.
+Allocates blocks from a lock-free Treiber stack pool, writes data directly into
+the mmap'd region, and transfers ownership via an 8-byte descriptor. O(1)
+transport regardless of payload size. Subscribers get safe `SampleGuard`
+references with `Deref<Target=[u8]>` -- the block is held alive by atomic
+refcounting via a seqlock ring.
 
-### `crossbar-inproc` — in-process pub/sub
+### Features
 
-Type-safe `Bus<T>` for fan-out within a single process. Messages are shared via
-`Arc<T>` — zero serialization, zero copies. Named topics like `"prices/AAPL"`.
-The publish hot path is lock-free: `ArcSwap::load()` reads the subscriber list,
-then each subscriber's SPSC ring receives an `Arc::clone()` of the message.
-
-### `crossbar-ipc` — shared-memory pub/sub
-
-Zero-copy pub/sub over `/dev/shm`. Allocates blocks from a lock-free Treiber
-stack pool, writes data directly into the mmap'd region, and transfers ownership
-via an 8-byte descriptor. O(1) transport regardless of payload size. Subscribers
-get safe `SampleGuard` references with `Deref<Target=[u8]>` — the block is held
-alive by atomic refcounting via a seqlock ring.
+- **O(1) transport** -- publishes an 8-byte descriptor; latency is constant regardless of payload size
+- **Zero-copy reads** -- subscribers deref directly into the mmap'd shared memory region
+- **Lock-free pool** -- Treiber stack allocation with ABA-safe generation counters
+- **URI-addressed topics** -- subscribe to `"/prices/AAPL"` by name, no compile-time wiring
+- **Typed pub/sub** -- `Pod` trait for safe zero-copy reads of structured types via `register_typed` / `loan_typed` / `try_recv_typed`
+- **Smart wake** -- futex-based notification that skips the syscall when no subscribers are waiting
+- **Cross-platform** -- Linux, macOS, Windows
 
 ---
 
@@ -39,65 +38,50 @@ alive by atomic refcounting via a seqlock ring.
 
 ![crossbar vs iceoryx2 benchmark comparison](assets/benchmark_comparison.svg)
 
-**Left:** O(1) transport proof — we write a fixed 8 bytes into backing buffers from 64 B to 1 MB. Latency is flat for both frameworks. The transfer (writing an 8-byte descriptor to a ring) is always O(1). Crossbar is **4.1x faster** (57 ns vs 231 ns).
+**Left:** O(1) transport proof -- we write a fixed 8 bytes into backing buffers from 64 B to 1 MB. Latency is flat for both frameworks. The transfer (writing an 8-byte descriptor to a ring) is always O(1). Crossbar is **4.1x faster** (57 ns vs 231 ns).
 
-**Right:** End-to-end with full payload — both write the entire payload into SHM before transfer. At small sizes, crossbar's lower overhead wins. At 64 KB+, both converge to the same speed because `memcpy` dominates.
+**Right:** End-to-end with full payload -- both write the entire payload into SHM before transfer. At small sizes, crossbar's lower overhead wins. At 64 KB+, both converge to the same speed because `memcpy` dominates.
 
 Both benchmarks use the same operations: `loan buffer` -> `write data` -> `publish` -> `receive` -> `deref`. Apples-to-apples, same process, same Criterion harness.
 
 > **Benchmark system:** Intel i7-10700KF @ 3.80 GHz, Linux 6.8, rustc stable.
-> iceoryx2 claims ~100 ns on an i7-13700H — our 237 ns measurement reflects our
-> older hardware. Run on yours: `cargo bench -p crossbar-ipc -- "head_to_head"`
+> iceoryx2 claims ~100 ns on an i7-13700H -- our 237 ns measurement reflects our
+> older hardware. Run on yours: `cargo bench -- "head_to_head"`
 
 | | crossbar | iceoryx2 |
 |---|---|---|
 | **Transport** | **57 ns** | ~231 ns (our hw) / ~100 ns (theirs) |
 | **Pool allocator** | Treiber stack (lock-free CAS) | Lock-free pool |
-| **Above pub/sub** | URI/topic names + in-process bus | Service discovery + POSIX config |
-| **API style** | URI-addressed pub/sub | Typed pub/sub channels |
+| **Above pub/sub** | URI/topic names | Service discovery + POSIX config |
+| **API style** | URI-addressed pub/sub + typed pub/sub | Typed pub/sub channels |
 | **`no_std`** | No | Yes |
 | **Platforms** | Linux, macOS, Windows | Linux, macOS, Windows, QNX, ... |
 
-Crossbar is faster because it skips iceoryx2's service discovery and POSIX configuration layer — it goes straight from user code to atomics.
+Crossbar is faster because it skips iceoryx2's service discovery and POSIX configuration layer -- it goes straight from user code to atomics.
 
 ---
 
 ## Quick start
 
-### In-process pub/sub
-
-```rust
-use crossbar_inproc::prelude::*;
-use std::sync::Arc;
-
-let bus = Bus::<String>::new();
-let topic = bus.topic("prices/AAPL");
-let sub = bus.subscribe("prices/AAPL");
-
-topic.publish(Arc::new("42.50".into()));
-let msg = sub.try_recv().unwrap();
-println!("AAPL: {msg}");
-```
-
-### Cross-process pub/sub
+### Byte-oriented pub/sub
 
 **Publisher** writes data directly into shared memory:
 
 ```rust
-use crossbar_ipc::*;
+use crossbar::*;
 
 let mut pub_ = ShmPublisher::create("market", PubSubConfig::default())?;
 let topic = pub_.register("/prices/AAPL")?;
 
 let mut loan = pub_.loan(&topic);
 loan.set_data(b"42.50");
-loan.publish(); // O(1) — writes 8 bytes to ring
+loan.publish(); // O(1) -- writes 8 bytes to ring
 ```
 
-**Subscriber** reads the data in-place — zero copies, no `unsafe`:
+**Subscriber** reads the data in-place -- zero copies, no `unsafe`:
 
 ```rust
-use crossbar_ipc::*;
+use crossbar::*;
 
 let sub = ShmSubscriber::connect("market")?;
 let stream = sub.subscribe("/prices/AAPL")?;
@@ -108,52 +92,56 @@ if let Some(guard) = stream.try_recv() {
 // guard dropped -> block freed back to pool
 ```
 
-Run both in separate terminals:
+### Typed pub/sub
+
+The `Pod` trait enables safe zero-copy reads of structured types. Any `Copy + 'static` struct that is valid for all bit patterns can implement `Pod`.
+
+**Publisher** writes a typed value directly into shared memory:
+
+```rust
+use crossbar::*;
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct Tick {
+    price: f64,
+    volume: u64,
+}
+
+unsafe impl Pod for Tick {}
+
+let mut pub_ = ShmPublisher::create("market", PubSubConfig::default())?;
+let topic = pub_.register_typed::<Tick>("/prices/AAPL")?;
+
+let mut loan = pub_.loan_typed::<Tick>(&topic);
+*loan = Tick { price: 42.50, volume: 1000 };
+loan.publish();
+```
+
+**Subscriber** reads the typed value in-place:
+
+```rust
+use crossbar::*;
+
+let sub = ShmSubscriber::connect("market")?;
+let stream = sub.subscribe("/prices/AAPL")?;
+
+if let Some(guard) = stream.try_recv_typed::<Tick>() {
+    println!("AAPL: ${:.2} x {}", guard.price, guard.volume);
+}
+// TypedSampleGuard dropped -> block freed back to pool
+```
+
+### Running the examples
 
 ```sh
-cargo run -p crossbar-ipc --example publisher
-cargo run -p crossbar-ipc --example subscriber
+cargo run --example publisher
+cargo run --example subscriber
 ```
 
 ---
 
 ## How it works
-
-Crossbar has two fast paths for the same problem — named pub/sub at hardware
-speed — adapted to different scopes (threads vs processes).
-
-### In-process path (`crossbar-inproc`)
-
-```mermaid
-graph LR
-    subgraph "Thread A"
-        PUB["TopicHandle::publish()"]
-    end
-
-    subgraph "Bus<T>"
-        AS["ArcSwap<br/>subscriber list"]
-        R1["SPSC Ring 1"]
-        R2["SPSC Ring 2"]
-    end
-
-    subgraph "Thread B / C"
-        S1["Subscription 1"]
-        S2["Subscription 2"]
-    end
-
-    PUB -->|"ArcSwap::load()"| AS
-    AS -->|"Arc::clone()"| R1
-    AS -->|"Arc::clone()"| R2
-    R1 -->|"try_recv"| S1
-    R2 -->|"try_recv"| S2
-```
-
-1. `TopicHandle::publish()` loads the subscriber list via `ArcSwap` (lock-free)
-2. Each subscriber's dedicated SPSC ring receives an `Arc::clone()` of the message
-3. On overflow, the ring CAS-advances its tail to drop the oldest message (lossy)
-4. `Subscription::recv()` uses a 3-phase wait: spin (32) -> yield (32) -> condvar
-
-### Shared-memory path (`crossbar-ipc`)
 
 ```mermaid
 sequenceDiagram
@@ -202,26 +190,15 @@ graph LR
 ## Installation
 
 ```toml
-# In-process pub/sub only
 [dependencies]
-crossbar-inproc = "0.2"
-
-# Shared-memory pub/sub
-[dependencies]
-crossbar-ipc = "0.1"
+crossbar = "0.2"
 ```
 
 ---
 
 ## Configuration
 
-### In-process (`BusConfig`)
-
-| Field | Default | Description |
-|---|---|---|
-| `ring_depth` | 64 | Default ring depth for new subscribers |
-
-### Shared-memory (`PubSubConfig`)
+### `PubSubConfig`
 
 | Field | Default | Description |
 |---|---|---|
@@ -250,40 +227,23 @@ crossbar-ipc = "0.1"
 | 64 KB | **46.7 GiB/s** |
 | 1 MB | **31.4 GiB/s** |
 
-### In-process pub/sub
-
-| Benchmark | Latency |
-|---|---|
-| 1-subscriber roundtrip (publish + try_recv) | **57 ns** |
-| Fan-out to 10 subscribers | **224 ns** |
-| try_recv (empty) | **1 ns** |
-
 ---
 
 ## Project layout
 
 ```
 crossbar/
-  crossbar-inproc/         In-process pub/sub (v0.2.0)
-    src/
-      lib.rs               Bus<T>, prelude
-      bus.rs               Central registry, topic creation, BusConfig
-      ring.rs              Lock-free SPSC ring buffer (CAS overflow)
-      topic.rs             TopicHandle, lock-free publish via ArcSwap
-      subscription.rs      Subscription, 3-phase recv (spin/yield/condvar)
-    benches/bus.rs         Criterion benchmarks
-    examples/demo.rs       Market data fan-out demo
-  crossbar-ipc/            Shared-memory pub/sub (v0.1.0)
-    src/
-      lib.rs               Crate root, re-exports
-      pubsub.rs            ShmPublisher, ShmSubscriber, SampleGuard
-      mmap.rs              Raw mmap wrappers (MADV_HUGEPAGE)
-      notify.rs            Futex (Linux) / WaitOnAddress (Windows) / polling (macOS)
-      error.rs             IpcError enum
-    benches/pubsub.rs      Criterion benchmarks (incl. iceoryx2 head-to-head)
-    examples/
-      publisher.rs         Cross-process latency benchmark (publisher)
-      subscriber.rs        Cross-process latency benchmark (subscriber)
+  src/
+    lib.rs               Crate root, re-exports
+    pubsub.rs            ShmPublisher, ShmSubscriber, SampleGuard
+    mmap.rs              Raw mmap wrappers (MADV_HUGEPAGE)
+    notify.rs            Futex (Linux) / WaitOnAddress (Windows) / polling (macOS)
+    wait.rs              WaitStrategy for blocking recv
+    error.rs             IpcError enum
+  benches/pubsub.rs      Criterion benchmarks (incl. iceoryx2 head-to-head)
+  examples/
+    publisher.rs         Cross-process latency benchmark (publisher)
+    subscriber.rs        Cross-process latency benchmark (subscriber)
 ```
 
 ---
@@ -292,8 +252,8 @@ crossbar/
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo clippy --all-targets -- -D warnings
+cargo test
 ```
 
 ---
