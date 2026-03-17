@@ -11,7 +11,7 @@
 use core::time::Duration;
 
 /// Configuration for pool-backed O(1) pub/sub.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct PubSubConfig {
     /// Maximum number of topics (default: 16).
     pub max_topics: u32,
@@ -21,7 +21,7 @@ pub struct PubSubConfig {
     /// Usable data capacity is `block_size - 8` (8 bytes for refcount header).
     pub block_size: u32,
     /// Ring depth per topic -- how many published samples the ring remembers
-    /// before overwriting (default: 8).
+    /// before overwriting (default: 8). Must be a power of 2.
     pub ring_depth: u32,
     /// Heartbeat write interval (default: 100 ms).
     pub heartbeat_interval: Duration,

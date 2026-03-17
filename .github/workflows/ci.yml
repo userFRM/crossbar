@@ -31,6 +31,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --features ffi -- -D warnings
 
   test:
     name: Tests (Linux)

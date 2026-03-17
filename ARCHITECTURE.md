@@ -12,6 +12,7 @@ src/
   pod.rs          Pod trait
   error.rs        IpcError
   wait.rs         WaitStrategy
+  ffi.rs          C FFI bindings (#[cfg(feature = "ffi")])
 
   protocol/       no_std — pure atomics, raw pointer math, no OS calls
     layout.rs     All SHM offset constants and layout helper functions
@@ -24,6 +25,10 @@ src/
     shm.rs        ShmPublisher, ShmSubscriber
     subscription.rs  Subscription, SampleGuard, TypedSampleGuard
     loan.rs       ShmLoan, TypedShmLoan, TopicHandle
+    channel.rs    ShmChannel — bidirectional channel
+
+include/
+  crossbar.h      C/C++ header
 ```
 
 The split is intentional: `protocol/` can be used on bare-metal (no OS) if you bring your own mmap. `platform/` is the opinionated std implementation that most users want.
@@ -64,7 +69,7 @@ One mmap region — three logical areas:
 +---------------------------+
 | Ring 0 (ring_depth × 16B) |
 |   per entry:              |
-|   0x00 seq      (AtomicU64)|  seqlock — 0 means slot is being written
+|   0x00 seq      (AtomicU64)|  seqlock — SEQ_WRITING (u64::MAX) = being written
 |   0x08 block_idx(AtomicU32)|  Relaxed
 |   0x0C data_len (AtomicU32)|  Relaxed
 +---------------------------+
@@ -86,34 +91,43 @@ Hot topic fields (`ACTIVE`, `NOTIFY`, `WRITE_SEQ`, `WAITERS`) are packed into th
 
 1. Pop block from Treiber stack (CAS on `pool_head`)
 2. Write payload into block at `BLOCK_DATA_OFFSET` (offset 8)
-3. Set block refcount to 1 (Release) — ring now holds one reference
-4. Seqlock open: store `seq = 0` to ring slot (Release) — invalidates slot
-5. Write `block_idx` and `data_len` (Relaxed) — safe, bracketed by seqlock
-6. Seqlock close: store new `seq` (Release) — slot is now readable
-7. Store new `seq` to topic `WRITE_SEQ` (Release)
-8. Decrement old block's refcount (AcqRel); free if it reaches zero
-9. Smart wake: increment `NOTIFY`; call `futex_wake` only if `WAITERS > 0`
+3. Claim sequence number: `fetch_add(1)` on `WRITE_SEQ` (AcqRel)
+4. Compute slot: `seq & (ring_depth - 1)` (bitmask, ring_depth must be power of 2)
+5. CAS-acquire ring slot: `compare_exchange(current, SEQ_WRITING)` — spins with `yield_hint` (SEVL+WFE on aarch64, PAUSE on x86) if another publisher holds the slot
+6. Set block refcount to 1 (Release)
+7. Write `block_idx` and `data_len` (Relaxed) — safe, bracketed by seqlock
+8. Seqlock close: store new `seq` (Release) — slot is now readable
+9. Decrement old block's refcount (AcqRel); free if it reaches zero
+10. Smart wake: increment `NOTIFY`; call `futex_wake` only if `WAITERS > 0`
 
-Step 9 means `publish()` costs ~8 ns when all subscribers use `try_recv()` (no blocked waiters). The futex syscall (~170 ns) fires only when a subscriber is blocked in `recv()`.
+Step 10 means `publish()` costs ~8 ns when all subscribers use `try_recv()` (no blocked waiters). The futex syscall (~170 ns) fires only when a subscriber is blocked in `recv()`.
+
+In single-publisher mode (the common case), the CAS in step 5 always succeeds on the first attempt — no contention, no spin.
 
 ---
 
 ## Receive path
 
 1. Load `WRITE_SEQ` (Acquire) — return `None` if unchanged
-2. Compute slot: `seq % ring_depth`
-3. Seqlock check 1: load slot `seq` (Acquire) — skip if 0 or mismatch
-4. Read `block_idx` and `data_len` (Relaxed) — safe inside seqlock bracket
-5. CAS-increment block refcount (AcqRel) — acquire a reference
-6. Seqlock check 2: verify slot `seq` again — undo refcount and retry if overwritten
-7. Advance `last_seq`, return `SampleGuard`
-8. On guard drop: decrement refcount (AcqRel); free block if it reaches zero
+2. Compute scan window: `[last_seq+1 .. write_seq]`, clamped to `ring_depth`
+3. For each seq in the window (first committed slot wins):
+   a. Compute slot: `seq & (ring_depth - 1)`
+   b. Seqlock check 1: load slot `seq` (Acquire) — skip if `SEQ_WRITING` or mismatch
+   c. Read `block_idx` and `data_len` (Relaxed) — safe inside seqlock bracket
+   d. CAS-increment block refcount (AcqRel) — acquire a reference
+   e. Seqlock check 2: verify slot `seq` again — undo refcount if overwritten
+4. Advance `last_seq`, return `SampleGuard`
+5. On guard drop: decrement refcount (AcqRel); free block if it reaches zero
+
+In single-publisher mode, the scan window is always 1 slot — the loop executes once. Under multi-publisher, at most `ring_depth` slots are scanned (default: 8, each check is ~9 ns).
 
 ---
 
 ## Seqlock correctness
 
-Ring data fields (`block_idx`, `data_len`) are read and written with `Relaxed` ordering. This is not a data race: `AtomicU32` operations are atomic by definition. The memory ordering (visibility guarantees) comes from the seqlock bracket — the Release store at seqlock close synchronizes-with the Acquire load at seqlock check 1. The Relaxed data reads between the two checks are safe because they happen within the same coherent atomic region. This pattern eliminates formal UB while compiling to identical instructions on all platforms.
+Ring data fields (`block_idx`, `data_len`) are read and written with `Relaxed` ordering. This is not a data race: `AtomicU32` operations are atomic by definition. The memory ordering (visibility guarantees) comes from the seqlock bracket — the Release store at seqlock close synchronizes-with the Acquire load at seqlock check 1. The Relaxed data reads between the two checks are safe because they happen within the same coherent atomic region.
+
+The seqlock uses `SEQ_WRITING` (`u64::MAX`) as the "slot locked" sentinel instead of 0. Publishers CAS the slot from its current seq to `SEQ_WRITING` before writing, then store the new seq on close. This allows multiple publishers to safely contend on the same ring slot — the CAS serializes writes, and subscribers skip slots where `entry_seq == SEQ_WRITING`.
 
 ---
 
@@ -166,6 +180,52 @@ The spin phase uses `PAUSE` on x86 and `SEVL + WFE` on aarch64. WFE puts the cor
 
 ## Heartbeat and liveness
 
-The publisher stores a microsecond-resolution timestamp in the global header every `heartbeat_interval` (default 100 ms), amortized over 1024 loan calls to avoid `Instant::now()` overhead on the hot path.
+Publishers store a microsecond-resolution timestamp in the global header every `heartbeat_interval` (default 100 ms), amortized over 1024 loan calls to avoid `Instant::now()` overhead on the hot path. With multiple publishers, `fetch_max` ensures the heartbeat only advances — any live publisher keeps the region alive.
 
 Subscribers check the heartbeat when blocking in `recv()`. If the timestamp is older than `stale_timeout` (default 5 s), `recv()` returns `Err(IpcError::PublisherDead)`.
+
+---
+
+## Multi-publisher
+
+Multiple publishers can share the same SHM region via `ShmPublisher::open()`. The protocol supports this through:
+
+- **Atomic seq claiming**: `fetch_add(1)` on `WRITE_SEQ` gives each publisher a unique, monotonically increasing sequence number at commit time
+- **CAS-based ring slot locking**: `compare_exchange(current, SEQ_WRITING)` serializes writes to the same ring slot when two publishers' seqs differ by exactly `ring_depth`
+- **CAS-based topic registration**: Three-state `ACTIVE` field (`FREE=0 → INIT=2 → ACTIVE=1`) prevents concurrent register races
+- **Shared flock**: The creating publisher downgrades its exclusive lock to shared after initialization. Secondary publishers acquire shared locks. All shared locks together prevent a new `create()` from truncating the region.
+- **`fetch_max` heartbeat**: Any live publisher keeps the heartbeat fresh
+
+The block pool (Treiber stack) is already lock-free and handles concurrent alloc/free from multiple publishers without modification.
+
+---
+
+## Bidirectional channel
+
+`ShmChannel` composes two pub/sub regions into a bidirectional pair. Each side publishes on its own region and subscribes to the other's:
+
+```
+Server                                  Client
+  ShmPublisher("rpc-srv")  ──────────>  Subscription("rpc-srv")
+  Subscription("rpc-cli")  <──────────  ShmPublisher("rpc-cli")
+```
+
+- `listen()` creates `{name}-srv`, polls for `{name}-cli`
+- `connect()` creates `{name}-cli`, connects to `{name}-srv`
+- Both sides get an `ShmChannel` with `send()` / `recv()` / `loan()`
+- Subscriptions start from seq 0 (not latest) so early messages are not missed
+
+This is built entirely on the existing pub/sub transport — no new protocol machinery. The channel adds ~0 ns overhead vs raw pub/sub.
+
+---
+
+## C / C++ FFI
+
+The `ffi` feature (`src/ffi.rs`) exposes `extern "C"` functions with opaque pointer types. The C header is `include/crossbar.h`.
+
+Key design decisions:
+- **No exposed loans in FFI** — `crossbar_publish()` copies data and publishes in one call. The "born-in-SHM" pattern requires Rust lifetimes that don't translate to C.
+- **Self-owned samples** — `CrossbarSample` holds an `Arc<Region>` to keep the mmap alive, replacing the borrowed `SampleGuard<'a>`. Refcount semantics are identical.
+- **Value-type topic handle** — `crossbar_topic_t` is a small `#[repr(C)]` struct, safe to copy.
+
+Build: `cargo rustc --release --features ffi --crate-type cdylib`

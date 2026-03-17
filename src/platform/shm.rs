@@ -79,6 +79,58 @@ fn exclusive_lock(file: &std::fs::File, name: &str) -> Result<(), IpcError> {
     Ok(())
 }
 
+/// Acquire or downgrade to a shared lock on `file`.
+/// On Unix, this atomically downgrades an exclusive lock to shared.
+/// Multiple shared locks can coexist, but shared locks prevent new exclusive locks.
+#[cfg(unix)]
+fn shared_lock(file: &std::fs::File, name: &str) -> Result<(), IpcError> {
+    use std::os::unix::io::AsRawFd;
+    // LOCK_SH without LOCK_NB: blocks until shared lock is available.
+    // If this fd already holds LOCK_EX, atomically downgrades to shared.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) };
+    if rc != 0 {
+        return Err(IpcError::InvalidRegion(format!(
+            "pub/sub region '{name}' cannot acquire shared lock"
+        )));
+    }
+    Ok(())
+}
+
+/// Acquire or downgrade to a shared lock on `file`.
+#[cfg(windows)]
+fn shared_lock(file: &std::fs::File, name: &str) -> Result<(), IpcError> {
+    use std::os::windows::io::AsRawHandle;
+    let handle = file.as_raw_handle();
+    // Unlock first (no atomic downgrade on Windows), then reacquire as shared.
+    let mut overlapped: windows_sys::Win32::System::IO::OVERLAPPED = unsafe { std::mem::zeroed() };
+    unsafe {
+        windows_sys::Win32::Storage::FileSystem::UnlockFileEx(
+            handle,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        );
+    }
+    let mut overlapped2: windows_sys::Win32::System::IO::OVERLAPPED = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        windows_sys::Win32::Storage::FileSystem::LockFileEx(
+            handle,
+            0, // 0 = shared lock, blocking
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped2,
+        )
+    };
+    if ok == 0 {
+        return Err(IpcError::InvalidRegion(format!(
+            "pub/sub region '{name}' cannot acquire shared lock"
+        )));
+    }
+    Ok(())
+}
+
 /// Returns a stable numeric identity for the file at `path`.
 /// Uses inode on Unix, file index on Windows.
 #[cfg(unix)]
@@ -133,8 +185,9 @@ pub struct ShmPublisher {
     _mmap: RawMmap,
     region: Arc<Region>,
     path: PathBuf,
-    _lock_file: std::fs::File,
+    _lock_file: Option<std::fs::File>,
     created_ino: u64,
+    is_owner: bool,
     id: u64,
     last_heartbeat: std::time::Instant,
     loan_count: u32,
@@ -156,10 +209,11 @@ impl ShmPublisher {
                 config.block_size
             )));
         }
-        if config.ring_depth == 0 {
-            return Err(IpcError::InvalidRegion(
-                "ring_depth must be at least 1".to_string(),
-            ));
+        if !config.ring_depth.is_power_of_two() {
+            return Err(IpcError::InvalidRegion(format!(
+                "ring_depth must be a power of 2 (got {})",
+                config.ring_depth
+            )));
         }
         if config.block_count == 0 {
             return Err(IpcError::InvalidRegion(
@@ -217,8 +271,7 @@ impl ShmPublisher {
         }
 
         // SAFETY: mmap provides a valid region of the computed size.
-        let region =
-            Arc::new(unsafe { Region::from_raw(mmap.as_mut_ptr(), mmap.len(), config.clone()) });
+        let region = Arc::new(unsafe { Region::from_raw(mmap.as_mut_ptr(), mmap.len(), config) });
 
         // Initialize pool free list
         region.init_free_list();
@@ -237,6 +290,11 @@ impl ShmPublisher {
             }
         }
 
+        // Downgrade exclusive lock to shared. This allows secondary publishers
+        // (open()) to acquire shared locks, while all shared locks together
+        // prevent a new create() from acquiring exclusive.
+        shared_lock(&lock_file, name)?;
+
         let created_ino = file_identity(&path);
 
         #[allow(clippy::cast_possible_truncation)]
@@ -250,8 +308,113 @@ impl ShmPublisher {
             _mmap: mmap,
             region,
             path,
-            _lock_file: lock_file,
+            _lock_file: Some(lock_file),
             created_ino,
+            is_owner: true,
+            id,
+            last_heartbeat: std::time::Instant::now(),
+            loan_count: 0,
+        })
+    }
+
+    /// Opens an existing pub/sub region as a secondary publisher.
+    ///
+    /// Unlike [`create`](Self::create), this does not create the SHM file or
+    /// hold an exclusive lock. The region must already exist (created by
+    /// another `ShmPublisher::create` call). Config is read from the header.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the region file doesn't exist, has invalid
+    /// magic/version, or the publisher's heartbeat is stale.
+    pub fn open(name: &str) -> Result<Self, IpcError> {
+        let path = shm_path(name);
+        let lpath = lock_path(name);
+
+        // Acquire a shared lock on the lock file. This prevents a new
+        // create() from truncating the region while we're using it.
+        let lock_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lpath)
+            .map_err(IpcError::Io)?;
+        shared_lock(&lock_file, name)?;
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true) // needed for atomic CAS on refcounts
+            .open(&path)
+            .map_err(IpcError::Io)?;
+
+        let mmap = RawMmap::from_file(&file).map_err(IpcError::Io)?;
+
+        if mmap.len() < HEADER_SIZE {
+            return Err(IpcError::InvalidRegion(
+                "region too small for header".into(),
+            ));
+        }
+
+        // Validate header
+        let ptr = mmap.as_ptr();
+        unsafe {
+            let mut magic = [0u8; 8];
+            core::ptr::copy_nonoverlapping(ptr.add(GH_MAGIC), magic.as_mut_ptr(), 8);
+            if &magic != MAGIC {
+                return Err(IpcError::InvalidRegion(
+                    "invalid magic (expected XBAR_ZC)".into(),
+                ));
+            }
+            let ver = (ptr.add(GH_VERSION) as *const u32).read();
+            if ver != VERSION {
+                return Err(IpcError::InvalidRegion(format!(
+                    "unsupported version {ver}, expected {VERSION}"
+                )));
+            }
+        }
+
+        // Read config from header
+        let config = unsafe {
+            PubSubConfig {
+                max_topics: (ptr.add(GH_MAX_TOPICS) as *const u32).read(),
+                block_count: (ptr.add(GH_BLOCK_COUNT) as *const u32).read(),
+                block_size: (ptr.add(GH_BLOCK_SIZE) as *const u32).read(),
+                ring_depth: (ptr.add(GH_RING_DEPTH) as *const u32).read(),
+                stale_timeout: Duration::from_micros(
+                    (ptr.add(GH_STALE_TIMEOUT_US) as *const u64).read(),
+                ),
+                ..PubSubConfig::default()
+            }
+        };
+
+        let expected_size = region_size(&config);
+        if mmap.len() < expected_size {
+            return Err(IpcError::InvalidRegion(format!(
+                "region size {} < expected {expected_size}",
+                mmap.len()
+            )));
+        }
+
+        // SAFETY: mmap provides a valid region of the computed size.
+        let region = Arc::new(unsafe { Region::from_raw(mmap.as_mut_ptr(), mmap.len(), config) });
+
+        region.check_heartbeat()?;
+
+        #[allow(clippy::cast_possible_truncation)]
+        let id = u64::from(std::process::id())
+            ^ (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64);
+
+        Ok(ShmPublisher {
+            _mmap: mmap,
+            region,
+            path,
+            _lock_file: Some(lock_file),
+            created_ino: 0,
+            is_owner: false,
             id,
             last_heartbeat: std::time::Instant::now(),
             loan_count: 0,
@@ -302,11 +465,12 @@ impl ShmPublisher {
 
         let base_ptr = self.region.base;
 
+        // Phase 1: Scan for existing topic (check active==ACTIVE slots for URI match)
         for i in 0..self.region.config.max_topics {
             let off = topic_entry_off(i);
             let active = unsafe { &*(base_ptr.add(off + TE_ACTIVE) as *const AtomicU32) };
 
-            if active.load(Ordering::Acquire) == 1 {
+            if active.load(Ordering::Acquire) == TE_STATE_ACTIVE {
                 // Check if same URI already registered (hash + byte comparison)
                 let existing_hash =
                     unsafe { (base_ptr.add(off + TE_URI_HASH) as *const u64).read() };
@@ -324,10 +488,28 @@ impl ShmPublisher {
                     }
                     // Hash collision -- different URI, keep searching
                 }
+            }
+        }
+
+        // Phase 2: Claim a free slot via CAS (0=free -> 2=initializing)
+        for i in 0..self.region.config.max_topics {
+            let off = topic_entry_off(i);
+            let active = unsafe { &*(base_ptr.add(off + TE_ACTIVE) as *const AtomicU32) };
+
+            // Skip slots that are not free (already active or being initialized)
+            if active
+                .compare_exchange(
+                    TE_STATE_FREE,
+                    TE_STATE_INIT,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
                 continue;
             }
 
-            // Found free slot -- register
+            // We own this slot (state == INIT). Write topic data.
             unsafe {
                 let base = base_ptr.add(off);
                 (base.add(TE_URI_HASH) as *mut u64).write(hash);
@@ -342,7 +524,8 @@ impl ShmPublisher {
                 // Write type_size (0 for untyped)
                 (base.add(TE_TYPE_SIZE) as *mut u32).write(type_size);
             }
-            active.store(1, Ordering::Release);
+            // Transition INIT -> ACTIVE (now visible to subscribers)
+            active.store(TE_STATE_ACTIVE, Ordering::Release);
 
             return Ok(TopicHandle {
                 topic_idx: i,
@@ -383,6 +566,8 @@ impl ShmPublisher {
 
         // Counter-based heartbeat: check clock every 1024 loans, not every loan.
         // Saves ~20ns per loan by avoiding Instant::now() on the hot path.
+        // All publishers update the heartbeat — it signals "region is alive",
+        // not "primary is alive". fetch_max in update_heartbeat() handles races.
         self.loan_count = self.loan_count.wrapping_add(1);
         if self.loan_count & 0x3FF == 0
             && self.last_heartbeat.elapsed() >= self.region.config.heartbeat_interval
@@ -402,7 +587,6 @@ impl ShmPublisher {
         let base_ptr = self.region.base;
 
         let write_seq_atom = unsafe { &*(base_ptr.add(off + TE_WRITE_SEQ) as *const AtomicU64) };
-        let next_seq = write_seq_atom.load(Ordering::Acquire) + 1;
 
         let notify_atom = unsafe { &*(base_ptr.add(off + TE_NOTIFY) as *const AtomicU32) };
 
@@ -416,7 +600,6 @@ impl ShmPublisher {
             capacity: self.region.data_capacity(),
             len: 0,
             block_idx,
-            seq: next_seq,
             topic_idx,
             write_seq_atom,
             notify_atom,
@@ -461,7 +644,6 @@ impl ShmPublisher {
         let base_ptr = self.region.base;
 
         let write_seq_atom = unsafe { &*(base_ptr.add(off + TE_WRITE_SEQ) as *const AtomicU64) };
-        let next_seq = write_seq_atom.load(Ordering::Acquire) + 1;
 
         let notify_atom = unsafe { &*(base_ptr.add(off + TE_NOTIFY) as *const AtomicU32) };
 
@@ -470,7 +652,6 @@ impl ShmPublisher {
         TypedShmLoan {
             region: &self.region,
             block_idx,
-            seq: next_seq,
             topic_idx,
             write_seq_atom,
             notify_atom,
@@ -482,7 +663,7 @@ impl ShmPublisher {
 
 impl Drop for ShmPublisher {
     fn drop(&mut self) {
-        if file_identity(&self.path) == self.created_ino {
+        if self.is_owner && file_identity(&self.path) == self.created_ino {
             let _ = std::fs::remove_file(&self.path);
         }
     }

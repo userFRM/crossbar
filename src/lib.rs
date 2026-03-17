@@ -8,12 +8,11 @@
 
 //! # crossbar
 //!
-//! **Zero-copy pub/sub over shared memory. URI-addressed. ~55 ns.**
+//! **Zero-copy pub/sub over shared memory. URI-addressed. O(1) transfer at any payload size.**
 //!
-//! Allocates blocks from a lock-free pool (Treiber stack), writes data
-//! directly into the mmap'd region, and transfers ownership via an 8-byte
-//! descriptor. Subscribers read directly from shared memory via [`SampleGuard`]
-//! — no copy, no deserialization.
+//! Transfers an 8-byte descriptor through a lock-free ring — O(1) regardless
+//! of payload. Subscribers read directly from shared memory via [`SampleGuard`]
+//! — no copy, no serialization, no service discovery layer.
 //!
 //! Supported platforms: Linux, macOS, Windows.
 //!
@@ -53,6 +52,10 @@ pub mod error;
 #[allow(unsafe_code)]
 mod platform;
 
+#[cfg(feature = "ffi")]
+#[allow(unsafe_code)]
+pub mod ffi;
+
 // Always available (no_std)
 pub use pod::Pod;
 pub use protocol::{PubSubConfig, Region};
@@ -61,6 +64,6 @@ pub use wait::WaitStrategy;
 // std-only exports
 #[cfg(feature = "std")]
 pub use platform::{
-    SampleGuard, ShmLoan, ShmPublisher, ShmSubscriber, Subscription, TopicHandle, TypedSampleGuard,
-    TypedShmLoan,
+    SampleGuard, ShmChannel, ShmLoan, ShmPublisher, ShmSubscriber, Subscription, TopicHandle,
+    TypedSampleGuard, TypedShmLoan,
 };

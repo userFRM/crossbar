@@ -4,9 +4,9 @@
 [![crates.io](https://img.shields.io/crates/v/crossbar.svg)](https://crates.io/crates/crossbar)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
 
-**Zero-copy pub/sub over shared memory. URI-addressed. ~55 ns end-to-end.**
+**Zero-copy pub/sub over shared memory. URI-addressed. O(1) transfer at any payload size.**
 
-Allocates blocks from a lock-free pool, writes data into the mmap'd region, and transfers ownership via an 8-byte descriptor. Subscribers read directly from shared memory — no copy, no deserialization.
+Transfers an 8-byte descriptor through a lock-free ring — O(1) regardless of payload. Subscribers read directly from shared memory. No copy, no serialization, no service discovery layer.
 
 ---
 
@@ -19,8 +19,6 @@ Allocates blocks from a lock-free pool, writes data into the mmap'd region, and 
 
 ## When not to use crossbar
 
-- You need C or C++ consumers — use [iceoryx2](https://github.com/eclipse-iceoryx/iceoryx2)
-- You need request/response — use a channel or iceoryx2
 - Payload > 64 KB and you're copying into the block — both frameworks are memcpy-bound at that point and latency is equal
 
 ---
@@ -103,6 +101,49 @@ let guard = stream.recv()?;
 let guard = stream.recv_with(WaitStrategy::BusySpin)?;
 ```
 
+### Multi-publisher
+
+Multiple publishers can share the same region — one creates, others join:
+
+```rust
+use crossbar::*;
+
+// Process A — creates the region
+let mut pub_a = ShmPublisher::create("market", PubSubConfig::default())?;
+let topic_a = pub_a.register("/prices/AAPL")?;
+
+// Process B — joins the existing region
+let mut pub_b = ShmPublisher::open("market")?;
+let topic_b = pub_b.register("/prices/GOOG")?;
+// Or publish to the same topic as pub_a:
+let topic_b2 = pub_b.register("/prices/AAPL")?;
+```
+
+Sequence numbers are claimed atomically via `fetch_add`. CAS-based ring slot locking prevents corruption when two publishers write to the same slot. Subscribers scan the ring window to handle out-of-order commits.
+
+### Bidirectional channel
+
+`ShmChannel` wraps two pub/sub regions into a TCP-like pair — one side listens, the other connects:
+
+```rust
+use crossbar::*;
+use std::time::Duration;
+
+// Process A (server)
+let mut srv = ShmChannel::listen("rpc", PubSubConfig::default(),
+    Duration::from_secs(30))?;
+
+// Process B (client)
+let mut cli = ShmChannel::connect("rpc", PubSubConfig::default(),
+    Duration::from_secs(5))?;
+
+cli.send(b"request");
+let msg = srv.recv()?;
+// ... process and respond
+srv.send(b"response");
+let reply = cli.recv()?;
+```
+
 ### Born-in-SHM (zero-copy publish)
 
 Write directly into the pool block — no intermediate buffer, no copy at any payload size:
@@ -122,6 +163,15 @@ loan.publish();
 
 All measurements: Criterion, same-process publisher + subscriber, `try_recv` (no futex).
 
+### Intel i7-10700KF · Linux 6.8 · rustc 1.87
+
+| | crossbar | iceoryx2 | speedup |
+|---|---|---|---|
+| 8 B (transport overhead) | **60 ns** | 227 ns | **3.8×** |
+| 1 KB | 70 ns | 245 ns | 3.5× |
+| 64 KB | 1.35 µs | 1.31 µs | ~1× |
+| 1 MB | 30.9 µs | 29.8 µs | ~1× |
+
 ### Apple M1 Pro · macOS · rustc 1.92
 
 | | crossbar | iceoryx2 | speedup |
@@ -129,21 +179,56 @@ All measurements: Criterion, same-process publisher + subscriber, `try_recv` (no
 | 8 B (transport overhead) | **52 ns** | 189 ns | **3.6×** |
 | 1 KB | 77 ns | 210 ns | 2.7× |
 | 64 KB | 1.27 µs | 1.35 µs | 1.1× |
-| 256 KB | 5.10 µs | 5.20 µs | ~1× |
 | 1 MB | 23.9 µs | 23.5 µs | ~1× |
-
-### Intel i7-10700KF · Linux 6.8 · rustc stable
-
-| | crossbar | iceoryx2 | speedup |
-|---|---|---|---|
-| 8 B (transport overhead) | **57 ns** | 231 ns | **4.1×** |
-| 1 KB | 65 ns | 231 ns | 3.6× |
-| 64 KB | 1.40 µs | 1.35 µs | ~1× |
-| 1 MB | 30.8 µs | 32.0 µs | ~1× |
 
 **The win is in the overhead.** At small payloads crossbar's lighter path (no service discovery, no POSIX config layer) is 3.5–4× faster. At 64 KB+ both frameworks are memcpy-bound and converge. The 8-byte descriptor is always O(1) — payload latency scales with how long you take to write into the block.
 
 Reproduce: `cargo bench -- head_to_head` (requires `iceoryx2` dev-dep, Unix only).
+
+---
+
+## C / C++ FFI
+
+Build the shared library and link against it from C or C++:
+
+```sh
+cargo build --release --features ffi --crate-type cdylib
+# produces target/release/libcrossbar.so (Linux), .dylib (macOS), .dll (Windows)
+```
+
+Include `include/crossbar.h`:
+
+```c
+#include "crossbar.h"
+
+// Publisher
+crossbar_publisher_t* pub = crossbar_publisher_create("market", NULL);
+crossbar_topic_t topic = crossbar_publisher_register(pub, "/prices/AAPL");
+crossbar_publish(pub, topic, data, data_len);
+
+// Subscriber
+crossbar_subscriber_t* sub = crossbar_subscriber_connect("market");
+crossbar_subscription_t* stream = crossbar_subscriber_subscribe(sub, "/prices/AAPL");
+crossbar_sample_t* sample = crossbar_try_recv(stream);  // allocates
+if (sample) {
+    const uint8_t* data = crossbar_sample_data(sample);
+    size_t len = crossbar_sample_len(sample);
+    // zero-copy read — data points directly into SHM
+    crossbar_sample_free(sample);
+}
+
+// Or zero-allocation hot path:
+crossbar_sample_t sample;
+if (crossbar_try_recv_into(stream, &sample)) {
+    const uint8_t* data = crossbar_sample_data(&sample);
+    crossbar_sample_free(&sample);
+}
+
+// Bidirectional channel
+crossbar_channel_t* ch = crossbar_channel_connect("rpc", NULL, 5000);
+crossbar_channel_send(ch, msg, msg_len);
+crossbar_sample_t* reply = crossbar_channel_recv(ch);
+```
 
 ---
 
@@ -154,7 +239,7 @@ PubSubConfig {
     max_topics:          16,    // concurrent topics
     block_count:        256,    // pool blocks
     block_size:       65536,    // bytes per block (usable: block_size - 8)
-    ring_depth:           8,    // samples before overwrite
+    ring_depth:           8,    // samples before overwrite (must be power of 2)
     heartbeat_interval: 100ms,  // liveness signal period
     stale_timeout:        5s,   // publisher dead after this
 }
@@ -172,6 +257,7 @@ src/
   pod.rs                 Pod trait — marker for safe zero-copy SHM reads
   error.rs               IpcError
   wait.rs                WaitStrategy (BusySpin / YieldSpin / BackoffSpin / Adaptive)
+  ffi.rs                 C FFI bindings (behind "ffi" feature)
 
   protocol/              no_std core — pure atomics, no OS calls
     layout.rs            SHM layout constants and offset helpers
@@ -184,16 +270,19 @@ src/
     shm.rs               ShmPublisher, ShmSubscriber
     subscription.rs      Subscription, SampleGuard, TypedSampleGuard
     loan.rs              ShmLoan, TypedShmLoan, TopicHandle
+    channel.rs           ShmChannel — bidirectional channel
 
+include/
+  crossbar.h             C/C++ header for FFI consumers
 tests/
   pubsub.rs              Integration tests
   typed_pubsub.rs        Typed pub/sub integration tests
+  channel.rs             Bidirectional channel tests
+  multi_publisher.rs     Multi-publisher tests
 benches/pubsub.rs        Criterion benchmarks (+ iceoryx2 head-to-head, Unix)
 examples/
   publisher.rs           Cross-process latency benchmark — publisher side
   subscriber.rs          Cross-process latency benchmark — subscriber side
-scripts/
-  gen_benchmark_chart.py Regenerate assets/benchmark_comparison.svg
 ```
 
 ---

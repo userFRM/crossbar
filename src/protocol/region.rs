@@ -145,7 +145,7 @@ impl Region {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_micros() as u64;
-        self.heartbeat_atom().store(now, Ordering::Release);
+        self.heartbeat_atom().fetch_max(now, Ordering::Release);
     }
 
     #[cfg(feature = "std")]
@@ -163,6 +163,10 @@ impl Region {
     }
 
     /// Shared commit logic for both `ShmLoan` and `TypedShmLoan`.
+    ///
+    /// Atomically claims the next sequence number via `fetch_add` on
+    /// `write_seq_atom`, then uses CAS-based seqlock to prevent two
+    /// publishers from writing the same ring slot simultaneously.
     #[cfg(feature = "std")]
     #[inline]
     #[allow(clippy::too_many_arguments)]
@@ -170,40 +174,54 @@ impl Region {
         &self,
         block_idx: u32,
         data_len: u32,
-        seq: u64,
         topic_idx: u32,
         write_seq_atom: &AtomicU64,
         notify_atom: &AtomicU32,
         waiters_atom: &AtomicU32,
         wake: bool,
     ) {
-        let ring_depth = self.config.ring_depth;
-        let slot = (seq % ring_depth as u64) as u32;
+        // 1. Atomically claim the next sequence number
+        let seq = write_seq_atom.fetch_add(1, Ordering::AcqRel) + 1;
+
+        let ring_mask = self.config.ring_depth as u64 - 1;
+        let slot = (seq & ring_mask) as u32;
         let entry_off = ring_entry_off(&self.config, topic_idx, slot);
         let entry_ptr = unsafe { self.base.add(entry_off) };
+        let entry_seq = unsafe { &*(entry_ptr.add(RE_SEQ) as *const AtomicU64) };
 
-        // 1. Read old block_idx from the ring slot we're about to overwrite
+        // 2. Acquire the ring slot via CAS (prevents two publishers from
+        //    writing the same slot when seqs differ by exactly ring_depth).
+        //    Uses SEVL+WFE on aarch64 for cache-line-aware low-power spin.
+        loop {
+            let current = entry_seq.load(Ordering::Acquire);
+            if current == SEQ_WRITING {
+                crate::wait::yield_hint();
+                continue;
+            }
+            if entry_seq
+                .compare_exchange(current, SEQ_WRITING, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
+            crate::wait::yield_hint();
+        }
+
+        // 3. Read old block_idx from the slot we're overwriting
         let old_block_idx =
             unsafe { &*(entry_ptr.add(RE_BLOCK_IDX) as *const AtomicU32) }.load(Ordering::Relaxed);
 
-        // 2. Set new block's refcount to 1 (ring holds one reference)
+        // 4. Set new block's refcount to 1
         self.block_refcount(block_idx).store(1, Ordering::Release);
 
-        // 3. Invalidate seq (seqlock open) -- prevents subscribers from reading mid-write
-        let entry_seq = unsafe { &*(entry_ptr.add(RE_SEQ) as *const AtomicU64) };
-        entry_seq.store(0, Ordering::Release);
-
-        // 4. Write new block_idx and data_len
+        // 5. Write new block_idx and data_len
         unsafe { &*(entry_ptr.add(RE_BLOCK_IDX) as *const AtomicU32) }
             .store(block_idx, Ordering::Relaxed);
         unsafe { &*(entry_ptr.add(RE_DATA_LEN) as *const AtomicU32) }
             .store(data_len, Ordering::Relaxed);
 
-        // 5. Validate seq (seqlock close) -- data visible to subscribers
+        // 6. Seqlock close -- data visible to subscribers
         entry_seq.store(seq, Ordering::Release);
-
-        // 6. Bump topic write_seq
-        write_seq_atom.store(seq, Ordering::Release);
 
         // 7. Release old block (decrement refcount; free if no subscribers hold it)
         if old_block_idx != NO_BLOCK {

@@ -56,6 +56,10 @@ impl Subscription {
     ///
     /// The returned guard implements `Deref<Target=[u8]>` -- safe to read
     /// without `unsafe`. The block is held alive until the guard is dropped.
+    ///
+    /// Uses a ring-window scan to handle multi-publisher scenarios where
+    /// sequence numbers are claimed atomically and slots may be committed
+    /// out of order.
     #[inline]
     pub fn try_recv(&self) -> Option<SampleGuard<'_>> {
         let current_seq = self.write_seq_atom().load(Ordering::Acquire);
@@ -63,31 +67,32 @@ impl Subscription {
             return None;
         }
 
-        let target = if current_seq - self.last_seq.get() > self.region.config.ring_depth as u64 {
-            current_seq // fell behind -- skip to latest
+        let ring_depth = self.region.config.ring_depth as u64;
+        let start = self.last_seq.get() + 1;
+
+        // If we've fallen far behind, skip to the recent window
+        let scan_start = if current_seq - start >= ring_depth {
+            current_seq - ring_depth + 1
         } else {
-            self.last_seq.get() + 1
+            start
         };
 
-        if let Some(guard) = self.try_read_slot(target) {
-            return Some(guard);
+        // Scan for the first committed slot in the window
+        for seq in scan_start..=current_seq {
+            if let Some(guard) = self.try_read_slot(seq) {
+                return Some(guard);
+            }
         }
 
-        // Slot was overwritten -- retry with latest
-        let latest = self.write_seq_atom().load(Ordering::Acquire);
-        if latest > self.last_seq.get() && latest != target {
-            self.try_read_slot(latest)
-        } else {
-            None
-        }
+        None
     }
 
     /// Raw slot read: performs seqlock + refcount CAS and returns slot metadata.
     /// Shared by both untyped and typed recv paths.
     #[inline]
     fn try_read_slot_raw(&self, seq: u64) -> Option<SlotRead> {
-        let ring_depth = self.region.config.ring_depth;
-        let slot = (seq % ring_depth as u64) as u32;
+        let ring_mask = self.region.config.ring_depth as u64 - 1;
+        let slot = (seq & ring_mask) as u32;
         let entry_off = ring_entry_off(&self.region.config, self.topic_idx, slot);
         let entry_ptr = unsafe { self.region.base.add(entry_off) };
 
@@ -155,25 +160,11 @@ impl Subscription {
         })
     }
 
-    /// Compute the target seq for the next receive, or None if no new data.
-    #[inline]
-    fn next_target_seq(&self) -> Option<u64> {
-        let current_seq = self.write_seq_atom().load(Ordering::Acquire);
-        if current_seq <= self.last_seq.get() {
-            return None;
-        }
-
-        Some(
-            if current_seq - self.last_seq.get() > self.region.config.ring_depth as u64 {
-                current_seq // fell behind -- skip to latest
-            } else {
-                self.last_seq.get() + 1
-            },
-        )
-    }
-
     /// Non-blocking typed receive. Returns a [`TypedSampleGuard`] that
     /// dereferences to `&T`.
+    ///
+    /// Uses the same ring-window scan as [`try_recv`](Self::try_recv) to
+    /// handle multi-publisher scenarios.
     ///
     /// # Panics
     ///
@@ -190,27 +181,33 @@ impl Subscription {
             );
         }
 
-        let target = self.next_target_seq()?;
-
-        if let Some(slot) = self.try_read_slot_raw(target) {
-            return Some(TypedSampleGuard {
-                region: &self.region,
-                block_idx: slot.block_idx,
-                _marker: core::marker::PhantomData,
-            });
+        let current_seq = self.write_seq_atom().load(Ordering::Acquire);
+        if current_seq <= self.last_seq.get() {
+            return None;
         }
 
-        // Slot was overwritten -- retry with latest
-        let latest = self.write_seq_atom().load(Ordering::Acquire);
-        if latest > self.last_seq.get() && latest != target {
-            self.try_read_slot_raw(latest).map(|slot| TypedSampleGuard {
-                region: &self.region,
-                block_idx: slot.block_idx,
-                _marker: core::marker::PhantomData,
-            })
+        let ring_depth = self.region.config.ring_depth as u64;
+        let start = self.last_seq.get() + 1;
+
+        // If we've fallen far behind, skip to the recent window
+        let scan_start = if current_seq - start >= ring_depth {
+            current_seq - ring_depth + 1
         } else {
-            None
+            start
+        };
+
+        // Scan for the first committed slot in the window
+        for seq in scan_start..=current_seq {
+            if let Some(slot) = self.try_read_slot_raw(seq) {
+                return Some(TypedSampleGuard {
+                    region: &self.region,
+                    block_idx: slot.block_idx,
+                    _marker: core::marker::PhantomData,
+                });
+            }
         }
+
+        None
     }
 
     /// Blocking typed receive with the default [`WaitStrategy`].
@@ -374,9 +371,9 @@ struct SlotRead {
 /// 3. No writer touches the block's data region after publishing.
 /// 4. The data region does not overlap the free-list link field.
 pub struct SampleGuard<'a> {
-    region: &'a Region,
-    block_idx: u32,
-    len: usize,
+    pub(crate) region: &'a Region,
+    pub(crate) block_idx: u32,
+    pub(crate) len: usize,
 }
 
 impl SampleGuard<'_> {
@@ -418,8 +415,8 @@ impl AsRef<[u8]> for SampleGuard<'_> {
     }
 }
 
-impl std::fmt::Debug for SampleGuard<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for SampleGuard<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("SampleGuard")
             .field("block_idx", &self.block_idx)
             .field("len", &self.len)

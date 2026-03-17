@@ -41,7 +41,6 @@ pub struct ShmLoan<'a> {
     pub(crate) capacity: usize,
     pub(crate) len: usize,
     pub(crate) block_idx: u32,
-    pub(crate) seq: u64,
     pub(crate) topic_idx: u32,
     pub(crate) write_seq_atom: &'a AtomicU64,
     pub(crate) notify_atom: &'a AtomicU32,
@@ -104,7 +103,6 @@ impl<'a> ShmLoan<'a> {
         self.region.commit_to_ring(
             self.block_idx,
             self.len as u32,
-            self.seq,
             self.topic_idx,
             self.write_seq_atom,
             self.notify_atom,
@@ -152,7 +150,6 @@ impl<'a> io::Write for ShmLoan<'a> {
 pub struct TypedShmLoan<'a, T: crate::Pod> {
     pub(crate) region: &'a Arc<Region>,
     pub(crate) block_idx: u32,
-    pub(crate) seq: u64,
     pub(crate) topic_idx: u32,
     pub(crate) write_seq_atom: &'a AtomicU64,
     pub(crate) notify_atom: &'a AtomicU32,
@@ -205,7 +202,6 @@ impl<'a, T: crate::Pod> TypedShmLoan<'a, T> {
         self.region.commit_to_ring(
             self.block_idx,
             core::mem::size_of::<T>() as u32,
-            self.seq,
             self.topic_idx,
             self.write_seq_atom,
             self.notify_atom,

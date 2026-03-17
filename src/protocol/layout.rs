@@ -22,6 +22,14 @@ pub(crate) const RING_ENTRY_SIZE: usize = 16;
 pub(crate) const BLOCK_DATA_OFFSET: usize = 8;
 pub(crate) const NO_BLOCK: u32 = u32::MAX;
 
+/// Sentinel for seqlock "being written" state (CAS-based slot locking).
+pub(crate) const SEQ_WRITING: u64 = u64::MAX;
+
+/// Topic active states for CAS-based registration.
+pub(crate) const TE_STATE_FREE: u32 = 0;
+pub(crate) const TE_STATE_INIT: u32 = 2;
+pub(crate) const TE_STATE_ACTIVE: u32 = 1;
+
 // Global header offsets
 pub(crate) const GH_MAGIC: usize = 0;
 pub(crate) const GH_VERSION: usize = 8;

@@ -10,12 +10,14 @@
 //!
 //! Everything in this module requires `std`.
 
-mod loan;
+mod channel;
+pub(crate) mod loan;
 mod mmap;
 pub(crate) mod notify;
 mod shm;
-mod subscription;
+pub(crate) mod subscription;
 
+pub use channel::ShmChannel;
 pub use loan::{ShmLoan, TopicHandle, TypedShmLoan};
 pub use shm::{ShmPublisher, ShmSubscriber};
 pub use subscription::{SampleGuard, Subscription, TypedSampleGuard};

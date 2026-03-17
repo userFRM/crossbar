@@ -80,7 +80,7 @@ impl Default for WaitStrategy {
 /// cache-line invalidation event wakes it.
 /// On x86: PAUSE yields the pipeline to the SMT sibling (~140 cycles).
 #[inline(always)]
-fn yield_hint() {
+pub(crate) fn yield_hint() {
     #[cfg(target_arch = "aarch64")]
     unsafe {
         core::arch::asm!("sevl", options(nomem, nostack));

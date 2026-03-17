@@ -1,8 +1,8 @@
 [package]
 name = "crossbar"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-description = "Zero-copy pub/sub over shared memory. URI-addressed. ~55 ns."
+description = "Zero-copy pub/sub over shared memory. URI-addressed. O(1) transfer at any payload size."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/userFRM/crossbar"
 keywords = ["ipc", "shared-memory", "pubsub", "zero-copy", "low-latency"]
@@ -12,12 +12,13 @@ rust-version = "1.87"
 [features]
 default = ["std"]
 std = ["libc", "windows-sys"]
+ffi = ["std"]
 
 [target.'cfg(unix)'.dependencies]
-libc = { version = "0.2", optional = true }
+libc = { version = "0.2.183", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", optional = true, features = [
+windows-sys = { version = "0.61.2", optional = true, features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_System_IO",
@@ -27,10 +28,10 @@ windows-sys = { version = "0.61", optional = true, features = [
 ] }
 
 [dev-dependencies]
-criterion = "0.8"
+criterion = "0.8.2"
 
 [target.'cfg(unix)'.dev-dependencies]
-iceoryx2 = "0.8"
+iceoryx2 = "0.8.1"
 
 [[example]]
 name = "publisher"
