@@ -5,8 +5,12 @@ Crossbar is a workspace with two crates, each providing a distinct fast path:
 - **`crossbar-inproc`** — in-process pub/sub via `Bus<T>` with `Arc<T>` fan-out
 - **`crossbar-ipc`** — zero-copy pub/sub over shared memory (`/dev/shm`)
 
-The crates are independent. They solve different problems, have different
-hot-path costs, and can be used separately.
+Both crates solve the same problem — **named pub/sub channels at hardware
+speed** — at different scopes. `crossbar-inproc` operates within a single
+process (threads share `Arc<T>`). `crossbar-ipc` operates across processes
+(they share mmap'd memory). Same mental model, same topic naming, same
+lossy-ring semantics. The only thing that changes is whether you cross an
+address space boundary.
 
 ---
 

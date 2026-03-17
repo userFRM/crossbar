@@ -119,8 +119,8 @@ cargo run -p crossbar-ipc --example subscriber
 
 ## How it works
 
-Crossbar has two distinct fast paths. They solve different problems and have
-different hot-path costs.
+Crossbar has two fast paths for the same problem — named pub/sub at hardware
+speed — adapted to different scopes (threads vs processes).
 
 ### In-process path (`crossbar-inproc`)
 
