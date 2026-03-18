@@ -50,6 +50,14 @@ pub(crate) const TE_URI: usize = 0x20; // char[64]
 pub(crate) const TE_URI_MAX: usize = 64; // unchanged (0x60 - 0x20 = 64)
 pub(crate) const TE_TYPE_SIZE: usize = 0x60; // u32 -- size_of::<T>() for typed topics, 0 = untyped
 
+/// Pinned-publish block index (u32). NO_BLOCK = not pinned.
+/// Located in topic entry cache line 1 (cold path, set once at registration).
+pub(crate) const TE_PINNED_BLOCK: usize = 0x64;
+/// Pinned-publish seqlock: packed (seq:32 | data_len:32) in AtomicU64.
+/// The publisher stores this with Release after writing data.
+/// The subscriber loads this with Acquire before reading data.
+pub(crate) const TE_PINNED_SEQ: usize = 0x70; // AtomicU64
+
 // Ring entry offsets (relative to entry start)
 pub(crate) const RE_SEQ: usize = 0; // AtomicU64 (seqlock)
 pub(crate) const RE_BLOCK_IDX: usize = 8; // u32

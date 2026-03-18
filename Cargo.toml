@@ -42,3 +42,4 @@ name = "subscriber"
 [[bench]]
 name = "pubsub"
 harness = false
+
