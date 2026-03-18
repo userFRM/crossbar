@@ -421,11 +421,11 @@ fn bench_iceoryx2_vs_crossbar(c: &mut Criterion) {
             group.bench_function(format!("crossbar/{label}"), |b| {
                 b.iter(|| {
                     // Pinned: same block every time — L1/L2 warm, no alloc, no refcount
-                    let mut loan = unsafe { pub_.loan_pinned(handle) };
+                    let mut loan = pub_.loan_pinned(handle);
                     loan.as_mut_slice()[..sz].fill(42u8);
                     loan.set_len(sz);
                     loan.publish();
-                    let g = unsafe { sub_handle.try_recv_pinned() }.unwrap();
+                    let g = sub_handle.try_recv_pinned().unwrap();
                     black_box(&*g);
                 })
             });

@@ -183,6 +183,17 @@ All measurements: Criterion, same-process publisher + subscriber, `try_recv` (no
 
 **The win is in the overhead.** At small payloads crossbar's lighter path (no service discovery, no POSIX config layer) is 4–5× faster. At 64 KB+ both frameworks are memcpy-bound and converge. The 8-byte descriptor is always O(1) — payload latency scales with how long you take to write into the block.
 
+### Pinned mode (latest-value, same buffer every iteration)
+
+| | crossbar | iceoryx2 | speedup |
+|---|---|---|---|
+| 8 B | **26 ns** | 229 ns | **8.7×** |
+| 1 KB | **33 ns** | 234 ns | **7.1×** |
+| 64 KB | **1.07 µs** | 1.27 µs | **1.2×** |
+| 1 MB | 18.4 µs | 18.4 µs | ~1× |
+
+Pinned mode (`loan_pinned` / `try_recv_pinned`) reuses the same block every iteration — no allocation, no refcount, no ring. Safe API with runtime reader-count protection. Best for market data, sensors, telemetry, game state.
+
 Reproduce: `cargo bench -- head_to_head` (requires `iceoryx2` dev-dep, Unix only).
 
 ---

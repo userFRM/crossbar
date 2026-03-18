@@ -14,6 +14,10 @@
 - `assert_eq!` → `debug_assert_eq!` for handle validation on hot path.
 - Combined `SEVL` + `WFE` into single `asm!` block for robustness on aarch64.
 
+### Changed
+- **Safe pinned API**: `loan_pinned` and `try_recv_pinned` no longer require `unsafe`. A shared reader count in the topic entry prevents data races at runtime — `loan_pinned` panics if any `PinnedGuard` is held. Cost: ~10 ns (26 ns total vs 16 ns unsafe), still 8.7× faster than iceoryx2.
+- **Blocking pinned receive**: `recv_pinned()` and `recv_pinned_with(strategy)` — three-phase adaptive wait (spin → yield → futex), same as the safe API.
+
 ### Fixed
 - **Block recycling**: `commit_to_ring` now stashes freed blocks in a per-region `last_freed` slot instead of returning them to the Treiber stack. The next `alloc_cached()` grabs the recycled block first — it's still warm in L1/L2 from the previous write. Eliminates the ~11 µs RFO (read-for-ownership) penalty at 1 MB payloads. E2E 1 MB: 45 µs → 33 µs.
 - **Double-spin bug**: `recv_with` Adaptive mode spun 220 iterations before futex sleep (100 spin + 10 yield in `recv_with`, then another 100 + 10 inside `wait_until_not`). Now skips the internal spin when called from Adaptive phase 3.

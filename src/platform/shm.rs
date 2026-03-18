@@ -692,19 +692,17 @@ impl ShmPublisher {
     }
 
     /// Loans the pinned block for a topic. On the first call, allocates a
-    /// dedicated block. Subsequent calls return the same block -- no alloc.
+    /// dedicated block. Subsequent calls return the same block — no alloc.
     ///
-    /// # Safety
-    ///
-    /// The returned `PinnedLoan` gives `&mut` access to the block's data region.
-    /// No subscriber may hold a [`PinnedGuard`] for this topic while a
-    /// `PinnedLoan` exists. Violating this is undefined behavior.
+    /// The publisher checks the shared reader count before returning the
+    /// loan. If any subscriber holds a [`PinnedGuard`] for this topic,
+    /// this method panics — preventing data races at runtime.
     ///
     /// # Panics
     ///
-    /// Panics if the pool is exhausted (first call only) or if `topic_idx`
-    /// exceeds `max_topics`.
-    pub unsafe fn loan_pinned(&mut self, handle: &TopicHandle) -> PinnedLoan<'_> {
+    /// - If a subscriber holds a `PinnedGuard` for this topic (data race prevention).
+    /// - If the pool is exhausted (first call only).
+    pub fn loan_pinned(&mut self, handle: &TopicHandle) -> PinnedLoan<'_> {
         debug_assert_eq!(handle.publisher_id, self.id);
         let topic_idx = handle.topic_idx;
 
@@ -714,7 +712,7 @@ impl ShmPublisher {
         } else {
             let idx = self
                 .alloc_cached()
-                .expect("pool exhausted -- increase block_count");
+                .expect("pool exhausted — increase block_count");
             self.pinned_blocks[topic_idx as usize] = idx;
             // Store in SHM topic entry so subscribers can find it
             self.region.set_pinned_block(topic_idx, idx);
@@ -723,9 +721,20 @@ impl ShmPublisher {
 
         let off = topic_entry_off(topic_idx);
         let base_ptr = self.region.base;
-        let write_seq_atom = &*(base_ptr.add(off + TE_WRITE_SEQ) as *const AtomicU64);
-        let waiters_atom = &*(base_ptr.add(off + TE_WAITERS) as *const AtomicU32);
-        let data_ptr = self.region.block_ptr(block_idx).add(BLOCK_DATA_OFFSET);
+
+        // Check reader count — panic if any subscriber holds a PinnedGuard
+        let readers = unsafe { &*(base_ptr.add(off + TE_PINNED_READERS) as *const AtomicU32) };
+        let active = readers.load(Ordering::Acquire);
+        assert!(
+            active == 0,
+            "loan_pinned: {} active PinnedGuard(s) on topic {topic_idx} — \
+             drop all guards before calling loan_pinned",
+            active
+        );
+
+        let write_seq_atom = unsafe { &*(base_ptr.add(off + TE_WRITE_SEQ) as *const AtomicU64) };
+        let waiters_atom = unsafe { &*(base_ptr.add(off + TE_WAITERS) as *const AtomicU32) };
+        let data_ptr = unsafe { self.region.block_ptr(block_idx).add(BLOCK_DATA_OFFSET) };
 
         PinnedLoan {
             region: &self.region,
