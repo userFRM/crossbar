@@ -23,36 +23,43 @@ use std::time::Duration;
 /// # Errors
 ///
 /// Returns `Err(())` if `timeout` elapses before the value changes.
-pub fn wait_until_not(addr: &AtomicU32, current: u32, timeout: Duration) -> Result<u32, ()> {
+pub fn wait_until_not(
+    addr: &AtomicU32,
+    current: u32,
+    timeout: Duration,
+    skip_spin: bool,
+) -> Result<u32, ()> {
     const SPIN_ITERS: u32 = 100;
     const YIELD_ITERS: u32 = 10;
 
-    // Phase 1: spin
-    for _ in 0..SPIN_ITERS {
-        let val = addr.load(Ordering::Acquire);
-        if val != current {
-            return Ok(val);
+    if !skip_spin {
+        // Phase 1: spin
+        for _ in 0..SPIN_ITERS {
+            let val = addr.load(Ordering::Acquire);
+            if val != current {
+                return Ok(val);
+            }
+            // Platform-specific yield hint:
+            // aarch64: SEVL + WFE puts the core into a low-power state until a
+            // cache-line invalidation event (from the publisher's store) wakes it.
+            // x86: PAUSE yields the pipeline to the SMT sibling (~140 cycles).
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                core::arch::asm!("sevl", options(nomem, nostack));
+                core::arch::asm!("wfe", options(nomem, nostack));
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            core::hint::spin_loop();
         }
-        // Platform-specific yield hint:
-        // aarch64: SEVL + WFE puts the core into a low-power state until a
-        // cache-line invalidation event (from the publisher's store) wakes it.
-        // x86: PAUSE yields the pipeline to the SMT sibling (~140 cycles).
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            core::arch::asm!("sevl", options(nomem, nostack));
-            core::arch::asm!("wfe", options(nomem, nostack));
-        }
-        #[cfg(not(target_arch = "aarch64"))]
-        core::hint::spin_loop();
-    }
 
-    // Phase 2: yield
-    for _ in 0..YIELD_ITERS {
-        let val = addr.load(Ordering::Acquire);
-        if val != current {
-            return Ok(val);
+        // Phase 2: yield
+        for _ in 0..YIELD_ITERS {
+            let val = addr.load(Ordering::Acquire);
+            if val != current {
+                return Ok(val);
+            }
+            std::thread::yield_now();
         }
-        std::thread::yield_now();
     }
 
     // Phase 3: platform-specific park

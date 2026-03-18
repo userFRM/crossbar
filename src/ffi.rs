@@ -99,8 +99,9 @@ impl Drop for CrossbarSample {
     fn drop(&mut self) {
         use core::sync::atomic::Ordering;
         let refcount = self.region.block_refcount(self.block_idx);
-        let prev = refcount.fetch_sub(1, Ordering::AcqRel);
+        let prev = refcount.fetch_sub(1, Ordering::Release);
         if prev == 1 {
+            core::sync::atomic::fence(Ordering::Acquire);
             self.region.free_block(self.block_idx);
         }
     }

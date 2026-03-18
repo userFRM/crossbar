@@ -42,7 +42,6 @@ pub(crate) const GH_STALE_TIMEOUT_US: usize = 0x38;
 
 // Topic entry offsets (relative to entry start)
 pub(crate) const TE_ACTIVE: usize = 0; // AtomicU32
-pub(crate) const TE_NOTIFY: usize = 4; // AtomicU32
 pub(crate) const TE_WRITE_SEQ: usize = 8; // AtomicU64
 pub(crate) const TE_WAITERS: usize = 0x10; // AtomicU32 -- moved from 0x5C to 1st cache line
 pub(crate) const TE_URI_LEN: usize = 0x14; // u32
