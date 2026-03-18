@@ -15,23 +15,25 @@ Same-process publisher + subscriber. `try_recv` only (no futex syscall — `WAIT
 
 Proves O(1): latency is flat regardless of how large the backing block is.
 
-| Backing buffer | crossbar | iceoryx2 | speedup |
+| Backing buffer | crossbar | iceoryx2 | ratio |
 |---|---|---|---|
-| 64 B | **56 ns** | 233 ns | 4.2× |
-| 4 KB | **56 ns** | 234 ns | 4.2× |
-| 64 KB | **59 ns** | 237 ns | 4.0× |
-| 256 KB | **59 ns** | 248 ns | 4.2× |
-| 1 MB | **59 ns** | 234 ns | 4.0× |
+| 64 B | **56 ns** | 233 ns | 4.2× faster |
+| 4 KB | **56 ns** | 234 ns | 4.2× faster |
+| 64 KB | **59 ns** | 237 ns | 4.0× faster |
+| 256 KB | **59 ns** | 248 ns | 4.2× faster |
+| 1 MB | **59 ns** | 234 ns | 4.0× faster |
 
 ### End-to-end with full payload (loan → memcpy → publish → recv → deref)
 
-| Payload | crossbar | iceoryx2 | speedup |
+| Payload | crossbar | iceoryx2 | ratio |
 |---|---|---|---|
-| 8 B | **59 ns** | 238 ns | **4.0×** |
-| 1 KB | **74 ns** | 250 ns | 3.4× |
-| 64 KB | 1.66 µs | 1.33 µs | ~1× |
-| 256 KB | 6.97 µs | 6.97 µs | ~1× |
-| 1 MB | 50 µs | 30 µs | ~1× |
+| 8 B | **60 ns** | 235 ns | **3.9× faster** |
+| 1 KB | **72 ns** | 250 ns | **3.5× faster** |
+| 64 KB | 1.53 µs | 1.31 µs | 0.86× (iceoryx2 wins) |
+| 256 KB | 6.84 µs | 7.00 µs | ~1× |
+| 1 MB | 45 µs | 32 µs | 0.71× (iceoryx2 wins) |
+
+At 64 KB+, iceoryx2's `memcpy` path is faster — likely from better SIMD-optimized copy routines or memory prefetching. Crossbar's `set_data()` uses plain `copy_nonoverlapping`. The born-in-SHM pattern (`as_mut_slice()`) eliminates this gap by avoiding the copy entirely.
 
 ### Throughput (born-in-SHM write)
 
@@ -44,7 +46,7 @@ Proves O(1): latency is flat regardless of how large the backing block is.
 
 | | latency |
 |---|---|
-| 8 B, `publish_silent()` | **58 ns** |
+| 8 B, `publish_silent()` | **57 ns** |
 
 ---
 
