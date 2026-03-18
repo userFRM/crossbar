@@ -138,6 +138,7 @@ The block pool is a lock-free stack with a 64-bit `(generation, index)` head poi
 - **Alloc**: CAS-weak head to `(gen+1, next_free_of_head_block)`; reuse `Err(current)` on retry
 - **Free**: CAS-weak head to `(gen+1, freed_block)`; write old head index into freed block's link field
 - **Per-publisher cache**: Each publisher caches up to 8 blocks locally, refilling from the global stack when empty. This amortizes the CAS over multiple allocations.
+- **Block recycling**: When `commit_to_ring` frees the old block, it stashes the index in `Region.last_freed` instead of pushing to the stack. The next `alloc_cached` grabs this block first — it's still warm in L1/L2 from the previous write, eliminating RFO cache misses for large payloads.
 
 ---
 

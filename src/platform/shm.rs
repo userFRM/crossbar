@@ -195,17 +195,23 @@ pub struct ShmPublisher {
 
 impl ShmPublisher {
     /// Allocates a block from the local cache, refilling from the global pool on miss.
+    /// Checks the recycled (cache-warm) block first for optimal L1/L2 reuse.
     fn alloc_cached(&mut self) -> Option<u32> {
+        // First: check for a recycled block (cache-warm from last publish)
+        if let Some(idx) = self.region.alloc_recycled() {
+            return Some(idx);
+        }
+        // Then: check the local cache
         if self.cache_len > 0 {
             self.cache_len -= 1;
             return Some(self.block_cache[self.cache_len as usize]);
         }
-        // Cache miss -- refill from global pool
-        for i in 0..8u8 {
+        // Finally: refill from global Treiber stack
+        while (self.cache_len as usize) < self.block_cache.len() {
             match self.region.alloc_block() {
                 Some(idx) => {
-                    self.block_cache[i as usize] = idx;
-                    self.cache_len = i + 1;
+                    self.block_cache[self.cache_len as usize] = idx;
+                    self.cache_len += 1;
                 }
                 None => break,
             }
@@ -685,6 +691,10 @@ impl ShmPublisher {
 
 impl Drop for ShmPublisher {
     fn drop(&mut self) {
+        // Return recycled block to pool
+        if let Some(idx) = self.region.alloc_recycled() {
+            self.region.free_block(idx);
+        }
         // Return cached blocks to the global pool
         for i in 0..self.cache_len as usize {
             self.region.free_block(self.block_cache[i]);

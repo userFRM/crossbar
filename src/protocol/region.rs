@@ -25,6 +25,7 @@ pub struct Region {
     pub(crate) len: usize,
     pub(crate) config: PubSubConfig,
     pub(crate) pool_offset: usize,
+    pub(crate) last_freed: AtomicU32,
 }
 
 // SAFETY: The mmap region is process-shared memory backed by a named file in
@@ -47,6 +48,7 @@ impl Region {
             len,
             config,
             pool_offset,
+            last_freed: AtomicU32::new(NO_BLOCK),
         }
     }
 
@@ -106,6 +108,18 @@ impl Region {
                 Ok(_) => return Some(idx),
                 Err(current) => head = current,
             }
+        }
+    }
+
+    /// Try to grab the recycled block (cache-warm from the last publish).
+    /// Returns `Some(idx)` if a recycled block was available, `None` otherwise.
+    #[inline]
+    pub(crate) fn alloc_recycled(&self) -> Option<u32> {
+        let idx = self.last_freed.swap(NO_BLOCK, Ordering::AcqRel);
+        if idx != NO_BLOCK {
+            Some(idx)
+        } else {
+            None
         }
     }
 
@@ -249,13 +263,18 @@ impl Region {
         // 6. Seqlock close -- data visible to subscribers
         entry_seq.store(seq, Ordering::Release);
 
-        // 7. Release old block (decrement refcount; free if no subscribers hold it)
+        // 7. Release old block (decrement refcount; recycle if no subscribers hold it)
         if old_block_idx != NO_BLOCK {
             let prev = self
                 .block_refcount(old_block_idx)
                 .fetch_sub(1, Ordering::AcqRel);
             if prev == 1 {
-                self.free_block(old_block_idx);
+                // Recycle this block for warm reuse by the next alloc.
+                // If a previous recycled block wasn't claimed, free it to the pool.
+                let old_recycled = self.last_freed.swap(old_block_idx, Ordering::AcqRel);
+                if old_recycled != NO_BLOCK {
+                    self.free_block(old_recycled);
+                }
             }
         }
 
