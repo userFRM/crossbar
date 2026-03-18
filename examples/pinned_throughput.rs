@@ -9,18 +9,18 @@ fn main() {
 
     // Warmup
     for _ in 0..1000 {
-        let mut loan = unsafe { pub_.loan_pinned(&handle) };
+        let mut loan = pub_.loan_pinned(&handle);
         loan.as_mut_slice()[..8].copy_from_slice(&42u64.to_le_bytes());
         loan.set_len(8);
         loan.publish();
-        let _ = unsafe { stream.try_recv_pinned() };
+        let _ = stream.try_recv_pinned();
     }
 
     // Measure: publish-only throughput
     let n = 10_000_000u64;
     let start = Instant::now();
     for i in 0..n {
-        let mut loan = unsafe { pub_.loan_pinned(&handle) };
+        let mut loan = pub_.loan_pinned(&handle);
         loan.as_mut_slice()[..8].copy_from_slice(&i.to_le_bytes());
         loan.set_len(8);
         loan.publish();
@@ -36,11 +36,11 @@ fn main() {
     // Measure: full roundtrip
     let start = Instant::now();
     for i in 0..n {
-        let mut loan = unsafe { pub_.loan_pinned(&handle) };
+        let mut loan = pub_.loan_pinned(&handle);
         loan.as_mut_slice()[..8].copy_from_slice(&i.to_le_bytes());
         loan.set_len(8);
         loan.publish();
-        let g = unsafe { stream.try_recv_pinned() }.unwrap();
+        let g = stream.try_recv_pinned().unwrap();
         std::hint::black_box(&*g);
     }
     let elapsed = start.elapsed();
@@ -55,12 +55,12 @@ fn main() {
     let n_64k = 500_000u64;
     let start = Instant::now();
     for _ in 0..n_64k {
-        let mut loan = unsafe { pub_.loan_pinned(&handle) };
+        let mut loan = pub_.loan_pinned(&handle);
         let cap = loan.capacity();
         loan.as_mut_slice()[..cap].fill(42u8);
         loan.set_len(cap);
         loan.publish();
-        let g = unsafe { stream.try_recv_pinned() }.unwrap();
+        let g = stream.try_recv_pinned().unwrap();
         std::hint::black_box(&*g);
     }
     let elapsed = start.elapsed();

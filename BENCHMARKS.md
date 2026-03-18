@@ -40,6 +40,17 @@ Proves O(1): latency is flat regardless of how large the backing block is.
 | 64 KB | **43 GiB/s** |
 | 1 MB | **30 GiB/s** |
 
+### Pinned mode (latest-value, same buffer every iteration)
+
+`loan_pinned` / `try_recv_pinned` — no ring, no alloc, no refcount.
+
+| Payload | crossbar | iceoryx2 | speedup |
+|---|---|---|---|
+| 8 B | **26 ns** | 229 ns | **8.7×** |
+| 1 KB | **33 ns** | 234 ns | **7.1×** |
+| 64 KB | **1.07 µs** | 1.27 µs | **1.2×** |
+| 1 MB | 18.4 µs | 18.4 µs | ~1× |
+
 ### Silent publish (no wake path)
 
 | | latency |

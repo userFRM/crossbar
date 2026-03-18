@@ -53,6 +53,9 @@ pub(crate) const TE_TYPE_SIZE: usize = 0x60; // u32 -- size_of::<T>() for typed 
 /// Pinned-publish block index (u32). NO_BLOCK = not pinned.
 /// Located in topic entry cache line 1 (cold path, set once at registration).
 pub(crate) const TE_PINNED_BLOCK: usize = 0x64;
+/// Pinned-publish active reader count (AtomicU32). Publisher panics if > 0
+/// when loan_pinned is called. Enables safe pinned API without `unsafe`.
+pub(crate) const TE_PINNED_READERS: usize = 0x68; // AtomicU32
 /// Pinned-publish seqlock: packed (seq:32 | data_len:32) in AtomicU64.
 /// The publisher stores this with Release after writing data.
 /// The subscriber loads this with Acquire before reading data.

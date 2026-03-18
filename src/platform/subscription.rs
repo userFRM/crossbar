@@ -367,16 +367,20 @@ impl Subscription {
     /// Non-blocking pinned receive. Returns a zero-overhead guard pointing
     /// directly into the pinned block. No refcount, no seqlock double-check.
     ///
-    /// # Safety
+    /// Non-blocking pinned receive. Returns a zero-overhead guard pointing
+    /// directly into the pinned block.
     ///
-    /// The publisher MUST NOT hold a `PinnedLoan` for this topic while
-    /// the returned `PinnedGuard` exists. Violating this is UB.
+    /// The guard increments a shared reader count on creation and decrements
+    /// on drop. The publisher checks this count before writing — if any
+    /// readers exist, `loan_pinned` panics instead of causing UB.
     ///
     /// Returns `None` if no new data has been published since the last recv.
-    pub unsafe fn try_recv_pinned(&self) -> Option<PinnedGuard<'_>> {
-        // Load the pinned seqlock: packed (seq:32 | data_len:32)
+    pub fn try_recv_pinned(&self) -> Option<PinnedGuard<'_>> {
         let off = topic_entry_off(self.topic_idx);
-        let pinned_seq = &*(self.region.base.add(off + TE_PINNED_SEQ) as *const AtomicU64);
+
+        // Load the pinned seqlock: packed (seq:32 | data_len:32)
+        let pinned_seq =
+            unsafe { &*(self.region.base.add(off + TE_PINNED_SEQ) as *const AtomicU64) };
         let packed = pinned_seq.load(Ordering::Acquire);
 
         if packed == 0 {
@@ -393,18 +397,91 @@ impl Subscription {
         self.last_seq.set(seq);
 
         // Read pinned block index from topic entry
-        let block_idx = (self.region.base.add(off + TE_PINNED_BLOCK) as *const u32).read();
+        let block_idx =
+            unsafe { (self.region.base.add(off + TE_PINNED_BLOCK) as *const u32).read() };
         if block_idx == NO_BLOCK {
             return None;
         }
 
-        let data_ptr = self.region.block_ptr(block_idx).add(BLOCK_DATA_OFFSET);
+        // Increment reader count — publisher will check this before writing
+        let readers =
+            unsafe { &*(self.region.base.add(off + TE_PINNED_READERS) as *const AtomicU32) };
+        readers.fetch_add(1, Ordering::Release);
+
+        let data_ptr = unsafe { self.region.block_ptr(block_idx).add(BLOCK_DATA_OFFSET) };
 
         Some(PinnedGuard {
             data_ptr,
             len: data_len as usize,
-            _marker: core::marker::PhantomData,
+            readers,
         })
+    }
+
+    /// Blocking pinned receive. Waits for the next pinned publish using
+    /// the default [`WaitStrategy`] (three-phase adaptive: spin -> yield
+    /// -> OS sleep).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpcError::PublisherDead`] if the publisher heartbeat goes stale.
+    pub fn recv_pinned(&self) -> Result<PinnedGuard<'_>, IpcError> {
+        self.recv_pinned_with(WaitStrategy::default())
+    }
+
+    /// Blocking pinned receive with a custom [`WaitStrategy`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpcError::PublisherDead`] if the publisher heartbeat goes stale.
+    pub fn recv_pinned_with(&self, strategy: WaitStrategy) -> Result<PinnedGuard<'_>, IpcError> {
+        // Fast path
+        if let Some(g) = self.try_recv_pinned() {
+            return Ok(g);
+        }
+
+        let poll_ms = (self.region.config.stale_timeout.as_millis() as u64 / 3).clamp(1, 50);
+        let mut iter: u32 = 0;
+
+        loop {
+            if let Some(g) = self.try_recv_pinned() {
+                return Ok(g);
+            }
+
+            match strategy {
+                WaitStrategy::Adaptive {
+                    spin_iters,
+                    yield_iters,
+                } if iter >= spin_iters + yield_iters => {
+                    let seq_futex = unsafe {
+                        &*(self.write_seq_atom() as *const AtomicU64 as *const AtomicU32)
+                    };
+                    let cur = seq_futex.load(Ordering::Acquire);
+                    if let Some(g) = self.try_recv_pinned() {
+                        return Ok(g);
+                    }
+                    self.waiters_atom().fetch_add(1, Ordering::Release);
+                    let result = notify::wait_until_not(
+                        seq_futex,
+                        cur,
+                        Duration::from_millis(poll_ms),
+                        true,
+                    );
+                    self.waiters_atom().fetch_sub(1, Ordering::Release);
+
+                    if result.is_err() {
+                        self.region.check_heartbeat()?;
+                    }
+                }
+                _ => {
+                    strategy.wait(iter);
+                    iter = iter.saturating_add(1);
+
+                    if iter.is_multiple_of(1024) {
+                        self.region.check_heartbeat()?;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -540,20 +617,28 @@ impl<T: crate::Pod> core::fmt::Debug for TypedSampleGuard<'_, T> {
 
 // ---- PinnedGuard ----
 
-/// Zero-overhead read reference to a pinned block in shared memory.
+/// Near-zero-overhead read reference to a pinned block in shared memory.
 ///
-/// No refcount increment on creation. No refcount decrement on drop.
-/// The data pointer goes directly into the permanently-assigned block.
-///
-/// # Safety
-///
-/// The publisher MUST NOT hold a [`PinnedLoan`](super::loan::PinnedLoan)
-/// for this topic while a `PinnedGuard` exists. Overlapping reads and
-/// writes are undefined behavior.
+/// On creation, increments a shared reader count in the topic entry.
+/// On drop, decrements it. The publisher checks this count before writing
+/// and panics if any readers exist — preventing data races at runtime
+/// without requiring `unsafe`.
 pub struct PinnedGuard<'a> {
     data_ptr: *const u8,
     len: usize,
-    _marker: core::marker::PhantomData<&'a ()>,
+    readers: &'a AtomicU32,
+}
+
+impl PinnedGuard<'_> {
+    /// Returns the data length.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns `true` if the sample has zero length.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 }
 
 impl Deref for PinnedGuard<'_> {
@@ -566,6 +651,12 @@ impl Deref for PinnedGuard<'_> {
 impl AsRef<[u8]> for PinnedGuard<'_> {
     fn as_ref(&self) -> &[u8] {
         self.deref()
+    }
+}
+
+impl Drop for PinnedGuard<'_> {
+    fn drop(&mut self) {
+        self.readers.fetch_sub(1, Ordering::Release);
     }
 }
 
