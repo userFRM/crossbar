@@ -341,6 +341,100 @@ fn bench_iceoryx2_vs_crossbar(c: &mut Criterion) {
 
         drop(pub_);
     }
+
+    // ============================================================
+    // Part 3: BORN-IN-SHM — write directly into SHM, no memcpy
+    // crossbar: write into loan.as_mut_slice(), publish (O(1) at any size)
+    // iceoryx2: write into sample via write_from_fn (still copies internally)
+    // This proves crossbar's zero-copy advantage at large payloads.
+    // ============================================================
+    {
+        let mut group = c.benchmark_group("head_to_head_born_in_shm");
+        group.measurement_time(Duration::from_secs(2));
+
+        let shm_sizes: &[(&str, usize)] = &[
+            ("8B", 8),
+            ("1KB", 1024),
+            ("64KB", 65_536),
+            ("1MB", 1_048_576),
+        ];
+
+        // iceoryx2: loan_slice_uninit + write_from_fn (fills in-place)
+        for &(label, sz) in shm_sizes {
+            let svc_name: ServiceName = format!("bench/shm/ix2/{label}")
+                .as_str()
+                .try_into()
+                .unwrap();
+            let service = node
+                .service_builder(&svc_name)
+                .publish_subscribe::<[u8]>()
+                .enable_safe_overflow(true)
+                .open_or_create()
+                .unwrap();
+            let publisher = service
+                .publisher_builder()
+                .initial_max_slice_len(sz)
+                .create()
+                .unwrap();
+            let subscriber = service.subscriber_builder().create().unwrap();
+
+            group.bench_function(format!("iceoryx2/{label}"), |b| {
+                b.iter(|| {
+                    let sample = publisher.loan_slice_uninit(sz).unwrap();
+                    let sample = sample.write_from_fn(|_| 42u8);
+                    sample.send().unwrap();
+                    let recv = subscriber.receive().unwrap().unwrap();
+                    black_box(&*recv);
+                })
+            });
+        }
+
+        // crossbar: loan + write directly into as_mut_slice() — true zero-copy
+        let ps_name = "crossbar-bench-shm";
+        let cfg = PubSubConfig {
+            block_size: 1_048_576 + 64,
+            block_count: 64,
+            ring_depth: 8,
+            ..PubSubConfig::default()
+        };
+        let mut pub_ = ShmPublisher::create(ps_name, cfg).unwrap();
+        let handles: Vec<_> = shm_sizes
+            .iter()
+            .map(|&(label, _)| {
+                let topic = format!("/bench/shm/{label}");
+                (label, pub_.register(&topic).unwrap())
+            })
+            .collect();
+        let sub = ShmSubscriber::connect(ps_name).unwrap();
+        let subs: Vec<_> = shm_sizes
+            .iter()
+            .map(|&(label, _)| {
+                let topic = format!("/bench/shm/{label}");
+                (label, sub.subscribe(&topic).unwrap())
+            })
+            .collect();
+
+        for (i, &(label, sz)) in shm_sizes.iter().enumerate() {
+            let handle = &handles[i].1;
+            let sub_handle = &subs[i].1;
+
+            group.bench_function(format!("crossbar/{label}"), |b| {
+                b.iter(|| {
+                    let mut loan = pub_.loan(handle);
+                    // Born-in-SHM: fill directly in the loaned block — no intermediate buffer
+                    loan.as_mut_slice()[..sz].fill(42u8);
+                    loan.set_len(sz);
+                    loan.publish();
+                    let g = sub_handle.try_recv().unwrap();
+                    black_box(&*g);
+                })
+            });
+        }
+
+        group.finish();
+
+        drop(pub_);
+    }
 }
 
 // ====================================================
