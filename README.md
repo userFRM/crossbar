@@ -172,7 +172,7 @@ All measurements: Criterion, same-process publisher + subscriber, `try_recv` (no
 | 64 KB | 1.35 µs | 1.35 µs | ~1× |
 | 1 MB | **33 µs** | 30 µs | ~1× |
 
-### Apple M1 Pro · macOS · rustc 1.92
+### Apple M1 Pro · macOS · rustc 1.92 (v0.3.0, pre-optimization)
 
 | | crossbar | iceoryx2 | speedup |
 |---|---|---|---|

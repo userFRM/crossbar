@@ -37,20 +37,20 @@ Proves O(1): latency is flat regardless of how large the backing block is.
 
 | Payload | throughput |
 |---|---|
-| 64 KB | **42.5 GiB/s** |
-| 1 MB | **15.7 GiB/s** |
+| 64 KB | **43 GiB/s** |
+| 1 MB | **30 GiB/s** |
 
 ### Silent publish (no wake path)
 
 | | latency |
 |---|---|
-| 8 B, `publish_silent()` | **46 ns** |
+| 8 B, `publish_silent()` | **56 ns** |
 
 ---
 
 ## Apple M1 Pro · macOS · rustc 1.92.0
 
-> These numbers are from a previous session and have not been re-run after multi-publisher changes.
+> These numbers are from a previous session (v0.3.0) and have not been re-run after the v0.3.1 performance overhaul. Expect improvement.
 
 ### Transport overhead
 
@@ -85,10 +85,10 @@ Proves O(1): latency is flat regardless of how large the backing block is.
 
 **The crossbar advantage lives below 64 KB.** The speed difference comes from a lighter path — no service discovery, no POSIX configuration layer, straight to atomics. Above 64 KB, `memcpy` dominates and both frameworks are equal.
 
-**Born-in-SHM avoids the memcpy entirely.** If the publisher writes directly into the loaned block (no intermediate copy), the latency at any payload size is just the transport overhead: ~52–60 ns depending on hardware. The throughput numbers above measure the memcpy cost separately.
+**Born-in-SHM avoids the memcpy entirely.** If the publisher writes directly into the loaned block (no intermediate copy), the transport is ~50 ns regardless of payload size. Run `cargo bench -- born_in_shm` to see the head-to-head.
 
-**Throughput is memory-bandwidth-bound.** 45–49 GiB/s is close to measured memory bandwidth — the bulk of time is writing the payload, not the framework.
+**Throughput is memory-bandwidth-bound.** 30–43 GiB/s is close to measured memory bandwidth — the bulk of time is writing the payload, not the framework.
 
-**Multi-publisher overhead.** The protocol uses `fetch_add` for atomic sequence claiming and CAS-based ring slot locking. In single-publisher mode (the common case), the seqlock uses a plain store instead of CAS, saving ~10–15 ns. The `silent_no_wake` path at 58 ns shows the pure atomics floor without notification overhead.
+**Multi-publisher overhead.** The protocol uses `fetch_add` for atomic sequence claiming and CAS-based ring slot locking. In single-publisher mode (the common case), the seqlock uses a plain store instead of CAS, saving ~10–15 ns. The `silent_no_wake` path at 56 ns shows the pure atomics floor without notification overhead.
 
 **Per-publisher block cache.** Each publisher caches up to 8 blocks locally, amortizing the Treiber stack CAS over multiple loans. Under contention (multiple publishers), this eliminates most CAS retries on the pool head.
