@@ -71,23 +71,40 @@ impl Region {
 
     #[inline]
     pub(crate) fn alloc_block(&self) -> Option<u32> {
+        let mut head = self.pool_head().load(Ordering::Acquire);
         loop {
-            let head = self.pool_head().load(Ordering::Acquire);
             let (gen, idx) = unpack(head);
             if idx == NO_BLOCK {
                 return None;
             }
-            let next =
-                unsafe { &*(self.block_ptr(idx) as *const AtomicU32) }.load(Ordering::Relaxed);
+            let block = self.block_ptr(idx);
+            let next = unsafe { &*(block as *const AtomicU32) }.load(Ordering::Relaxed);
             let new_head = pack(gen.wrapping_add(1), next);
-            if self
-                .pool_head()
-                .compare_exchange(head, new_head, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                // Clear refcount for the newly allocated block
-                self.block_refcount(idx).store(0, Ordering::Release);
-                return Some(idx);
+
+            // Prefetch the block data into L1 cache before the CAS attempt
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(
+                    block as *const i8,
+                );
+            }
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                core::arch::asm!(
+                    "prfm pstl1keep, [{addr}]",
+                    addr = in(reg) block,
+                    options(nostack, preserves_flags)
+                );
+            }
+
+            match self.pool_head().compare_exchange_weak(
+                head,
+                new_head,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(idx),
+                Err(current) => head = current,
             }
         }
     }
@@ -95,19 +112,21 @@ impl Region {
     #[inline]
     pub(crate) fn free_block(&self, idx: u32) {
         debug_assert!((idx as usize) < self.config.block_count as usize);
+        let mut head = self.pool_head().load(Ordering::Acquire);
         loop {
-            let head = self.pool_head().load(Ordering::Acquire);
             let (gen, old_head_idx) = unpack(head);
             // Write next pointer into the block's free-list link (offset 0)
             unsafe { &*(self.block_ptr(idx) as *const AtomicU32) }
                 .store(old_head_idx, Ordering::Relaxed);
             let new_head = pack(gen.wrapping_add(1), idx);
-            if self
-                .pool_head()
-                .compare_exchange(head, new_head, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                return;
+            match self.pool_head().compare_exchange_weak(
+                head,
+                new_head,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(current) => head = current,
             }
         }
     }
@@ -174,9 +193,9 @@ impl Region {
         data_len: u32,
         topic_idx: u32,
         write_seq_atom: &AtomicU64,
-        notify_atom: &AtomicU32,
         waiters_atom: &AtomicU32,
         wake: bool,
+        single_publisher: bool,
     ) {
         // 1. Atomically claim the next sequence number
         let seq = write_seq_atom.fetch_add(1, Ordering::AcqRel) + 1;
@@ -189,20 +208,29 @@ impl Region {
 
         // 2. Acquire the ring slot via CAS (prevents two publishers from
         //    writing the same slot when seqs differ by exactly ring_depth).
-        //    Uses SEVL+WFE on aarch64 for cache-line-aware low-power spin.
-        loop {
-            let current = entry_seq.load(Ordering::Acquire);
-            if current == SEQ_WRITING {
+        //    Single-publisher mode skips the CAS loop entirely.
+        if single_publisher {
+            entry_seq.store(SEQ_WRITING, Ordering::Release);
+        } else {
+            loop {
+                let current = entry_seq.load(Ordering::Acquire);
+                if current == SEQ_WRITING {
+                    crate::wait::yield_hint();
+                    continue;
+                }
+                if entry_seq
+                    .compare_exchange_weak(
+                        current,
+                        SEQ_WRITING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    break;
+                }
                 crate::wait::yield_hint();
-                continue;
             }
-            if entry_seq
-                .compare_exchange(current, SEQ_WRITING, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                break;
-            }
-            crate::wait::yield_hint();
         }
 
         // 3. Read old block_idx from the slot we're overwriting
@@ -231,15 +259,15 @@ impl Region {
             }
         }
 
-        // 8. Smart wake: always bump notification counter, but only issue the
-        //    expensive futex_wake syscall (~170ns) when a subscriber is actually
-        //    blocked in recv(). When all subscribers poll with try_recv(), this
-        //    path costs ~8ns instead of ~170ns.
-        if wake {
-            notify_atom.fetch_add(1, Ordering::Release);
-            if waiters_atom.load(Ordering::Acquire) > 0 {
-                notify::wake_all(notify_atom);
-            }
+        // 8. Smart wake: only issue the expensive futex_wake syscall (~170ns)
+        //    when a subscriber is actually blocked in recv(). Reinterpret the
+        //    low 32 bits of write_seq as the futex address -- the fetch_add
+        //    already changed the value so waiters will see it and wake up.
+        if wake && waiters_atom.load(Ordering::Acquire) > 0 {
+            // Safety: AtomicU64 is at least 4-byte aligned. On little-endian
+            // (all supported platforms), the low 32 bits are at the base address.
+            let seq_futex = unsafe { &*(write_seq_atom as *const AtomicU64 as *const AtomicU32) };
+            notify::wake_all(seq_futex);
         }
     }
 }

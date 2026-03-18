@@ -189,9 +189,35 @@ pub struct ShmPublisher {
     id: u64,
     last_heartbeat: std::time::Instant,
     loan_count: u32,
+    block_cache: [u32; 8],
+    cache_len: u8,
 }
 
 impl ShmPublisher {
+    /// Allocates a block from the local cache, refilling from the global pool on miss.
+    fn alloc_cached(&mut self) -> Option<u32> {
+        if self.cache_len > 0 {
+            self.cache_len -= 1;
+            return Some(self.block_cache[self.cache_len as usize]);
+        }
+        // Cache miss -- refill from global pool
+        for i in 0..8u8 {
+            match self.region.alloc_block() {
+                Some(idx) => {
+                    self.block_cache[i as usize] = idx;
+                    self.cache_len = i + 1;
+                }
+                None => break,
+            }
+        }
+        if self.cache_len > 0 {
+            self.cache_len -= 1;
+            Some(self.block_cache[self.cache_len as usize])
+        } else {
+            None
+        }
+    }
+
     /// Creates a new pool-backed pub/sub region.
     ///
     /// # Errors
@@ -312,6 +338,8 @@ impl ShmPublisher {
             id,
             last_heartbeat: std::time::Instant::now(),
             loan_count: 0,
+            block_cache: [0; 8],
+            cache_len: 0,
         })
     }
 
@@ -416,6 +444,8 @@ impl ShmPublisher {
             id,
             last_heartbeat: std::time::Instant::now(),
             loan_count: 0,
+            block_cache: [0; 8],
+            cache_len: 0,
         })
     }
 
@@ -557,7 +587,7 @@ impl ShmPublisher {
     /// belongs to a different publisher.
     #[inline]
     pub fn loan(&mut self, handle: &TopicHandle) -> ShmLoan<'_> {
-        assert_eq!(
+        debug_assert_eq!(
             handle.publisher_id, self.id,
             "TopicHandle belongs to a different ShmPublisher"
         );
@@ -575,8 +605,7 @@ impl ShmPublisher {
         }
 
         let block_idx = self
-            .region
-            .alloc_block()
+            .alloc_cached()
             .expect("pool exhausted -- increase block_count in PubSubConfig");
 
         let topic_idx = handle.topic_idx;
@@ -585,8 +614,6 @@ impl ShmPublisher {
         let base_ptr = self.region.base;
 
         let write_seq_atom = unsafe { &*(base_ptr.add(off + TE_WRITE_SEQ) as *const AtomicU64) };
-
-        let notify_atom = unsafe { &*(base_ptr.add(off + TE_NOTIFY) as *const AtomicU32) };
 
         let waiters_atom = unsafe { &*(base_ptr.add(off + TE_WAITERS) as *const AtomicU32) };
 
@@ -600,8 +627,8 @@ impl ShmPublisher {
             block_idx,
             topic_idx,
             write_seq_atom,
-            notify_atom,
             waiters_atom,
+            single_publisher: self.is_owner,
         }
     }
 
@@ -617,7 +644,7 @@ impl ShmPublisher {
     /// publisher.
     #[inline]
     pub fn loan_typed<T: crate::Pod>(&mut self, handle: &TopicHandle) -> TypedShmLoan<'_, T> {
-        assert_eq!(
+        debug_assert_eq!(
             handle.publisher_id, self.id,
             "TopicHandle belongs to a different ShmPublisher"
         );
@@ -632,8 +659,7 @@ impl ShmPublisher {
         }
 
         let block_idx = self
-            .region
-            .alloc_block()
+            .alloc_cached()
             .expect("pool exhausted -- increase block_count in PubSubConfig");
 
         let topic_idx = handle.topic_idx;
@@ -643,8 +669,6 @@ impl ShmPublisher {
 
         let write_seq_atom = unsafe { &*(base_ptr.add(off + TE_WRITE_SEQ) as *const AtomicU64) };
 
-        let notify_atom = unsafe { &*(base_ptr.add(off + TE_NOTIFY) as *const AtomicU32) };
-
         let waiters_atom = unsafe { &*(base_ptr.add(off + TE_WAITERS) as *const AtomicU32) };
 
         TypedShmLoan {
@@ -652,8 +676,8 @@ impl ShmPublisher {
             block_idx,
             topic_idx,
             write_seq_atom,
-            notify_atom,
             waiters_atom,
+            single_publisher: self.is_owner,
             _marker: core::marker::PhantomData,
         }
     }
@@ -661,6 +685,12 @@ impl ShmPublisher {
 
 impl Drop for ShmPublisher {
     fn drop(&mut self) {
+        // Return cached blocks to the global pool
+        for i in 0..self.cache_len as usize {
+            self.region.free_block(self.block_cache[i]);
+        }
+        self.cache_len = 0;
+
         if self.is_owner && file_identity(&self.path) == self.created_ino {
             let _ = std::fs::remove_file(&self.path);
         }

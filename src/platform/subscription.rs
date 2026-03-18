@@ -40,11 +40,6 @@ impl Subscription {
         unsafe { &*(self.region.base.add(off + TE_WRITE_SEQ) as *const AtomicU64) }
     }
 
-    fn notify_atom(&self) -> &AtomicU32 {
-        let off = topic_entry_off(self.topic_idx);
-        unsafe { &*(self.region.base.add(off + TE_NOTIFY) as *const AtomicU32) }
-    }
-
     fn waiters_atom(&self) -> &AtomicU32 {
         let off = topic_entry_off(self.topic_idx);
         unsafe { &*(self.region.base.add(off + TE_WAITERS) as *const AtomicU32) }
@@ -94,6 +89,21 @@ impl Subscription {
         let entry_off = ring_entry_off(&self.region.config, self.topic_idx, slot);
         let entry_ptr = unsafe { self.region.base.add(entry_off) };
 
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(
+                entry_ptr as *const i8,
+            );
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            core::arch::asm!(
+                "prfm pldl1keep, [{addr}]",
+                addr = in(reg) entry_ptr,
+                options(nostack, preserves_flags)
+            );
+        }
+
         // Seqlock check 1
         let entry_seq = unsafe { &*(entry_ptr.add(RE_SEQ) as *const AtomicU64) };
         if entry_seq.load(Ordering::Acquire) != seq {
@@ -123,7 +133,7 @@ impl Subscription {
                 return None; // block already freed
             }
             if refcount
-                .compare_exchange(rc, rc + 1, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange_weak(rc, rc + 1, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
                 break;
@@ -133,8 +143,9 @@ impl Subscription {
         // Seqlock check 2 -- verify ring slot wasn't overwritten during our read
         if entry_seq.load(Ordering::Acquire) != seq {
             // Undo refcount increment
-            let prev = refcount.fetch_sub(1, Ordering::AcqRel);
+            let prev = refcount.fetch_sub(1, Ordering::Release);
             if prev == 1 {
+                core::sync::atomic::fence(Ordering::Acquire);
                 self.region.free_block(block_idx);
             }
             return None;
@@ -246,15 +257,19 @@ impl Subscription {
                     spin_iters,
                     yield_iters,
                 } if iter >= spin_iters + yield_iters => {
-                    let cur = self.notify_atom().load(Ordering::Acquire);
+                    let seq_futex = unsafe {
+                        &*(self.write_seq_atom() as *const AtomicU64 as *const AtomicU32)
+                    };
+                    let cur = seq_futex.load(Ordering::Acquire);
                     if let Some(g) = self.try_recv_typed::<T>() {
                         return Ok(g);
                     }
                     self.waiters_atom().fetch_add(1, Ordering::Release);
                     let result = notify::wait_until_not(
-                        self.notify_atom(),
+                        seq_futex,
                         cur,
                         Duration::from_millis(poll_ms),
+                        true,
                     );
                     self.waiters_atom().fetch_sub(1, Ordering::Release);
 
@@ -304,16 +319,20 @@ impl Subscription {
                     spin_iters,
                     yield_iters,
                 } if iter >= spin_iters + yield_iters => {
-                    // Phase 3: OS sleep (existing futex/WaitOnAddress/WFE path)
-                    let cur = self.notify_atom().load(Ordering::Acquire);
+                    // Phase 3: OS sleep — use low-32 of write_seq as futex word
+                    let seq_futex = unsafe {
+                        &*(self.write_seq_atom() as *const AtomicU64 as *const AtomicU32)
+                    };
+                    let cur = seq_futex.load(Ordering::Acquire);
                     if let Some(g) = self.try_recv() {
                         return Ok(g);
                     }
                     self.waiters_atom().fetch_add(1, Ordering::Release);
                     let result = notify::wait_until_not(
-                        self.notify_atom(),
+                        seq_futex,
                         cur,
                         Duration::from_millis(poll_ms),
+                        true,
                     );
                     self.waiters_atom().fetch_sub(1, Ordering::Release);
 
@@ -425,8 +444,9 @@ impl core::fmt::Debug for SampleGuard<'_> {
 impl Drop for SampleGuard<'_> {
     fn drop(&mut self) {
         let refcount = self.region.block_refcount(self.block_idx);
-        let prev = refcount.fetch_sub(1, Ordering::AcqRel);
+        let prev = refcount.fetch_sub(1, Ordering::Release);
         if prev == 1 {
+            core::sync::atomic::fence(Ordering::Acquire);
             self.region.free_block(self.block_idx);
         }
     }
@@ -458,8 +478,9 @@ impl<T: crate::Pod> core::ops::Deref for TypedSampleGuard<'_, T> {
 impl<T: crate::Pod> Drop for TypedSampleGuard<'_, T> {
     fn drop(&mut self) {
         let refcount = self.region.block_refcount(self.block_idx);
-        let prev = refcount.fetch_sub(1, Ordering::AcqRel);
+        let prev = refcount.fetch_sub(1, Ordering::Release);
         if prev == 1 {
+            core::sync::atomic::fence(Ordering::Acquire);
             self.region.free_block(self.block_idx);
         }
     }

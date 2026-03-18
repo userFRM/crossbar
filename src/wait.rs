@@ -81,8 +81,7 @@ impl Default for WaitStrategy {
 pub(crate) fn yield_hint() {
     #[cfg(target_arch = "aarch64")]
     unsafe {
-        core::arch::asm!("sevl", options(nomem, nostack));
-        core::arch::asm!("wfe", options(nomem, nostack));
+        core::arch::asm!("sevl", "wfe", options(nomem, nostack));
     }
     #[cfg(not(target_arch = "aarch64"))]
     core::hint::spin_loop();

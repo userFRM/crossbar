@@ -13,6 +13,46 @@ use std::sync::Arc;
 use crate::protocol::layout::BLOCK_DATA_OFFSET;
 use crate::protocol::Region;
 
+// ---- Non-temporal copy (x86-64) ----
+
+/// Copies `len` bytes from `src` to `dst` using non-temporal (streaming) stores.
+/// The 16-byte-aligned portion uses `_mm_stream_si128`; any head/tail remainder
+/// uses `copy_nonoverlapping`. An `_mm_sfence` at the end ensures all stores
+/// are globally visible before the function returns.
+///
+/// # Safety
+///
+/// `src` and `dst` must be valid for `len` bytes and must not overlap.
+#[cfg(target_arch = "x86_64")]
+unsafe fn nontemporal_copy(src: *const u8, dst: *mut u8, len: usize) {
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_sfence, _mm_stream_si128};
+
+    let mut offset = 0usize;
+
+    // Handle unaligned head: copy bytes until dst is 16-byte aligned
+    let align_offset = dst.align_offset(16).min(len);
+    if align_offset > 0 {
+        core::ptr::copy_nonoverlapping(src, dst, align_offset);
+        offset = align_offset;
+    }
+
+    // Stream 16 bytes at a time via non-temporal stores
+    while offset + 16 <= len {
+        let chunk = _mm_loadu_si128(src.add(offset) as *const __m128i);
+        _mm_stream_si128(dst.add(offset) as *mut __m128i, chunk);
+        offset += 16;
+    }
+
+    // Handle remainder tail
+    if offset < len {
+        core::ptr::copy_nonoverlapping(src.add(offset), dst.add(offset), len - offset);
+    }
+
+    // Ensure all streaming stores are visible before any subsequent loads
+    _mm_sfence();
+}
+
 // ---- TopicHandle ----
 
 /// Handle returned by [`super::shm::ShmPublisher::register`]. Identifies a topic
@@ -41,8 +81,8 @@ pub struct ShmLoan<'a> {
     pub(crate) block_idx: u32,
     pub(crate) topic_idx: u32,
     pub(crate) write_seq_atom: &'a AtomicU64,
-    pub(crate) notify_atom: &'a AtomicU32,
     pub(crate) waiters_atom: &'a AtomicU32,
+    pub(crate) single_publisher: bool,
 }
 
 impl<'a> ShmLoan<'a> {
@@ -63,6 +103,17 @@ impl<'a> ShmLoan<'a> {
             data.len(),
             self.capacity
         );
+        #[cfg(target_arch = "x86_64")]
+        {
+            if data.len() >= 1_048_576 {
+                // Non-temporal stores bypass the cache hierarchy, avoiding
+                // pollution for large payloads that subscribers will read
+                // from their own cache lines.
+                unsafe { nontemporal_copy(data.as_ptr(), self.data_ptr, data.len()) };
+                self.len = data.len();
+                return;
+            }
+        }
         unsafe {
             core::ptr::copy_nonoverlapping(data.as_ptr(), self.data_ptr, data.len());
         }
@@ -103,9 +154,9 @@ impl<'a> ShmLoan<'a> {
             self.len as u32,
             self.topic_idx,
             self.write_seq_atom,
-            self.notify_atom,
             self.waiters_atom,
             wake,
+            self.single_publisher,
         );
     }
 }
@@ -150,8 +201,8 @@ pub struct TypedShmLoan<'a, T: crate::Pod> {
     pub(crate) block_idx: u32,
     pub(crate) topic_idx: u32,
     pub(crate) write_seq_atom: &'a AtomicU64,
-    pub(crate) notify_atom: &'a AtomicU32,
     pub(crate) waiters_atom: &'a AtomicU32,
+    pub(crate) single_publisher: bool,
     pub(crate) _marker: core::marker::PhantomData<&'a mut T>,
 }
 
@@ -202,9 +253,9 @@ impl<'a, T: crate::Pod> TypedShmLoan<'a, T> {
             core::mem::size_of::<T>() as u32,
             self.topic_idx,
             self.write_seq_atom,
-            self.notify_atom,
             self.waiters_atom,
             wake,
+            self.single_publisher,
         );
     }
 }
