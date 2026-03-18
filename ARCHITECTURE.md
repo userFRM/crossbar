@@ -56,8 +56,8 @@ One mmap region — three logical areas:
 | Topic Entry 0 (128 bytes) |
 |   1st cache line (hot):   |
 |   0x00 ACTIVE   (u32)     |  AtomicU32
-|   0x04 NOTIFY   (u32)     |  AtomicU32 — smart wake counter
-|   0x08 WRITE_SEQ(u64)     |  AtomicU64 — monotonic publish counter
+|   0x04 (reserved, u32)    |  (was NOTIFY — now merged into WRITE_SEQ)
+|   0x08 WRITE_SEQ(u64)     |  AtomicU64 — monotonic publish counter + futex wake address
 |   0x10 WAITERS  (u32)     |  AtomicU32 — blocked subscriber count
 |   2nd cache line (cold):  |
 |   0x14 URI_LEN  (u32)     |
@@ -89,20 +89,20 @@ Hot topic fields (`ACTIVE`, `NOTIFY`, `WRITE_SEQ`, `WAITERS`) are packed into th
 
 ## Publish path
 
-1. Pop block from Treiber stack (CAS on `pool_head`)
+1. Pop block from per-publisher cache, or Treiber stack if cache empty (CAS on `pool_head`)
 2. Write payload into block at `BLOCK_DATA_OFFSET` (offset 8)
 3. Claim sequence number: `fetch_add(1)` on `WRITE_SEQ` (AcqRel)
 4. Compute slot: `seq & (ring_depth - 1)` (bitmask, ring_depth must be power of 2)
-5. CAS-acquire ring slot: `compare_exchange(current, SEQ_WRITING)` — spins with `yield_hint` (SEVL+WFE on aarch64, PAUSE on x86) if another publisher holds the slot
+5. Acquire ring slot — **single-publisher**: plain store of `SEQ_WRITING` (Release); **multi-publisher**: `compare_exchange_weak(current, SEQ_WRITING)` CAS loop with `yield_hint`
 6. Set block refcount to 1 (Release)
 7. Write `block_idx` and `data_len` (Relaxed) — safe, bracketed by seqlock
 8. Seqlock close: store new `seq` (Release) — slot is now readable
 9. Decrement old block's refcount (AcqRel); free if it reaches zero
-10. Smart wake: increment `NOTIFY`; call `futex_wake` only if `WAITERS > 0`
+10. Smart wake: call `futex_wake` on `WRITE_SEQ` low-32 bits only if `WAITERS > 0`
 
-Step 10 means `publish()` costs ~8 ns when all subscribers use `try_recv()` (no blocked waiters). The futex syscall (~170 ns) fires only when a subscriber is blocked in `recv()`.
+Step 10 means `publish()` costs zero extra when all subscribers use `try_recv()` (no blocked waiters). The futex syscall (~170 ns) fires only when a subscriber is blocked in `recv()`.
 
-In single-publisher mode (the common case), the CAS in step 5 always succeeds on the first attempt — no contention, no spin.
+The per-publisher block cache (step 1) eliminates the Treiber stack CAS for ~87% of allocations. Each publisher caches up to 8 blocks locally.
 
 ---
 
@@ -117,7 +117,7 @@ In single-publisher mode (the common case), the CAS in step 5 always succeeds on
    d. CAS-increment block refcount (AcqRel) — acquire a reference
    e. Seqlock check 2: verify slot `seq` again — undo refcount if overwritten
 4. Advance `last_seq`, return `SampleGuard`
-5. On guard drop: decrement refcount (AcqRel); free block if it reaches zero
+5. On guard drop: decrement refcount (Release); if last reference, acquire fence then free block
 
 In single-publisher mode, the scan window is always 1 slot — the loop executes once. Under multi-publisher, at most `ring_depth` slots are scanned (default: 8, each check is ~9 ns).
 
@@ -135,8 +135,9 @@ The seqlock uses `SEQ_WRITING` (`u64::MAX`) as the "slot locked" sentinel instea
 
 The block pool is a lock-free stack with a 64-bit `(generation, index)` head pointer. The generation counter prevents ABA: even if the same block is freed and reallocated between a load and a CAS, the generation mismatch causes the CAS to fail.
 
-- **Alloc**: CAS head to `(gen+1, next_free_of_head_block)`; clear refcount
-- **Free**: CAS head to `(gen+1, freed_block)`; write old head index into freed block's link field
+- **Alloc**: CAS-weak head to `(gen+1, next_free_of_head_block)`; reuse `Err(current)` on retry
+- **Free**: CAS-weak head to `(gen+1, freed_block)`; write old head index into freed block's link field
+- **Per-publisher cache**: Each publisher caches up to 8 blocks locally, refilling from the global stack when empty. This amortizes the CAS over multiple allocations.
 
 ---
 
@@ -159,9 +160,9 @@ At runtime, `register_typed::<T>()` writes `size_of::<T>()` into the topic entry
 
 ## Smart wake
 
-The `TE_NOTIFY` field is a monotonic counter. The publisher increments it on every `publish()`. A subscriber in `recv()` registers itself in `TE_WAITERS` before sleeping on the futex; it unregisters on wakeup. The publisher reads `WAITERS` before calling `futex_wake` — if zero, it skips the syscall entirely.
+Notification is merged into `WRITE_SEQ`: the publisher's `fetch_add` on `WRITE_SEQ` changes the value, and subscribers in `recv()` futex-wait on the low 32 bits of `WRITE_SEQ`. A subscriber registers itself in `TE_WAITERS` before sleeping; it unregisters on wakeup. The publisher reads `WAITERS` before calling `futex_wake` — if zero, it skips the syscall entirely.
 
-Result: when all subscribers poll with `try_recv()`, publish costs ~8 ns (atomic increment only). The ~170 ns futex overhead only appears when a subscriber is genuinely blocked.
+Result: when all subscribers poll with `try_recv()`, publish has zero notification overhead — no separate counter to increment. The ~170 ns futex overhead only appears when a subscriber is genuinely blocked.
 
 ---
 

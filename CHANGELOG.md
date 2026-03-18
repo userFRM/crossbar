@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.1 — 2026-03-18
+
+### Changed
+- **Per-publisher block cache**: Each publisher caches up to 8 blocks locally, amortizing Treiber stack CAS (~87% cache hit rate, saves ~15–25 ns per publish under contention).
+- **Single-publisher fast path**: `commit_to_ring` uses a plain store instead of CAS for seqlock acquisition when the publisher is the sole owner (saves ~10–15 ns per publish).
+- **Notification merged into `WRITE_SEQ`**: Subscribers futex-wait on the low 32 bits of `WRITE_SEQ` instead of a separate `NOTIFY` counter. Eliminates 1 `fetch_add` per publish and 1 cache line miss on subscriber wakeup.
+- **`compare_exchange_weak`**: All CAS loops (`alloc_block`, `free_block`, seqlock, refcount) now use weak CAS with `Err(current)` reuse — saves 4–8 cycles per retry on ARM.
+- **Arc::drop pattern**: `SampleGuard` and `TypedSampleGuard` use `fetch_sub(Release)` + `fence(Acquire)` on final decrement — saves ~4 cycles per drop on ARM.
+- **Prefetch hints**: `PREFETCHW`/`PRFM` in `alloc_block` and `try_read_slot_raw` hide 10–40 ns of cache miss latency.
+- **Non-temporal stores**: Payloads >= 2 MiB on x86-64 use streaming stores to avoid cache pollution.
+- Removed redundant `refcount.store(0)` in `alloc_block` (already zero from `free_block`).
+- `assert_eq!` → `debug_assert_eq!` for handle validation on hot path.
+- Combined `SEVL` + `WFE` into single `asm!` block for robustness on aarch64.
+
+### Fixed
+- **Double-spin bug**: `recv_with` Adaptive mode spun 220 iterations before futex sleep (100 spin + 10 yield in `recv_with`, then another 100 + 10 inside `wait_until_not`). Now skips the internal spin when called from Adaptive phase 3.
+
+### Removed
+- `TE_NOTIFY` layout constant (notification merged into `WRITE_SEQ`).
+
 ## 0.3.0 — 2026-03-18
 
 ### Added

@@ -167,10 +167,10 @@ All measurements: Criterion, same-process publisher + subscriber, `try_recv` (no
 
 | | crossbar | iceoryx2 | speedup |
 |---|---|---|---|
-| 8 B (transport overhead) | **60 ns** | 227 ns | **3.8×** |
-| 1 KB | 70 ns | 245 ns | 3.5× |
-| 64 KB | 1.35 µs | 1.31 µs | ~1× |
-| 1 MB | 30.9 µs | 29.8 µs | ~1× |
+| 8 B (transport overhead) | **56 ns** | 233 ns | **4.2×** |
+| 1 KB | 74 ns | 250 ns | 3.4× |
+| 64 KB | 1.66 µs | 1.33 µs | ~1× |
+| 1 MB | 50 µs | 30 µs | ~1× |
 
 ### Apple M1 Pro · macOS · rustc 1.92
 
@@ -181,7 +181,7 @@ All measurements: Criterion, same-process publisher + subscriber, `try_recv` (no
 | 64 KB | 1.27 µs | 1.35 µs | 1.1× |
 | 1 MB | 23.9 µs | 23.5 µs | ~1× |
 
-**The win is in the overhead.** At small payloads crossbar's lighter path (no service discovery, no POSIX config layer) is 3.5–4× faster. At 64 KB+ both frameworks are memcpy-bound and converge. The 8-byte descriptor is always O(1) — payload latency scales with how long you take to write into the block.
+**The win is in the overhead.** At small payloads crossbar's lighter path (no service discovery, no POSIX config layer) is 3–4× faster. At 64 KB+ both frameworks are memcpy-bound and converge. The 8-byte descriptor is always O(1) — payload latency scales with how long you take to write into the block.
 
 Reproduce: `cargo bench -- head_to_head` (requires `iceoryx2` dev-dep, Unix only).
 

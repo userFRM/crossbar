@@ -17,34 +17,34 @@ Proves O(1): latency is flat regardless of how large the backing block is.
 
 | Backing buffer | crossbar | iceoryx2 | speedup |
 |---|---|---|---|
-| 64 B | **60 ns** | 227 ns | 3.8× |
-| 4 KB | **60 ns** | 230 ns | 3.8× |
-| 64 KB | **60 ns** | 227 ns | 3.8× |
-| 256 KB | **60 ns** | 227 ns | 3.8× |
-| 1 MB | **60 ns** | 231 ns | 3.9× |
+| 64 B | **56 ns** | 233 ns | 4.2× |
+| 4 KB | **56 ns** | 234 ns | 4.2× |
+| 64 KB | **59 ns** | 237 ns | 4.0× |
+| 256 KB | **59 ns** | 248 ns | 4.2× |
+| 1 MB | **59 ns** | 234 ns | 4.0× |
 
 ### End-to-end with full payload (loan → memcpy → publish → recv → deref)
 
 | Payload | crossbar | iceoryx2 | speedup |
 |---|---|---|---|
-| 8 B | **59 ns** | 234 ns | **4.0×** |
-| 1 KB | **70 ns** | 245 ns | 3.5× |
-| 64 KB | 1.35 µs | 1.31 µs | ~1× |
-| 256 KB | 6.89 µs | 6.74 µs | ~1× |
-| 1 MB | 30.9 µs | 29.8 µs | ~1× |
+| 8 B | **59 ns** | 238 ns | **4.0×** |
+| 1 KB | **74 ns** | 250 ns | 3.4× |
+| 64 KB | 1.66 µs | 1.33 µs | ~1× |
+| 256 KB | 6.97 µs | 6.97 µs | ~1× |
+| 1 MB | 50 µs | 30 µs | ~1× |
 
 ### Throughput (born-in-SHM write)
 
 | Payload | throughput |
 |---|---|
-| 64 KB | **45.4 GiB/s** |
-| 1 MB | **32.2 GiB/s** |
+| 64 KB | **42.5 GiB/s** |
+| 1 MB | **15.7 GiB/s** |
 
 ### Silent publish (no wake path)
 
 | | latency |
 |---|---|
-| 8 B, `publish_silent()` | **52 ns** |
+| 8 B, `publish_silent()` | **58 ns** |
 
 ---
 
@@ -89,4 +89,6 @@ Proves O(1): latency is flat regardless of how large the backing block is.
 
 **Throughput is memory-bandwidth-bound.** 45–49 GiB/s is close to measured memory bandwidth — the bulk of time is writing the payload, not the framework.
 
-**Multi-publisher overhead.** The protocol uses `fetch_add` for atomic sequence claiming and CAS-based ring slot locking. This adds ~3 ns vs. the theoretical single-publisher minimum (plain store). The `silent_no_wake` path at 52 ns shows the pure atomics floor without notification overhead.
+**Multi-publisher overhead.** The protocol uses `fetch_add` for atomic sequence claiming and CAS-based ring slot locking. In single-publisher mode (the common case), the seqlock uses a plain store instead of CAS, saving ~10–15 ns. The `silent_no_wake` path at 58 ns shows the pure atomics floor without notification overhead.
+
+**Per-publisher block cache.** Each publisher caches up to 8 blocks locally, amortizing the Treiber stack CAS over multiple loans. Under contention (multiple publishers), this eliminates most CAS retries on the pool head.

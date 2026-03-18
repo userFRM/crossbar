@@ -105,7 +105,7 @@ impl<'a> ShmLoan<'a> {
         );
         #[cfg(target_arch = "x86_64")]
         {
-            if data.len() >= 1_048_576 {
+            if data.len() >= 2_097_152 {
                 // Non-temporal stores bypass the cache hierarchy, avoiding
                 // pollution for large payloads that subscribers will read
                 // from their own cache lines.
