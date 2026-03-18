@@ -17,7 +17,7 @@ use crate::error::IpcError;
 use crate::protocol::layout::*;
 use crate::protocol::{PubSubConfig, Region};
 
-use super::loan::{ShmLoan, TopicHandle, TypedShmLoan};
+use super::loan::{PinnedLoan, ShmLoan, TopicHandle, TypedShmLoan};
 use super::mmap::RawMmap;
 use super::subscription::Subscription;
 
@@ -191,6 +191,7 @@ pub struct ShmPublisher {
     loan_count: u32,
     block_cache: [u32; 8],
     cache_len: u8,
+    pinned_blocks: [u32; 16], // block_idx per topic_idx, NO_BLOCK if not pinned
 }
 
 impl ShmPublisher {
@@ -346,6 +347,7 @@ impl ShmPublisher {
             loan_count: 0,
             block_cache: [0; 8],
             cache_len: 0,
+            pinned_blocks: [NO_BLOCK; 16],
         })
     }
 
@@ -452,6 +454,7 @@ impl ShmPublisher {
             loan_count: 0,
             block_cache: [0; 8],
             cache_len: 0,
+            pinned_blocks: [NO_BLOCK; 16],
         })
     }
 
@@ -687,10 +690,63 @@ impl ShmPublisher {
             _marker: core::marker::PhantomData,
         }
     }
+
+    /// Loans the pinned block for a topic. On the first call, allocates a
+    /// dedicated block. Subsequent calls return the same block -- no alloc.
+    ///
+    /// # Safety
+    ///
+    /// The returned `PinnedLoan` gives `&mut` access to the block's data region.
+    /// No subscriber may hold a [`PinnedGuard`] for this topic while a
+    /// `PinnedLoan` exists. Violating this is undefined behavior.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the pool is exhausted (first call only) or if `topic_idx`
+    /// exceeds `max_topics`.
+    pub unsafe fn loan_pinned(&mut self, handle: &TopicHandle) -> PinnedLoan<'_> {
+        debug_assert_eq!(handle.publisher_id, self.id);
+        let topic_idx = handle.topic_idx;
+
+        // Get or allocate the pinned block for this topic
+        let block_idx = if self.pinned_blocks[topic_idx as usize] != NO_BLOCK {
+            self.pinned_blocks[topic_idx as usize]
+        } else {
+            let idx = self
+                .alloc_cached()
+                .expect("pool exhausted -- increase block_count");
+            self.pinned_blocks[topic_idx as usize] = idx;
+            // Store in SHM topic entry so subscribers can find it
+            self.region.set_pinned_block(topic_idx, idx);
+            idx
+        };
+
+        let off = topic_entry_off(topic_idx);
+        let base_ptr = self.region.base;
+        let write_seq_atom = &*(base_ptr.add(off + TE_WRITE_SEQ) as *const AtomicU64);
+        let waiters_atom = &*(base_ptr.add(off + TE_WAITERS) as *const AtomicU32);
+        let data_ptr = self.region.block_ptr(block_idx).add(BLOCK_DATA_OFFSET);
+
+        PinnedLoan {
+            region: &self.region,
+            data_ptr,
+            capacity: self.region.data_capacity(),
+            len: 0,
+            topic_idx,
+            write_seq_atom,
+            waiters_atom,
+        }
+    }
 }
 
 impl Drop for ShmPublisher {
     fn drop(&mut self) {
+        // Free pinned blocks
+        for &blk in &self.pinned_blocks {
+            if blk != NO_BLOCK {
+                self.region.free_block(blk);
+            }
+        }
         // Return recycled block to pool
         if let Some(idx) = self.region.alloc_recycled() {
             self.region.free_block(idx);

@@ -266,3 +266,68 @@ impl<T: crate::Pod> Drop for TypedShmLoan<'_, T> {
         self.region.free_block(self.block_idx);
     }
 }
+
+// ---- PinnedLoan ----
+
+/// Mutable view into a pinned block in shared memory.
+///
+/// The block is permanently assigned to the topic -- no allocation on loan,
+/// no refcount. `publish()` is a single atomic Release store.
+///
+/// # Safety
+///
+/// Subscribers MUST NOT hold a [`PinnedGuard`](super::subscription::PinnedGuard)
+/// for this topic while the publisher holds a `PinnedLoan`. Overlapping
+/// reads and writes are undefined behavior.
+pub struct PinnedLoan<'a> {
+    pub(crate) region: &'a Arc<Region>,
+    pub(crate) data_ptr: *mut u8,
+    pub(crate) capacity: usize,
+    pub(crate) len: usize,
+    pub(crate) topic_idx: u32,
+    pub(crate) write_seq_atom: &'a AtomicU64,
+    pub(crate) waiters_atom: &'a AtomicU32,
+}
+
+impl<'a> PinnedLoan<'a> {
+    /// Returns the writable data region as a mutable slice.
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { core::slice::from_raw_parts_mut(self.data_ptr, self.capacity) }
+    }
+
+    /// Copies `data` into the block starting at offset 0.
+    pub fn set_data(&mut self, data: &[u8]) {
+        assert!(data.len() <= self.capacity);
+        unsafe {
+            core::ptr::copy_nonoverlapping(data.as_ptr(), self.data_ptr, data.len());
+        }
+        self.len = data.len();
+    }
+
+    /// Sets the valid data length.
+    pub fn set_len(&mut self, len: usize) {
+        assert!(len <= self.capacity);
+        self.len = len;
+    }
+
+    /// Maximum bytes this loan can hold.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Publish. 1 atomic Release store -- that's it.
+    ///
+    /// # Safety
+    ///
+    /// No subscriber may hold a `PinnedGuard` for this topic.
+    #[inline]
+    pub fn publish(self) {
+        self.region.commit_pinned(
+            self.len as u32,
+            self.topic_idx,
+            self.write_seq_atom,
+            self.waiters_atom,
+        );
+        // No mem::forget needed -- PinnedLoan has no Drop.
+    }
+}

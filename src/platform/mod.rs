@@ -16,6 +16,6 @@ mod shm;
 pub(crate) mod subscription;
 
 pub use channel::ShmChannel;
-pub use loan::{ShmLoan, TopicHandle, TypedShmLoan};
+pub use loan::{PinnedLoan, ShmLoan, TopicHandle, TypedShmLoan};
 pub use shm::{ShmPublisher, ShmSubscriber};
-pub use subscription::{SampleGuard, Subscription, TypedSampleGuard};
+pub use subscription::{PinnedGuard, SampleGuard, Subscription, TypedSampleGuard};

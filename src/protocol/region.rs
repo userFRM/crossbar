@@ -193,6 +193,45 @@ impl Region {
         Ok(())
     }
 
+    /// Pinned publish: store (seq, data_len) atomically. The block is permanently
+    /// assigned -- no alloc, no free, no refcount. 1 atomic Release store.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure no subscriber holds a `PinnedGuard` for this topic
+    /// while the publisher is writing to the pinned block.
+    #[cfg(feature = "std")]
+    #[inline]
+    pub(crate) fn commit_pinned(
+        &self,
+        data_len: u32,
+        topic_idx: u32,
+        write_seq_atom: &AtomicU64,
+        waiters_atom: &AtomicU32,
+    ) {
+        // Claim sequence number (still needed for subscriber to detect new data)
+        let seq = write_seq_atom.fetch_add(1, Ordering::AcqRel) + 1;
+
+        // Store packed (seq:32 | data_len:32) in the pinned seqlock field.
+        // The Release ordering ensures all data writes are visible before this store.
+        let off = topic_entry_off(topic_idx);
+        let pinned_seq = unsafe { &*(self.base.add(off + TE_PINNED_SEQ) as *const AtomicU64) };
+        let packed = (seq & 0xFFFF_FFFF) << 32 | u64::from(data_len);
+        pinned_seq.store(packed, Ordering::Release);
+
+        // Smart wake: use write_seq low-32 as futex address (same as regular path)
+        if waiters_atom.load(Ordering::Acquire) > 0 {
+            let seq_futex = unsafe { &*(write_seq_atom as *const AtomicU64 as *const AtomicU32) };
+            notify::wake_all(seq_futex);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn set_pinned_block(&self, topic_idx: u32, block_idx: u32) {
+        let off = topic_entry_off(topic_idx);
+        unsafe { (self.base.add(off + TE_PINNED_BLOCK) as *mut u32).write(block_idx) }
+    }
+
     /// Shared commit logic for both `ShmLoan` and `TypedShmLoan`.
     ///
     /// Atomically claims the next sequence number via `fetch_add` on

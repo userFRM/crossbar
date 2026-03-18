@@ -389,7 +389,7 @@ fn bench_iceoryx2_vs_crossbar(c: &mut Criterion) {
             });
         }
 
-        // crossbar: loan + write directly into as_mut_slice() — true zero-copy
+        // crossbar: loan_pinned + write directly + publish — true zero-copy, same buffer every time
         let ps_name = "crossbar-bench-shm";
         let cfg = PubSubConfig {
             block_size: 1_048_576 + 64,
@@ -420,12 +420,12 @@ fn bench_iceoryx2_vs_crossbar(c: &mut Criterion) {
 
             group.bench_function(format!("crossbar/{label}"), |b| {
                 b.iter(|| {
-                    let mut loan = pub_.loan(handle);
-                    // Born-in-SHM: fill directly in the loaned block — no intermediate buffer
+                    // Pinned: same block every time — L1/L2 warm, no alloc, no refcount
+                    let mut loan = unsafe { pub_.loan_pinned(handle) };
                     loan.as_mut_slice()[..sz].fill(42u8);
                     loan.set_len(sz);
                     loan.publish();
-                    let g = sub_handle.try_recv().unwrap();
+                    let g = unsafe { sub_handle.try_recv_pinned() }.unwrap();
                     black_box(&*g);
                 })
             });

@@ -363,6 +363,49 @@ impl Subscription {
     pub fn recv(&self) -> Result<SampleGuard<'_>, IpcError> {
         self.recv_with(WaitStrategy::default())
     }
+
+    /// Non-blocking pinned receive. Returns a zero-overhead guard pointing
+    /// directly into the pinned block. No refcount, no seqlock double-check.
+    ///
+    /// # Safety
+    ///
+    /// The publisher MUST NOT hold a `PinnedLoan` for this topic while
+    /// the returned `PinnedGuard` exists. Violating this is UB.
+    ///
+    /// Returns `None` if no new data has been published since the last recv.
+    pub unsafe fn try_recv_pinned(&self) -> Option<PinnedGuard<'_>> {
+        // Load the pinned seqlock: packed (seq:32 | data_len:32)
+        let off = topic_entry_off(self.topic_idx);
+        let pinned_seq = &*(self.region.base.add(off + TE_PINNED_SEQ) as *const AtomicU64);
+        let packed = pinned_seq.load(Ordering::Acquire);
+
+        if packed == 0 {
+            return None; // Never published in pinned mode
+        }
+
+        #[allow(clippy::cast_possible_truncation)]
+        let seq = (packed >> 32) as u64;
+        let data_len = packed as u32;
+
+        if seq <= self.last_seq.get() {
+            return None; // No new data
+        }
+        self.last_seq.set(seq);
+
+        // Read pinned block index from topic entry
+        let block_idx = (self.region.base.add(off + TE_PINNED_BLOCK) as *const u32).read();
+        if block_idx == NO_BLOCK {
+            return None;
+        }
+
+        let data_ptr = self.region.block_ptr(block_idx).add(BLOCK_DATA_OFFSET);
+
+        Some(PinnedGuard {
+            data_ptr,
+            len: data_len as usize,
+            _marker: core::marker::PhantomData,
+        })
+    }
 }
 
 /// Raw slot data returned by `try_read_slot_raw`.
@@ -491,6 +534,45 @@ impl<T: crate::Pod> core::fmt::Debug for TypedSampleGuard<'_, T> {
         f.debug_struct("TypedSampleGuard")
             .field("block_idx", &self.block_idx)
             .field("size", &core::mem::size_of::<T>())
+            .finish()
+    }
+}
+
+// ---- PinnedGuard ----
+
+/// Zero-overhead read reference to a pinned block in shared memory.
+///
+/// No refcount increment on creation. No refcount decrement on drop.
+/// The data pointer goes directly into the permanently-assigned block.
+///
+/// # Safety
+///
+/// The publisher MUST NOT hold a [`PinnedLoan`](super::loan::PinnedLoan)
+/// for this topic while a `PinnedGuard` exists. Overlapping reads and
+/// writes are undefined behavior.
+pub struct PinnedGuard<'a> {
+    data_ptr: *const u8,
+    len: usize,
+    _marker: core::marker::PhantomData<&'a ()>,
+}
+
+impl Deref for PinnedGuard<'_> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        unsafe { core::slice::from_raw_parts(self.data_ptr, self.len) }
+    }
+}
+
+impl AsRef<[u8]> for PinnedGuard<'_> {
+    fn as_ref(&self) -> &[u8] {
+        self.deref()
+    }
+}
+
+impl core::fmt::Debug for PinnedGuard<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PinnedGuard")
+            .field("len", &self.len)
             .finish()
     }
 }
