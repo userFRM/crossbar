@@ -118,7 +118,7 @@ impl WaitStrategy {
             } => {
                 if iter < *spin_iters {
                     // Phase 1: bare spin -- fastest wakeup.
-                } else if iter < spin_iters + yield_iters {
+                } else if iter < spin_iters.saturating_add(*yield_iters) {
                     // Phase 2: yield-spin -- yields pipeline.
                     yield_hint();
                 }
@@ -149,25 +149,35 @@ mod tests {
     #[test]
     fn busy_spin_returns_immediately() {
         let ws = WaitStrategy::BusySpin;
+        let start = std::time::Instant::now();
         for i in 0..1000 {
             ws.wait(i);
         }
+        // BusySpin with 1000 iterations should complete in well under 100ms
+        assert!(start.elapsed().as_millis() < 100, "BusySpin took too long");
     }
 
     #[test]
     fn yield_spin_returns() {
         let ws = WaitStrategy::YieldSpin;
+        let start = std::time::Instant::now();
         for i in 0..100 {
             ws.wait(i);
         }
+        assert!(start.elapsed().as_millis() < 500, "YieldSpin took too long");
     }
 
     #[test]
     fn backoff_spin_returns() {
         let ws = WaitStrategy::BackoffSpin;
+        let start = std::time::Instant::now();
         for i in 0..20 {
             ws.wait(i);
         }
+        assert!(
+            start.elapsed().as_millis() < 500,
+            "BackoffSpin took too long"
+        );
     }
 
     #[test]
@@ -176,9 +186,22 @@ mod tests {
             spin_iters: 4,
             yield_iters: 4,
         };
+        let start = std::time::Instant::now();
         for i in 0..20 {
             ws.wait(i);
         }
+        assert!(start.elapsed().as_millis() < 500, "Adaptive took too long");
+    }
+
+    #[test]
+    fn adaptive_saturating_add_no_overflow() {
+        // M7: u32::MAX + 1 should not wrap
+        let ws = WaitStrategy::Adaptive {
+            spin_iters: u32::MAX,
+            yield_iters: 1,
+        };
+        // Should not panic from overflow
+        ws.wait(u32::MAX);
     }
 
     #[test]
@@ -195,6 +218,6 @@ mod tests {
     fn debug_format() {
         let ws = WaitStrategy::BusySpin;
         let s = alloc::format!("{ws:?}");
-        assert!(s.contains("BusySpin"));
+        assert_eq!(s, "BusySpin");
     }
 }

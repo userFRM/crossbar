@@ -20,6 +20,28 @@ pub enum IpcError {
 
     /// The shared-memory region has invalid magic, version, or metadata.
     InvalidRegion(alloc::string::String),
+
+    /// The block pool is exhausted (all blocks are in use by subscribers).
+    PoolExhausted,
+
+    /// Data exceeds the block's data capacity.
+    DataTooLarge {
+        /// Attempted write size.
+        size: usize,
+        /// Block data capacity.
+        capacity: usize,
+    },
+
+    /// A subscriber holds a `PinnedGuard`, preventing the publisher from writing.
+    PinnedReadersActive {
+        /// Number of active readers.
+        count: u32,
+        /// Topic index.
+        topic_idx: u32,
+    },
+
+    /// The system clock is before UNIX epoch (NTP jump, VM restore).
+    ClockError,
 }
 
 impl fmt::Display for IpcError {
@@ -32,6 +54,25 @@ impl fmt::Display for IpcError {
             }
             IpcError::InvalidRegion(msg) => {
                 write!(f, "invalid shared-memory region: {msg}")
+            }
+            IpcError::PoolExhausted => {
+                write!(
+                    f,
+                    "block pool exhausted -- increase block_count in PubSubConfig"
+                )
+            }
+            IpcError::DataTooLarge { size, capacity } => {
+                write!(f, "data ({size}) exceeds block data capacity ({capacity})")
+            }
+            IpcError::PinnedReadersActive { count, topic_idx } => {
+                write!(
+                    f,
+                    "{count} active PinnedGuard(s) on topic {topic_idx} -- \
+                     drop all guards before calling loan_pinned"
+                )
+            }
+            IpcError::ClockError => {
+                write!(f, "system clock is before UNIX epoch")
             }
         }
     }

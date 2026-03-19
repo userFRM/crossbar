@@ -10,6 +10,7 @@ use std::io;
 use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::Arc;
 
+use crate::error::IpcError;
 use crate::protocol::layout::BLOCK_DATA_OFFSET;
 use crate::protocol::Region;
 
@@ -25,7 +26,6 @@ use crate::protocol::Region;
 /// `src` and `dst` must be valid for `len` bytes and must not overlap.
 #[cfg(target_arch = "x86_64")]
 unsafe fn nontemporal_copy(src: *const u8, dst: *mut u8, len: usize) {
-    #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_sfence, _mm_stream_si128};
 
     let mut offset = 0usize;
@@ -57,7 +57,7 @@ unsafe fn nontemporal_copy(src: *const u8, dst: *mut u8, len: usize) {
 
 /// Handle returned by [`super::shm::ShmPublisher::register`]. Identifies a topic
 /// for use with [`super::shm::ShmPublisher::loan`].
-#[derive(Clone)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TopicHandle {
     pub(crate) topic_idx: u32,
     pub(crate) publisher_id: u64,
@@ -93,16 +93,16 @@ impl<'a> ShmLoan<'a> {
 
     /// Copies `data` into the block starting at offset 0.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `data` exceeds the block's data capacity.
-    pub fn set_data(&mut self, data: &[u8]) {
-        assert!(
-            data.len() <= self.capacity,
-            "data ({}) exceeds block data capacity ({})",
-            data.len(),
-            self.capacity
-        );
+    /// Returns [`IpcError::DataTooLarge`] if `data` exceeds block data capacity.
+    pub fn set_data(&mut self, data: &[u8]) -> Result<(), IpcError> {
+        if data.len() > self.capacity {
+            return Err(IpcError::DataTooLarge {
+                size: data.len(),
+                capacity: self.capacity,
+            });
+        }
         #[cfg(target_arch = "x86_64")]
         {
             if data.len() >= 2_097_152 {
@@ -111,19 +111,30 @@ impl<'a> ShmLoan<'a> {
                 // from their own cache lines.
                 unsafe { nontemporal_copy(data.as_ptr(), self.data_ptr, data.len()) };
                 self.len = data.len();
-                return;
+                return Ok(());
             }
         }
         unsafe {
             core::ptr::copy_nonoverlapping(data.as_ptr(), self.data_ptr, data.len());
         }
         self.len = data.len();
+        Ok(())
     }
 
     /// Sets the valid data length (use after writing via `as_mut_slice`).
-    pub fn set_len(&mut self, len: usize) {
-        assert!(len <= self.capacity);
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpcError::DataTooLarge`] if `len` exceeds block data capacity.
+    pub fn set_len(&mut self, len: usize) -> Result<(), IpcError> {
+        if len > self.capacity {
+            return Err(IpcError::DataTooLarge {
+                size: len,
+                capacity: self.capacity,
+            });
+        }
         self.len = len;
+        Ok(())
     }
 
     /// Maximum bytes this loan can hold.
@@ -149,6 +160,9 @@ impl<'a> ShmLoan<'a> {
 
     #[inline]
     fn commit(&self, wake: bool) {
+        // Runtime check: len must fit in u32 (structurally enforced by u32 block_size,
+        // but defense-in-depth against corruption via io::Write accumulation)
+        assert!(self.len <= u32::MAX as usize, "data_len overflow");
         self.region.commit_to_ring(
             self.block_idx,
             self.len as u32,
@@ -274,11 +288,10 @@ impl<T: crate::Pod> Drop for TypedShmLoan<'_, T> {
 /// The block is permanently assigned to the topic -- no allocation on loan,
 /// no refcount. `publish()` is a single atomic Release store.
 ///
-/// # Safety
+/// # Panics
 ///
-/// Subscribers MUST NOT hold a [`PinnedGuard`](super::subscription::PinnedGuard)
-/// for this topic while the publisher holds a `PinnedLoan`. Overlapping
-/// reads and writes are undefined behavior.
+/// `loan_pinned` returns an error if subscribers hold a `PinnedGuard`.
+/// Overlapping reads and writes are prevented at runtime.
 pub struct PinnedLoan<'a> {
     pub(crate) region: &'a Arc<Region>,
     pub(crate) data_ptr: *mut u8,
@@ -287,6 +300,7 @@ pub struct PinnedLoan<'a> {
     pub(crate) topic_idx: u32,
     pub(crate) write_seq_atom: &'a AtomicU64,
     pub(crate) waiters_atom: &'a AtomicU32,
+    pub(crate) readers: &'a AtomicU32,
 }
 
 impl<'a> PinnedLoan<'a> {
@@ -296,18 +310,38 @@ impl<'a> PinnedLoan<'a> {
     }
 
     /// Copies `data` into the block starting at offset 0.
-    pub fn set_data(&mut self, data: &[u8]) {
-        assert!(data.len() <= self.capacity);
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpcError::DataTooLarge`] if `data` exceeds block data capacity.
+    pub fn set_data(&mut self, data: &[u8]) -> Result<(), IpcError> {
+        if data.len() > self.capacity {
+            return Err(IpcError::DataTooLarge {
+                size: data.len(),
+                capacity: self.capacity,
+            });
+        }
         unsafe {
             core::ptr::copy_nonoverlapping(data.as_ptr(), self.data_ptr, data.len());
         }
         self.len = data.len();
+        Ok(())
     }
 
     /// Sets the valid data length.
-    pub fn set_len(&mut self, len: usize) {
-        assert!(len <= self.capacity);
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpcError::DataTooLarge`] if `len` exceeds block data capacity.
+    pub fn set_len(&mut self, len: usize) -> Result<(), IpcError> {
+        if len > self.capacity {
+            return Err(IpcError::DataTooLarge {
+                size: len,
+                capacity: self.capacity,
+            });
+        }
         self.len = len;
+        Ok(())
     }
 
     /// Maximum bytes this loan can hold.
@@ -315,19 +349,29 @@ impl<'a> PinnedLoan<'a> {
         self.capacity
     }
 
-    /// Publish. 1 atomic Release store -- that's it.
-    ///
-    /// # Safety
-    ///
-    /// No subscriber may hold a `PinnedGuard` for this topic.
+    /// Publish. 1 atomic Release store + clear writer sentinel.
     #[inline]
     pub fn publish(self) {
+        assert!(self.len <= u32::MAX as usize, "data_len overflow");
         self.region.commit_pinned(
             self.len as u32,
             self.topic_idx,
             self.write_seq_atom,
             self.waiters_atom,
         );
-        // No mem::forget needed -- PinnedLoan has no Drop.
+        // Clear the writer sentinel so subscribers can enter again
+        self.readers.store(0, core::sync::atomic::Ordering::Release);
+        // Skip Drop — we already cleared the sentinel
+        core::mem::forget(self);
+    }
+}
+
+impl Drop for PinnedLoan<'_> {
+    fn drop(&mut self) {
+        // PinnedLoan dropped without publish — clear the writer sentinel
+        // so subscribers aren't permanently blocked. Data in the pinned
+        // block is stale (partial write), but the old pinned_seq is still
+        // valid so subscribers won't see the partial data.
+        self.readers.store(0, core::sync::atomic::Ordering::Release);
     }
 }

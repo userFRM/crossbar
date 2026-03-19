@@ -45,8 +45,7 @@ pub fn wait_until_not(
             // x86: PAUSE yields the pipeline to the SMT sibling (~140 cycles).
             #[cfg(target_arch = "aarch64")]
             unsafe {
-                core::arch::asm!("sevl", options(nomem, nostack));
-                core::arch::asm!("wfe", options(nomem, nostack));
+                core::arch::asm!("sevl", "wfe", options(nomem, nostack));
             }
             #[cfg(not(target_arch = "aarch64"))]
             core::hint::spin_loop();

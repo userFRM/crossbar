@@ -23,12 +23,12 @@ fn multi_publisher_same_topic() {
     let stream = sub.subscribe("/data").unwrap();
 
     // Both publish
-    let mut loan_a = pub_a.loan(&topic_a);
-    loan_a.set_data(b"from_a");
+    let mut loan_a = pub_a.loan(&topic_a).unwrap();
+    loan_a.set_data(b"from_a").unwrap();
     loan_a.publish();
 
-    let mut loan_b = pub_b.loan(&topic_b);
-    loan_b.set_data(b"from_b");
+    let mut loan_b = pub_b.loan(&topic_b).unwrap();
+    loan_b.set_data(b"from_b").unwrap();
     loan_b.publish();
 
     // Subscriber should receive both (order not guaranteed)
@@ -63,12 +63,12 @@ fn multi_publisher_different_topics() {
     let stream_a = sub.subscribe("/prices/AAPL").unwrap();
     let stream_b = sub.subscribe("/prices/GOOG").unwrap();
 
-    let mut loan = pub_a.loan(&topic_a);
-    loan.set_data(b"AAPL");
+    let mut loan = pub_a.loan(&topic_a).unwrap();
+    loan.set_data(b"AAPL").unwrap();
     loan.publish();
 
-    let mut loan = pub_b.loan(&topic_b);
-    loan.set_data(b"GOOG");
+    let mut loan = pub_b.loan(&topic_b).unwrap();
+    loan.set_data(b"GOOG").unwrap();
     loan.publish();
 
     let guard_a = stream_a.try_recv().unwrap();
@@ -97,8 +97,8 @@ fn multi_publisher_owner_cleanup() {
     let sub = ShmSubscriber::connect(&name).unwrap();
     let stream = sub.subscribe("/test").unwrap();
 
-    let mut loan = pub_a.loan(&_topic_a);
-    loan.set_data(b"still alive");
+    let mut loan = pub_a.loan(&_topic_a).unwrap();
+    loan.set_data(b"still alive").unwrap();
     loan.publish();
 
     let guard = stream.try_recv().unwrap();
@@ -117,11 +117,12 @@ fn multi_publisher_heartbeat() {
     let mut pub_b = ShmPublisher::open(&name).unwrap();
     let _topic_b = pub_b.register("/hb").unwrap();
 
-    // Both update heartbeat -- should not panic
-    pub_a.heartbeat();
-    pub_b.heartbeat();
+    // Both update heartbeat -- should not error
+    pub_a.heartbeat().unwrap();
+    pub_b.heartbeat().unwrap();
 
     // Subscriber should still see the region as alive
     let sub = ShmSubscriber::connect(&name).unwrap();
-    let _stream = sub.subscribe("/hb").unwrap();
+    let stream = sub.subscribe("/hb").unwrap();
+    assert!(stream.try_recv().is_none(), "should have no pending data");
 }

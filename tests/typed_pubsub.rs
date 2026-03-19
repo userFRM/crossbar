@@ -23,7 +23,7 @@ fn typed_publish_subscribe() {
         volume: 100,
         _pad: 0,
     };
-    pub_.loan_typed::<Tick>(&handle).send(tick);
+    pub_.loan_typed::<Tick>(&handle).unwrap().send(tick);
 
     let guard = stream.try_recv_typed::<Tick>().unwrap();
     assert_eq!(*guard, tick);
@@ -39,12 +39,16 @@ fn typed_send_multiple() {
     let stream = sub.subscribe("/counter").unwrap();
 
     for i in 0..10u64 {
-        pub_.loan_typed::<u64>(&handle).send(i);
+        pub_.loan_typed::<u64>(&handle).unwrap().send(i);
     }
 
     // Should get the latest (ring depth = 8 by default)
     let guard = stream.try_recv_typed::<u64>().unwrap();
-    assert!(*guard < 10);
+    assert!(
+        *guard >= 2 && *guard <= 9,
+        "expected value in [2,9], got {}",
+        *guard
+    );
 }
 
 #[test]
@@ -56,7 +60,7 @@ fn typed_loan_as_mut() {
     let sub = ShmSubscriber::connect(name).unwrap();
     let stream = sub.subscribe("/tick").unwrap();
 
-    let mut loan = pub_.loan_typed::<Tick>(&handle);
+    let mut loan = pub_.loan_typed::<Tick>(&handle).unwrap();
     let t = loan.as_mut();
     t.price = 99.9;
     t.volume = 500;
@@ -69,15 +73,22 @@ fn typed_loan_as_mut() {
 }
 
 #[test]
-#[should_panic(expected = "type size mismatch")]
-fn typed_size_mismatch_panics() {
+fn typed_size_mismatch_returns_none() {
     let name = &format!("test-typed-mismatch-{}", std::process::id());
     let mut pub_ = ShmPublisher::create(name, PubSubConfig::default()).unwrap();
-    let _handle = pub_.register_typed::<u64>("/data").unwrap();
+    let handle = pub_.register_typed::<u64>("/data").unwrap();
+
+    // Publish a u64 value so there's data available
+    pub_.loan_typed::<u64>(&handle).unwrap().send(42u64);
 
     let sub = ShmSubscriber::connect(name).unwrap();
     let stream = sub.subscribe("/data").unwrap();
-    let _ = stream.try_recv_typed::<u32>(); // panic: 8 != 4
+    // Mismatched type size: topic is u64 (8 bytes), we request u32 (4 bytes)
+    // Should return None instead of panicking
+    assert!(
+        stream.try_recv_typed::<u32>().is_none(),
+        "type mismatch should return None"
+    );
 }
 
 #[test]
@@ -89,8 +100,8 @@ fn untyped_api_still_works() {
     let sub = ShmSubscriber::connect(name).unwrap();
     let stream = sub.subscribe("/raw").unwrap();
 
-    let mut loan = pub_.loan(&handle);
-    loan.set_data(b"hello");
+    let mut loan = pub_.loan(&handle).unwrap();
+    loan.set_data(b"hello").unwrap();
     loan.publish();
 
     let guard = stream.try_recv().unwrap();

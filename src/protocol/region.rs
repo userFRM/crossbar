@@ -20,9 +20,7 @@ use crate::platform::notify;
 /// Shared state for the mmap region -- held by both publisher/subscriber
 /// and by `SampleGuard` (via `Arc`) to keep the mmap alive.
 pub struct Region {
-    pub(crate) base: *mut u8,
-    #[allow(dead_code)]
-    pub(crate) len: usize,
+    base: *mut u8,
     pub(crate) config: PubSubConfig,
     pub(crate) pool_offset: usize,
     pub(crate) last_freed: AtomicU32,
@@ -41,15 +39,20 @@ impl Region {
     ///
     /// `base` must point to a valid, mmap'd region of at least `len` bytes
     /// that remains valid for the lifetime of this Region.
-    pub unsafe fn from_raw(base: *mut u8, len: usize, config: PubSubConfig) -> Self {
+    pub(crate) unsafe fn from_raw(base: *mut u8, _len: usize, config: PubSubConfig) -> Self {
         let pool_offset = block_pool_offset(&config);
         Self {
             base,
-            len,
             config,
             pool_offset,
             last_freed: AtomicU32::new(NO_BLOCK),
         }
+    }
+
+    /// Returns the raw base pointer to the mmap region.
+    #[inline]
+    pub(crate) fn base_ptr(&self) -> *mut u8 {
+        self.base
     }
 
     #[inline]
@@ -57,6 +60,23 @@ impl Region {
         unsafe { &*(self.base.add(GH_POOL_HEAD) as *const AtomicU64) }
     }
 
+    /// Returns a pointer to the block at `idx`, or `None` if out of bounds.
+    #[inline]
+    pub(crate) fn block_ptr_checked(&self, idx: u32) -> Option<*mut u8> {
+        if (idx as usize) >= self.config.block_count as usize {
+            return None;
+        }
+        Some(unsafe {
+            self.base
+                .add(self.pool_offset + idx as usize * self.config.block_size as usize)
+        })
+    }
+
+    /// Returns a pointer to the block at `idx`.
+    ///
+    /// # Panics
+    ///
+    /// Panics in debug mode if `idx >= block_count`.
     #[inline]
     pub(crate) fn block_ptr(&self, idx: u32) -> *mut u8 {
         debug_assert!((idx as usize) < self.config.block_count as usize);
@@ -64,6 +84,14 @@ impl Region {
             self.base
                 .add(self.pool_offset + idx as usize * self.config.block_size as usize)
         }
+    }
+
+    /// Returns the refcount atomic for block `idx`, with bounds check.
+    /// Returns `None` if `idx >= block_count`.
+    #[inline]
+    pub(crate) fn block_refcount_checked(&self, idx: u32) -> Option<&AtomicU32> {
+        let ptr = self.block_ptr_checked(idx)?;
+        Some(unsafe { &*(ptr.add(BK_REFCOUNT) as *const AtomicU32) })
     }
 
     #[inline]
@@ -79,8 +107,18 @@ impl Region {
             if idx == NO_BLOCK {
                 return None;
             }
+            // Validate idx is within bounds (H6: free-list corruption defense)
+            if (idx as usize) >= self.config.block_count as usize {
+                return None;
+            }
             let block = self.block_ptr(idx);
             let next = unsafe { &*(block as *const AtomicU32) }.load(Ordering::Relaxed);
+
+            // Validate next pointer too (defense against corrupted free-list)
+            if next != NO_BLOCK && (next as usize) >= self.config.block_count as usize {
+                return None;
+            }
+
             let new_head = pack(gen.wrapping_add(1), next);
 
             // Prefetch the block data into L1 cache before the CAS attempt
@@ -125,7 +163,9 @@ impl Region {
 
     #[inline]
     pub(crate) fn free_block(&self, idx: u32) {
-        debug_assert!((idx as usize) < self.config.block_count as usize);
+        if (idx as usize) >= self.config.block_count as usize {
+            return; // Bounds check: silently ignore corrupt block_idx in Drop paths
+        }
         let mut head = self.pool_head().load(Ordering::Acquire);
         loop {
             let (gen, old_head_idx) = unpack(head);
@@ -165,28 +205,32 @@ impl Region {
         self.config.block_size as usize - BLOCK_DATA_OFFSET
     }
 
-    pub(crate) fn heartbeat_atom(&self) -> &AtomicU64 {
+    fn heartbeat_atom(&self) -> &AtomicU64 {
         unsafe { &*(self.base.add(GH_HEARTBEAT) as *const AtomicU64) }
     }
 
+    /// Returns microseconds since UNIX epoch, or error if clock is behind epoch.
     #[cfg(feature = "std")]
     #[allow(clippy::cast_possible_truncation)]
-    pub(crate) fn update_heartbeat(&self) {
-        let now = std::time::SystemTime::now()
+    fn now_micros() -> Result<u64, crate::error::IpcError> {
+        std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_micros() as u64;
+            .map(|d| d.as_micros() as u64)
+            .map_err(|_| crate::error::IpcError::ClockError)
+    }
+
+    #[cfg(feature = "std")]
+    pub(crate) fn update_heartbeat(&self) -> Result<(), crate::error::IpcError> {
+        let now = Self::now_micros()?;
         self.heartbeat_atom().fetch_max(now, Ordering::Release);
+        Ok(())
     }
 
     #[cfg(feature = "std")]
     #[allow(clippy::cast_possible_truncation)]
     pub(crate) fn check_heartbeat(&self) -> Result<(), crate::error::IpcError> {
         let hb = self.heartbeat_atom().load(Ordering::Acquire);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_micros() as u64;
+        let now = Self::now_micros()?;
         if now.saturating_sub(hb) > self.config.stale_timeout.as_micros() as u64 {
             return Err(crate::error::IpcError::PublisherDead);
         }
@@ -195,11 +239,6 @@ impl Region {
 
     /// Pinned publish: store (seq, data_len) atomically. The block is permanently
     /// assigned -- no alloc, no free, no refcount. 1 atomic Release store.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure no subscriber holds a `PinnedGuard` for this topic
-    /// while the publisher is writing to the pinned block.
     #[cfg(feature = "std")]
     #[inline]
     pub(crate) fn commit_pinned(
@@ -229,7 +268,24 @@ impl Region {
     #[inline]
     pub(crate) fn set_pinned_block(&self, topic_idx: u32, block_idx: u32) {
         let off = topic_entry_off(topic_idx);
-        unsafe { (self.base.add(off + TE_PINNED_BLOCK) as *mut u32).write(block_idx) }
+        // Use atomic store with Release so subscriber's Acquire load sees the value
+        unsafe { &*(self.base.add(off + TE_PINNED_BLOCK) as *const AtomicU32) }
+            .store(block_idx, Ordering::Release);
+    }
+
+    /// Load pinned block index atomically.
+    #[inline]
+    pub(crate) fn pinned_block(&self, topic_idx: u32) -> u32 {
+        let off = topic_entry_off(topic_idx);
+        unsafe { &*(self.base.add(off + TE_PINNED_BLOCK) as *const AtomicU32) }
+            .load(Ordering::Acquire)
+    }
+
+    /// Returns the pinned readers atomic for a topic.
+    #[inline]
+    pub(crate) fn pinned_readers(&self, topic_idx: u32) -> &AtomicU32 {
+        let off = topic_entry_off(topic_idx);
+        unsafe { &*(self.base.add(off + TE_PINNED_READERS) as *const AtomicU32) }
     }
 
     /// Shared commit logic for both `ShmLoan` and `TypedShmLoan`.
@@ -303,7 +359,8 @@ impl Region {
         entry_seq.store(seq, Ordering::Release);
 
         // 7. Release old block (decrement refcount; recycle if no subscribers hold it)
-        if old_block_idx != NO_BLOCK {
+        if old_block_idx != NO_BLOCK && (old_block_idx as usize) < self.config.block_count as usize
+        {
             let prev = self
                 .block_refcount(old_block_idx)
                 .fetch_sub(1, Ordering::AcqRel);
@@ -323,9 +380,25 @@ impl Region {
         //    already changed the value so waiters will see it and wake up.
         if wake && waiters_atom.load(Ordering::Acquire) > 0 {
             // Safety: AtomicU64 is at least 4-byte aligned. On little-endian
-            // (all supported platforms), the low 32 bits are at the base address.
+            // (enforced by compile_error in layout.rs), the low 32 bits are
+            // at the base address.
             let seq_futex = unsafe { &*(write_seq_atom as *const AtomicU64 as *const AtomicU32) };
             notify::wake_all(seq_futex);
         }
+    }
+}
+
+/// Release a block's refcount. If this is the last reference, free it to the pool.
+/// Shared by `SampleGuard::drop`, `TypedSampleGuard::drop`, and `CrossbarSample::drop`.
+pub(crate) fn release_block(region: &Region, block_idx: u32) {
+    // Runtime bounds check (Codex/Security: must not use debug_assert in Drop paths)
+    let refcount = match region.block_refcount_checked(block_idx) {
+        Some(rc) => rc,
+        None => return, // OOB block_idx — silently ignore in Drop path
+    };
+    let prev = refcount.fetch_sub(1, Ordering::Release);
+    if prev == 1 {
+        core::sync::atomic::fence(Ordering::Acquire);
+        region.free_block(block_idx);
     }
 }

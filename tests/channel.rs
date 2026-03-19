@@ -16,14 +16,14 @@ fn channel_bidirectional() {
         let msg = srv.recv().unwrap();
         assert_eq!(&*msg, b"ping");
         drop(msg);
-        srv.send(b"pong");
+        srv.send(b"pong").unwrap();
     });
 
     std::thread::sleep(Duration::from_millis(50));
 
     let mut cli =
         ShmChannel::connect(&name, PubSubConfig::default(), Duration::from_secs(5)).unwrap();
-    cli.send(b"ping");
+    cli.send(b"ping").unwrap();
     let reply = cli.recv().unwrap();
     assert_eq!(&*reply, b"pong");
 
@@ -48,9 +48,9 @@ fn channel_loan_pattern() {
 
     let mut cli =
         ShmChannel::connect(&name, PubSubConfig::default(), Duration::from_secs(5)).unwrap();
-    let mut loan = cli.loan();
+    let mut loan = cli.loan().unwrap();
     loan.as_mut_slice()[..8].copy_from_slice(&42u64.to_le_bytes());
-    loan.set_len(8);
+    loan.set_len(8).unwrap();
     loan.publish();
 
     server.join().unwrap();
@@ -69,7 +69,7 @@ fn channel_multiple_messages() {
             let val = u32::from_le_bytes(msg[..4].try_into().unwrap());
             assert_eq!(val, i);
             drop(msg);
-            srv.send(&(i * 10).to_le_bytes());
+            srv.send(&(i * 10).to_le_bytes()).unwrap();
         }
     });
 
@@ -78,7 +78,7 @@ fn channel_multiple_messages() {
     let mut cli =
         ShmChannel::connect(&name, PubSubConfig::default(), Duration::from_secs(5)).unwrap();
     for i in 0u32..10 {
-        cli.send(&i.to_le_bytes());
+        cli.send(&i.to_le_bytes()).unwrap();
         let reply = cli.recv().unwrap();
         let val = u32::from_le_bytes(reply[..4].try_into().unwrap());
         assert_eq!(val, i * 10);

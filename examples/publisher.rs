@@ -53,13 +53,13 @@ fn main() {
     println!("publishing {n} samples at 10µs intervals...");
 
     for i in 0..n {
-        let mut loan = pub_.loan(&handle);
+        let mut loan = pub_.loan(&handle).unwrap();
         let buf = loan.as_mut_slice();
         // Write mono timestamp + sequence directly into SHM
         let ts = mono_nanos();
         buf[0..8].copy_from_slice(&ts.to_le_bytes());
         buf[8..16].copy_from_slice(&i.to_le_bytes());
-        loan.set_len(16);
+        loan.set_len(16).unwrap();
         loan.publish();
 
         // Pace at ~10µs per sample to avoid ring overwrite

@@ -9,7 +9,7 @@ use std::time::Duration;
 // ====================================================
 
 fn bench_pubsub(c: &mut Criterion) {
-    let ps_name = "crossbar-bench-ps";
+    let ps_name = &format!("crossbar-bench-ps-{}", std::process::id());
     let cfg = PubSubConfig {
         block_size: 1_048_576 + 8, // 1 MB data + 8B header
         block_count: 64,
@@ -40,9 +40,9 @@ fn bench_pubsub(c: &mut Criterion) {
         // This is the apples-to-apples iceoryx2 comparison.
         group.bench_function("smart_wake", |b| {
             b.iter(|| {
-                let mut loan = pub_.loan(&h_8b);
+                let mut loan = pub_.loan(&h_8b).unwrap();
                 loan.as_mut_slice()[..8].copy_from_slice(&42u64.to_le_bytes());
-                loan.set_len(8);
+                loan.set_len(8).unwrap();
                 loan.publish(); // smart: no futex since try_recv, not recv
                 let g = s_8b.try_recv().unwrap();
                 black_box(&*g);
@@ -52,9 +52,9 @@ fn bench_pubsub(c: &mut Criterion) {
         // Silent: no notification at all — pure atomics overhead floor.
         group.bench_function("silent_no_wake", |b| {
             b.iter(|| {
-                let mut loan = pub_.loan(&h_8b);
+                let mut loan = pub_.loan(&h_8b).unwrap();
                 loan.as_mut_slice()[..8].copy_from_slice(&42u64.to_le_bytes());
-                loan.set_len(8);
+                loan.set_len(8).unwrap();
                 loan.publish_silent();
                 let g = s_8b.try_recv().unwrap();
                 black_box(&*g);
@@ -72,9 +72,9 @@ fn bench_pubsub(c: &mut Criterion) {
         // 8 bytes — measures pure O(1) transfer overhead
         group.bench_function("8B", |b| {
             b.iter(|| {
-                let mut loan = pub_.loan(&h_8b);
+                let mut loan = pub_.loan(&h_8b).unwrap();
                 loan.as_mut_slice()[..8].copy_from_slice(&42u64.to_le_bytes());
-                loan.set_len(8);
+                loan.set_len(8).unwrap();
                 loan.publish();
                 let g = s_8b.try_recv().unwrap();
                 black_box(&*g); // safe Deref!
@@ -84,9 +84,9 @@ fn bench_pubsub(c: &mut Criterion) {
         // 64 KB — same O(1) ring transfer, different write cost
         group.bench_function("64KB", |b| {
             b.iter(|| {
-                let mut loan = pub_.loan(&h_64kb);
+                let mut loan = pub_.loan(&h_64kb).unwrap();
                 loan.as_mut_slice()[..payload_64kb.len()].copy_from_slice(&payload_64kb);
-                loan.set_len(payload_64kb.len());
+                loan.set_len(payload_64kb.len()).unwrap();
                 loan.publish();
                 let g = s_64kb.try_recv().unwrap();
                 black_box(&*g);
@@ -96,9 +96,9 @@ fn bench_pubsub(c: &mut Criterion) {
         // 1 MB
         group.bench_function("1MB", |b| {
             b.iter(|| {
-                let mut loan = pub_.loan(&h_1mb);
+                let mut loan = pub_.loan(&h_1mb).unwrap();
                 loan.as_mut_slice()[..payload_1mb.len()].copy_from_slice(&payload_1mb);
-                loan.set_len(payload_1mb.len());
+                loan.set_len(payload_1mb.len()).unwrap();
                 loan.publish();
                 let g = s_1mb.try_recv().unwrap();
                 black_box(&*g);
@@ -116,9 +116,9 @@ fn bench_pubsub(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(65_536));
         group.bench_function("64kb", |b| {
             b.iter(|| {
-                let mut loan = pub_.loan(&h_64kb);
+                let mut loan = pub_.loan(&h_64kb).unwrap();
                 loan.as_mut_slice()[..payload_64kb.len()].copy_from_slice(&payload_64kb);
-                loan.set_len(payload_64kb.len());
+                loan.set_len(payload_64kb.len()).unwrap();
                 loan.publish();
                 let g = s_64kb.try_recv().unwrap();
                 black_box(&*g);
@@ -135,9 +135,9 @@ fn bench_pubsub(c: &mut Criterion) {
 
         group.bench_function("1mb", |b| {
             b.iter(|| {
-                let mut loan = pub_.loan(&h_1mb);
+                let mut loan = pub_.loan(&h_1mb).unwrap();
                 loan.as_mut_slice()[..payload_1mb.len()].copy_from_slice(&payload_1mb);
-                loan.set_len(payload_1mb.len());
+                loan.set_len(payload_1mb.len()).unwrap();
                 loan.publish();
                 let g = s_1mb.try_recv().unwrap();
                 black_box(&*g);
@@ -241,9 +241,9 @@ fn bench_iceoryx2_vs_crossbar(c: &mut Criterion) {
 
             group.bench_function(format!("crossbar/8B_on_{label}"), |b| {
                 b.iter(|| {
-                    let mut loan = pub_.loan(&handle);
+                    let mut loan = pub_.loan(&handle).unwrap();
                     loan.as_mut_slice()[..8].copy_from_slice(&42u64.to_le_bytes());
-                    loan.set_len(8);
+                    loan.set_len(8).unwrap();
                     loan.publish();
                     let g = s.try_recv().unwrap();
                     black_box(g[0]); // read 1 byte — O(1)
@@ -327,9 +327,9 @@ fn bench_iceoryx2_vs_crossbar(c: &mut Criterion) {
 
             group.bench_function(format!("crossbar/{label}"), |b| {
                 b.iter(|| {
-                    let mut loan = pub_.loan(handle);
+                    let mut loan = pub_.loan(handle).unwrap();
                     loan.as_mut_slice()[..payload.len()].copy_from_slice(payload);
-                    loan.set_len(payload.len());
+                    loan.set_len(payload.len()).unwrap();
                     loan.publish();
                     let g = sub_handle.try_recv().unwrap();
                     black_box(&*g);
@@ -421,9 +421,9 @@ fn bench_iceoryx2_vs_crossbar(c: &mut Criterion) {
             group.bench_function(format!("crossbar/{label}"), |b| {
                 b.iter(|| {
                     // Pinned: same block every time — L1/L2 warm, no alloc, no refcount
-                    let mut loan = pub_.loan_pinned(handle);
+                    let mut loan = pub_.loan_pinned(handle).unwrap();
                     loan.as_mut_slice()[..sz].fill(42u8);
-                    loan.set_len(sz);
+                    loan.set_len(sz).unwrap();
                     loan.publish();
                     let g = sub_handle.try_recv_pinned().unwrap();
                     black_box(&*g);

@@ -57,7 +57,7 @@ unsafe impl Sync for RawMmap {}
 impl RawMmap {
     /// Maps `file` read-write using the file's current size.
     ///
-    /// Applies `MAP_SHARED | MAP_POPULATE` and `MADV_HUGEPAGE` on Linux.
+    /// Applies `MAP_SHARED` and `MADV_HUGEPAGE` on Linux.
     pub fn from_file(file: &std::fs::File) -> io::Result<Self> {
         let len = file.metadata()?.len() as usize;
         Self::from_file_with_len(file, len)

@@ -19,7 +19,8 @@ use std::time::Duration;
 use crate::platform::subscription::Subscription;
 use crate::platform::{ShmChannel, ShmPublisher, ShmSubscriber};
 use crate::protocol::layout::BLOCK_DATA_OFFSET;
-use crate::protocol::{PubSubConfig, Region};
+use crate::protocol::PubSubConfig;
+use crate::protocol::{release_block, Region};
 
 // ---- Config ----
 
@@ -77,7 +78,7 @@ fn config_from_ptr(ptr: *const CrossbarConfig) -> PubSubConfig {
 
 // ---- Topic handle ----
 
-/// Value type — safe to copy.
+/// Value type -- safe to copy.
 #[repr(C)]
 pub struct CrossbarTopic {
     /// Topic index within the region.
@@ -97,13 +98,7 @@ pub struct CrossbarSample {
 
 impl Drop for CrossbarSample {
     fn drop(&mut self) {
-        use core::sync::atomic::Ordering;
-        let refcount = self.region.block_refcount(self.block_idx);
-        let prev = refcount.fetch_sub(1, Ordering::Release);
-        if prev == 1 {
-            core::sync::atomic::fence(Ordering::Acquire);
-            self.region.free_block(self.block_idx);
-        }
+        release_block(&self.region, self.block_idx);
     }
 }
 
@@ -113,12 +108,15 @@ impl Drop for CrossbarSample {
 ///
 /// # Safety
 ///
-/// `name` must be a valid null-terminated C string.
+/// `name` must be a valid null-terminated C string, or `NULL`.
 #[no_mangle]
 pub unsafe extern "C" fn crossbar_publisher_create(
     name: *const c_char,
     config: *const CrossbarConfig,
 ) -> *mut ShmPublisher {
+    if name.is_null() {
+        return std::ptr::null_mut();
+    }
     let name = match CStr::from_ptr(name).to_str() {
         Ok(s) => s,
         Err(_) => return std::ptr::null_mut(),
@@ -152,25 +150,24 @@ pub unsafe extern "C" fn crossbar_publisher_register(
     pub_: *mut ShmPublisher,
     uri: *const c_char,
 ) -> CrossbarTopic {
+    let err_topic = CrossbarTopic {
+        topic_idx: u32::MAX,
+        publisher_id: 0,
+    };
+    if pub_.is_null() || uri.is_null() {
+        return err_topic;
+    }
     let pub_ = &mut *pub_;
     let uri = match CStr::from_ptr(uri).to_str() {
         Ok(s) => s,
-        Err(_) => {
-            return CrossbarTopic {
-                topic_idx: u32::MAX,
-                publisher_id: 0,
-            }
-        }
+        Err(_) => return err_topic,
     };
     match pub_.register(uri) {
         Ok(h) => CrossbarTopic {
             topic_idx: h.topic_idx,
             publisher_id: h.publisher_id,
         },
-        Err(_) => CrossbarTopic {
-            topic_idx: u32::MAX,
-            publisher_id: 0,
-        },
+        Err(_) => err_topic,
     }
 }
 
@@ -180,11 +177,17 @@ pub unsafe extern "C" fn crossbar_publisher_register(
 ///
 /// `pub_` must be a valid publisher pointer.
 #[no_mangle]
-pub unsafe extern "C" fn crossbar_publisher_heartbeat(pub_: *mut ShmPublisher) {
-    (*pub_).heartbeat();
+pub unsafe extern "C" fn crossbar_publisher_heartbeat(pub_: *mut ShmPublisher) -> i32 {
+    if pub_.is_null() {
+        return -1;
+    }
+    match (*pub_).heartbeat() {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
 }
 
-/// Copies `data` into a SHM block and publishes it. Returns 0 on success.
+/// Copies `data` into a SHM block and publishes it. Returns 0 on success, -1 on error.
 ///
 /// # Safety
 ///
@@ -198,14 +201,30 @@ pub unsafe extern "C" fn crossbar_publish(
     data: *const u8,
     len: usize,
 ) -> i32 {
+    if pub_.is_null() {
+        return -1;
+    }
     let pub_ = &mut *pub_;
     let handle = crate::platform::loan::TopicHandle {
         topic_idx: topic.topic_idx,
         publisher_id: topic.publisher_id,
     };
-    let mut loan = pub_.loan(&handle);
-    let payload = std::slice::from_raw_parts(data, len);
-    loan.set_data(payload);
+    let mut loan = match pub_.loan(&handle) {
+        Ok(l) => l,
+        Err(_) => return -1,
+    };
+    // Avoid UB: from_raw_parts requires non-null even for len==0
+    let payload = if len == 0 {
+        &[]
+    } else {
+        if data.is_null() {
+            return -1;
+        }
+        std::slice::from_raw_parts(data, len)
+    };
+    if loan.set_data(payload).is_err() {
+        return -1;
+    }
     loan.publish();
     0
 }
@@ -219,6 +238,9 @@ pub unsafe extern "C" fn crossbar_publish(
 /// `name` must be a valid null-terminated C string.
 #[no_mangle]
 pub unsafe extern "C" fn crossbar_subscriber_connect(name: *const c_char) -> *mut ShmSubscriber {
+    if name.is_null() {
+        return std::ptr::null_mut();
+    }
     let name = match CStr::from_ptr(name).to_str() {
         Ok(s) => s,
         Err(_) => return std::ptr::null_mut(),
@@ -252,6 +274,9 @@ pub unsafe extern "C" fn crossbar_subscriber_subscribe(
     sub: *mut ShmSubscriber,
     uri: *const c_char,
 ) -> *mut Subscription {
+    if sub.is_null() || uri.is_null() {
+        return std::ptr::null_mut();
+    }
     let sub = &*sub;
     let uri = match CStr::from_ptr(uri).to_str() {
         Ok(s) => s,
@@ -288,7 +313,7 @@ fn guard_to_sample(
         block_idx: guard.block_idx,
         len: guard.len,
     };
-    // Forget the guard so it doesn't decrement refcount — we took ownership.
+    // Forget the guard so it doesn't decrement refcount -- we took ownership.
     core::mem::forget(guard);
     Box::into_raw(Box::new(sample))
 }
@@ -301,6 +326,9 @@ fn guard_to_sample(
 /// must be freed with `crossbar_sample_free`.
 #[no_mangle]
 pub unsafe extern "C" fn crossbar_try_recv(stream: *mut Subscription) -> *mut CrossbarSample {
+    if stream.is_null() {
+        return std::ptr::null_mut();
+    }
     let stream = &*stream;
     match stream.try_recv() {
         Some(guard) => guard_to_sample(&stream.region, guard),
@@ -310,19 +338,24 @@ pub unsafe extern "C" fn crossbar_try_recv(stream: *mut Subscription) -> *mut Cr
 
 /// Non-blocking receive into caller-provided memory (zero allocation).
 ///
-/// Returns 1 if a sample was written to `out`, 0 if no data available.
-/// The caller must call `crossbar_sample_free` on `out` when done if this
-/// returns 1, or reuse `out` for the next call.
+/// Returns 1 if a sample was written to `out`, 0 if no data available, -1 on error.
+///
+/// **Important:** The caller MUST call `crossbar_sample_free` on `out` before
+/// reusing it if a previous call returned 1. Failing to do so leaks the
+/// previous sample's block.
 ///
 /// # Safety
 ///
 /// `stream` must be a valid subscription pointer. `out` must point to a
-/// valid `CrossbarSample` struct (may be uninitialized).
+/// valid `CrossbarSample` struct (may be uninitialized on first call).
 #[no_mangle]
 pub unsafe extern "C" fn crossbar_try_recv_into(
     stream: *mut Subscription,
     out: *mut CrossbarSample,
 ) -> i32 {
+    if stream.is_null() || out.is_null() {
+        return -1;
+    }
     let stream = &*stream;
     match stream.try_recv() {
         Some(guard) => {
@@ -345,6 +378,9 @@ pub unsafe extern "C" fn crossbar_try_recv_into(
 /// `stream` must be a valid subscription pointer.
 #[no_mangle]
 pub unsafe extern "C" fn crossbar_recv(stream: *mut Subscription) -> *mut CrossbarSample {
+    if stream.is_null() {
+        return std::ptr::null_mut();
+    }
     let stream = &*stream;
     match stream.recv() {
         Ok(guard) => guard_to_sample(&stream.region, guard),
@@ -352,15 +388,22 @@ pub unsafe extern "C" fn crossbar_recv(stream: *mut Subscription) -> *mut Crossb
     }
 }
 
-/// Returns a pointer to the sample's data (zero-copy — points into SHM).
+/// Returns a pointer to the sample's data (zero-copy -- points into SHM).
 ///
 /// # Safety
 ///
 /// `sample` must be a valid sample pointer.
 #[no_mangle]
 pub unsafe extern "C" fn crossbar_sample_data(sample: *const CrossbarSample) -> *const u8 {
+    if sample.is_null() {
+        return std::ptr::null();
+    }
     let s = &*sample;
-    s.region.block_ptr(s.block_idx).add(BLOCK_DATA_OFFSET)
+    // C1: bounds check on block_idx
+    match s.region.block_ptr_checked(s.block_idx) {
+        Some(ptr) => ptr.add(BLOCK_DATA_OFFSET),
+        None => std::ptr::null(),
+    }
 }
 
 /// Returns the sample's data length in bytes.
@@ -370,6 +413,9 @@ pub unsafe extern "C" fn crossbar_sample_data(sample: *const CrossbarSample) -> 
 /// `sample` must be a valid sample pointer.
 #[no_mangle]
 pub unsafe extern "C" fn crossbar_sample_len(sample: *const CrossbarSample) -> usize {
+    if sample.is_null() {
+        return 0;
+    }
     (*sample).len
 }
 
@@ -400,6 +446,9 @@ pub unsafe extern "C" fn crossbar_channel_listen(
     config: *const CrossbarConfig,
     timeout_ms: u64,
 ) -> *mut ShmChannel {
+    if name.is_null() {
+        return std::ptr::null_mut();
+    }
     let name = match CStr::from_ptr(name).to_str() {
         Ok(s) => s,
         Err(_) => return std::ptr::null_mut(),
@@ -426,6 +475,9 @@ pub unsafe extern "C" fn crossbar_channel_connect(
     config: *const CrossbarConfig,
     timeout_ms: u64,
 ) -> *mut ShmChannel {
+    if name.is_null() {
+        return std::ptr::null_mut();
+    }
     let name = match CStr::from_ptr(name).to_str() {
         Ok(s) => s,
         Err(_) => return std::ptr::null_mut(),
@@ -453,7 +505,7 @@ pub unsafe extern "C" fn crossbar_channel_free(ch: *mut ShmChannel) {
     }
 }
 
-/// Sends data through a channel. Returns 0 on success.
+/// Sends data through a channel. Returns 0 on success, -1 on error.
 ///
 /// # Safety
 ///
@@ -464,10 +516,22 @@ pub unsafe extern "C" fn crossbar_channel_send(
     data: *const u8,
     len: usize,
 ) -> i32 {
+    if ch.is_null() {
+        return -1;
+    }
     let ch = &mut *ch;
-    let payload = std::slice::from_raw_parts(data, len);
-    ch.send(payload);
-    0
+    let payload = if len == 0 {
+        &[]
+    } else {
+        if data.is_null() {
+            return -1;
+        }
+        std::slice::from_raw_parts(data, len)
+    };
+    match ch.send(payload) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
 }
 
 /// Non-blocking receive on a channel. Returns `NULL` if no data.
@@ -477,11 +541,12 @@ pub unsafe extern "C" fn crossbar_channel_send(
 /// `ch` must be a valid channel pointer.
 #[no_mangle]
 pub unsafe extern "C" fn crossbar_channel_try_recv(ch: *mut ShmChannel) -> *mut CrossbarSample {
+    if ch.is_null() {
+        return std::ptr::null_mut();
+    }
     let ch = &*ch;
     match ch.try_recv() {
         Some(guard) => {
-            // Channel's subscription holds the Arc<Region>. We need to access
-            // it to create a self-owned sample. Access via the guard's region ref.
             let sample = CrossbarSample {
                 region: Arc::clone(&ch.rx.region),
                 block_idx: guard.block_idx,
@@ -501,6 +566,9 @@ pub unsafe extern "C" fn crossbar_channel_try_recv(ch: *mut ShmChannel) -> *mut 
 /// `ch` must be a valid channel pointer.
 #[no_mangle]
 pub unsafe extern "C" fn crossbar_channel_recv(ch: *mut ShmChannel) -> *mut CrossbarSample {
+    if ch.is_null() {
+        return std::ptr::null_mut();
+    }
     let ch = &*ch;
     match ch.recv() {
         Ok(guard) => {

@@ -14,4 +14,5 @@ pub(crate) mod layout;
 mod region;
 
 pub use config::PubSubConfig;
+pub(crate) use region::release_block;
 pub use region::Region;
