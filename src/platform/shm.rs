@@ -758,7 +758,7 @@ impl ShmPublisher {
     /// dedicated block. Subsequent calls return the same block -- no alloc.
     ///
     /// The publisher uses a CAS-based writer sentinel to prevent data races:
-    /// if any subscriber holds a [`PinnedGuard`] for this topic, this method
+    /// if any subscriber holds a [`PinnedGuard`](super::subscription::PinnedGuard) for this topic, this method
     /// returns an error.
     ///
     /// # Errors
