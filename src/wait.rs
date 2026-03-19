@@ -77,6 +77,7 @@ impl Default for WaitStrategy {
 /// On aarch64: SEVL + WFE puts the core into a low-power state until a
 /// cache-line invalidation event wakes it.
 /// On x86: PAUSE yields the pipeline to the SMT sibling (~140 cycles).
+#[cfg(feature = "std")]
 #[inline(always)]
 pub(crate) fn yield_hint() {
     #[cfg(target_arch = "aarch64")]
@@ -87,6 +88,7 @@ pub(crate) fn yield_hint() {
     core::hint::spin_loop();
 }
 
+#[cfg(feature = "std")]
 impl WaitStrategy {
     /// Execute one wait iteration. Called by `recv_with` on each loop when
     /// `try_recv` returns `None`.

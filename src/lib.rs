@@ -39,10 +39,8 @@ extern crate alloc;
 
 #[allow(unsafe_code)]
 mod pod;
-#[cfg_attr(not(feature = "std"), allow(dead_code))]
 #[allow(unsafe_code)]
 pub mod protocol;
-#[cfg_attr(not(feature = "std"), allow(dead_code))]
 #[allow(unsafe_code)]
 pub mod wait;
 

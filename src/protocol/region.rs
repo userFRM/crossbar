@@ -9,21 +9,22 @@
 //! Works on raw pointers -- no OS dependency. The platform layer constructs
 //! a `Region` from an mmap'd pointer.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-
 use super::config::PubSubConfig;
-use super::layout::*;
-
-#[cfg(feature = "std")]
-use crate::platform::notify;
 
 /// Shared state for the mmap region -- held by both publisher/subscriber
 /// and by `SampleGuard` (via `Arc`) to keep the mmap alive.
 pub struct Region {
+    #[cfg(feature = "std")]
     base: *mut u8,
+    #[cfg(feature = "std")]
     pub(crate) config: PubSubConfig,
+    #[cfg(feature = "std")]
     pub(crate) pool_offset: usize,
-    pub(crate) last_freed: AtomicU32,
+    #[cfg(feature = "std")]
+    pub(crate) last_freed: core::sync::atomic::AtomicU32,
+    // In no_std mode, Region is a zero-sized type placeholder.
+    #[cfg(not(feature = "std"))]
+    _phantom: core::marker::PhantomData<PubSubConfig>,
 }
 
 // SAFETY: The mmap region is process-shared memory backed by a named file in
@@ -32,6 +33,14 @@ pub struct Region {
 unsafe impl Send for Region {}
 unsafe impl Sync for Region {}
 
+#[cfg(feature = "std")]
+use super::layout::*;
+#[cfg(feature = "std")]
+use crate::platform::notify;
+#[cfg(feature = "std")]
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+#[cfg(feature = "std")]
 impl Region {
     /// Construct a Region from a raw pointer and length.
     ///
@@ -388,6 +397,7 @@ impl Region {
     }
 }
 
+#[cfg(feature = "std")]
 /// Release a block's refcount. If this is the last reference, free it to the pool.
 /// Shared by `SampleGuard::drop`, `TypedSampleGuard::drop`, and `CrossbarSample::drop`.
 pub(crate) fn release_block(region: &Region, block_idx: u32) {
