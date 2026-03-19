@@ -17,28 +17,28 @@ Proves O(1): latency is flat regardless of how large the backing block is.
 
 | Backing buffer | crossbar | iceoryx2 | speedup |
 |---|---|---|---|
-| 64 B | **49 ns** | 233 ns | 4.8× |
-| 4 KB | **49 ns** | 232 ns | 4.7× |
-| 64 KB | **50 ns** | 235 ns | 4.7× |
-| 256 KB | **50 ns** | 234 ns | 4.7× |
-| 1 MB | **50 ns** | 234 ns | 4.7× |
+| 64 B | **54 ns** | 232 ns | 4.3× |
+| 4 KB | **55 ns** | 234 ns | 4.2× |
+| 64 KB | **54 ns** | 232 ns | 4.3× |
+| 256 KB | **54 ns** | 234 ns | 4.3× |
+| 1 MB | **54 ns** | 230 ns | 4.2× |
 
 ### End-to-end with full payload (loan → memcpy → publish → recv → deref)
 
 | Payload | crossbar | iceoryx2 | speedup |
 |---|---|---|---|
-| 8 B | **50 ns** | 240 ns | **4.8×** |
-| 1 KB | **65 ns** | 250 ns | **3.8×** |
-| 64 KB | 1.35 µs | 1.35 µs | ~1× |
-| 256 KB | 7.20 µs | 6.89 µs | ~1× |
-| 1 MB | 33 µs | 30 µs | ~1× |
+| 8 B | **54 ns** | 232 ns | **4.3×** |
+| 1 KB | **66 ns** | 243 ns | **3.7×** |
+| 64 KB | 1.35 µs | 1.38 µs | ~1× |
+| 256 KB | 6.65 µs | 6.82 µs | ~1× |
+| 1 MB | 31 µs | 29 µs | ~1× |
 
 ### Throughput (born-in-SHM write)
 
 | Payload | throughput |
 |---|---|
-| 64 KB | **43 GiB/s** |
-| 1 MB | **30 GiB/s** |
+| 64 KB | **45 GiB/s** |
+| 1 MB | **32 GiB/s** |
 
 ### Pinned mode (latest-value, same buffer every iteration)
 
@@ -46,16 +46,22 @@ Proves O(1): latency is flat regardless of how large the backing block is.
 
 | Payload | crossbar | iceoryx2 | speedup |
 |---|---|---|---|
-| 8 B | **26 ns** | 229 ns | **8.7×** |
-| 1 KB | **33 ns** | 234 ns | **7.1×** |
-| 64 KB | **1.07 µs** | 1.27 µs | **1.2×** |
-| 1 MB | 18.4 µs | 18.4 µs | ~1× |
+| 8 B | **35 ns** | 229 ns | **6.5×** |
+| 1 KB | **45 ns** | 238 ns | **5.3×** |
+| 64 KB | **1.07 µs** | 1.30 µs | **1.2×** |
+| 1 MB | 18.1 µs | 18.4 µs | ~1× |
+
+> **Note:** The 8 B pinned result increased from ~26 ns to ~35 ns due to the CAS-based writer sentinel
+> added for safety. This is the cost of the sentinel's compare-and-swap on every `loan_pinned` — a
+> deliberate trade-off for correctness under concurrent access.
 
 ### Silent publish (no wake path)
 
 | | latency |
 |---|---|
 | 8 B, `publish_silent()` | **56 ns** |
+
+> The `smart_wake` path now also lands at **56 ns** — the wake-check overhead is in the noise.
 
 ---
 
@@ -96,9 +102,9 @@ Proves O(1): latency is flat regardless of how large the backing block is.
 
 **The crossbar advantage lives below 64 KB.** The speed difference comes from a lighter path — no service discovery, no POSIX configuration layer, straight to atomics. Above 64 KB, `memcpy` dominates and both frameworks are equal.
 
-**Born-in-SHM avoids the memcpy entirely.** If the publisher writes directly into the loaned block (no intermediate copy), the transport is ~50 ns regardless of payload size. Run `cargo bench -- born_in_shm` to see the head-to-head.
+**Born-in-SHM avoids the memcpy entirely.** If the publisher writes directly into the loaned block (no intermediate copy), the transport is ~35 ns for small payloads regardless of payload size. Run `cargo bench -- born_in_shm` to see the head-to-head.
 
-**Throughput is memory-bandwidth-bound.** 30–43 GiB/s is close to measured memory bandwidth — the bulk of time is writing the payload, not the framework.
+**Throughput is memory-bandwidth-bound.** 32–45 GiB/s is close to measured memory bandwidth — the bulk of time is writing the payload, not the framework.
 
 **Multi-publisher overhead.** The protocol uses `fetch_add` for atomic sequence claiming and CAS-based ring slot locking. In single-publisher mode (the common case), the seqlock uses a plain store instead of CAS, saving ~10–15 ns. The `silent_no_wake` path at 56 ns shows the pure atomics floor without notification overhead.
 

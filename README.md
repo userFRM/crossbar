@@ -137,10 +137,10 @@ let mut srv = ShmChannel::listen("rpc", PubSubConfig::default(),
 let mut cli = ShmChannel::connect("rpc", PubSubConfig::default(),
     Duration::from_secs(5))?;
 
-cli.send(b"request");
+cli.send(b"request")?;
 let msg = srv.recv()?;
 // ... process and respond
-srv.send(b"response");
+srv.send(b"response")?;
 let reply = cli.recv()?;
 ```
 
@@ -167,10 +167,10 @@ All measurements: Criterion, same-process publisher + subscriber, `try_recv` (no
 
 | | crossbar | iceoryx2 | speedup |
 |---|---|---|---|
-| 8 B (transport overhead) | **50 ns** | 233 ns | **4.7×** |
-| 1 KB | **65 ns** | 250 ns | **3.8×** |
-| 64 KB | 1.35 µs | 1.35 µs | ~1× |
-| 1 MB | **33 µs** | 30 µs | ~1× |
+| 8 B (transport overhead) | **54 ns** | 232 ns | **4.3×** |
+| 1 KB | **66 ns** | 243 ns | **3.7×** |
+| 64 KB | 1.35 µs | 1.38 µs | ~1× |
+| 1 MB | **31 µs** | 30 µs | ~1× |
 
 ### Apple M1 Pro · macOS · rustc 1.92 (v0.3.0, pre-optimization)
 
@@ -181,18 +181,18 @@ All measurements: Criterion, same-process publisher + subscriber, `try_recv` (no
 | 64 KB | 1.27 µs | 1.35 µs | 1.1× |
 | 1 MB | 23.9 µs | 23.5 µs | ~1× |
 
-**The win is in the overhead.** At small payloads crossbar's lighter path (no service discovery, no POSIX config layer) is 4–5× faster. At 64 KB+ both frameworks are memcpy-bound and converge. The 8-byte descriptor is always O(1) — payload latency scales with how long you take to write into the block.
+**The win is in the overhead.** At small payloads crossbar's lighter path (no service discovery, no POSIX config layer) is 4× faster. At 64 KB+ both frameworks are memcpy-bound and converge. The 8-byte descriptor is always O(1) — payload latency scales with how long you take to write into the block.
 
 ### Pinned mode (latest-value, same buffer every iteration)
 
 | | crossbar | iceoryx2 | speedup |
 |---|---|---|---|
-| 8 B | **26 ns** | 229 ns | **8.7×** |
-| 1 KB | **33 ns** | 234 ns | **7.1×** |
-| 64 KB | **1.07 µs** | 1.27 µs | **1.2×** |
-| 1 MB | 18.4 µs | 18.4 µs | ~1× |
+| 8 B | **35 ns** | 229 ns | **6.5×** |
+| 1 KB | **45 ns** | 238 ns | **5.3×** |
+| 64 KB | **1.07 µs** | 1.30 µs | **1.2×** |
+| 1 MB | 18.1 µs | 18.4 µs | ~1× |
 
-Pinned mode (`loan_pinned` / `try_recv_pinned`) reuses the same block every iteration — no allocation, no refcount, no ring. Safe API with runtime reader-count protection. Best for market data, sensors, telemetry, game state.
+Pinned mode (`loan_pinned` / `try_recv_pinned`) reuses the same block every iteration — no allocation, no refcount, no ring. Safe API with CAS-based reader/writer exclusion. Best for market data, sensors, telemetry, game state. The 8B cost increased from 26 ns to 35 ns in v0.3.1 due to the CAS sentinel added for safety (prevents data races between publisher writes and subscriber reads).
 
 Reproduce: `cargo bench -- head_to_head` (requires `iceoryx2` dev-dep, Unix only).
 
