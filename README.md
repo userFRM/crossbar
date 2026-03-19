@@ -1,8 +1,12 @@
 # crossbar
 
-[![CI](https://github.com/userFRM/crossbar/actions/workflows/ci.yml/badge.svg)](https://github.com/userFRM/crossbar/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/crossbar.svg)](https://crates.io/crates/crossbar)
+[![Crates.io](https://img.shields.io/crates/v/crossbar.svg)](https://crates.io/crates/crossbar)
+[![docs.rs](https://docs.rs/crossbar/badge.svg)](https://docs.rs/crossbar)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE-APACHE)
+[![no_std](https://img.shields.io/badge/no__std-compatible-brightgreen.svg)](https://docs.rs/crossbar)
+[![CI](https://github.com/userFRM/crossbar/actions/workflows/ci.yml/badge.svg)](https://github.com/userFRM/crossbar/actions/workflows/ci.yml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.87-blue.svg)](https://www.rust-lang.org)
+[![Downloads](https://img.shields.io/crates/d/crossbar.svg)](https://crates.io/crates/crossbar)
 
 **Zero-copy pub/sub over shared memory. URI-addressed. O(1) transfer at any payload size.**
 
@@ -27,7 +31,7 @@ Transfers an 8-byte descriptor through a lock-free ring — O(1) regardless of p
 
 ```toml
 [dependencies]
-crossbar = "0.3"
+crossbar = "0.4"
 ```
 
 ---
@@ -306,10 +310,10 @@ Requirement: `target_has_atomic = "64"` — the ABA-safe Treiber stack uses 64-b
 
 ```toml
 # no_std + alloc only (protocol core, no ShmPublisher/ShmSubscriber)
-crossbar = { version = "0.3", default-features = false }
+crossbar = { version = "0.4", default-features = false }
 
 # std (default — includes everything)
-crossbar = "0.3"
+crossbar = "0.4"
 ```
 
 ---

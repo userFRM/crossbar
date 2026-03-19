@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.4.0 — 2026-03-19
+
+### Breaking Changes
+- `ShmPublisher::loan()` and `loan_typed()` now return `Result<_, IpcError>` instead of panicking on pool exhaustion.
+- `ShmPublisher::loan_pinned()` returns `Result<_, IpcError>` instead of panicking on active readers.
+- `ShmLoan::set_data()` and `set_len()` return `Result<_, IpcError>` instead of panicking on oversized data.
+- `PinnedLoan::set_data()` and `set_len()` return `Result<_, IpcError>`.
+- `ShmChannel::send()` and `loan()` return `Result<_, IpcError>`.
+- `ShmPublisher::heartbeat()` and `ShmChannel::heartbeat()` return `Result<_, IpcError>`.
+- `Subscription::try_recv_typed()` returns `None` on type size mismatch instead of panicking.
+- `ShmPublisher::register_typed()` returns `Err` on alignment > 8 instead of panicking.
+- `Region::from_raw` is now `pub(crate)` (was `pub`).
+
+### Added
+- **CAS-based pinned writer sentinel**: `loan_pinned()` atomically sets `PINNED_WRITER_ACTIVE` via `compare_exchange`, preventing the publisher/subscriber data race that existed in 0.3.1. Subscribers use a CAS loop that rejects the sentinel + seqlock re-check after reader registration.
+- **`PinnedLoan` has a `Drop` impl**: clears the writer sentinel on panic or early drop, preventing permanent subscriber lockout.
+- **New `IpcError` variants**: `PoolExhausted`, `DataTooLarge`, `PinnedReadersActive`, `ClockError`.
+- **Path traversal defense**: `is_valid_segment_name()` rejects `/`, `\`, `..`, and null bytes in segment names.
+- **File permissions**: SHM and lock files created with `mode(0o600)` on Unix.
+- **Config validation in `connect()`/`open()`**: validates magic, version, `ring_depth` power-of-2, all config bounds, checked arithmetic for region size.
+- **`max_topics` capped at 4096**: prevents OOM from malicious SHM headers.
+- **FFI null safety**: all 22 `extern "C"` functions check every pointer parameter for null before dereferencing.
+- **FFI `from_raw_parts` fix**: `crossbar_publish` and `crossbar_channel_send` use `&[]` for zero-length payloads instead of potentially-null `from_raw_parts`.
+- **Free-list corruption defense**: `alloc_block()` validates both `idx` and `next` pointer bounds.
+- **Fully checked arithmetic**: `region_size_checked()` and `block_pool_offset_checked()` use `checked_mul`/`checked_add`.
+- **Compile-time endianness check**: `compile_error!` on non-little-endian targets.
+- **`TopicHandle`** now derives `Clone, Copy, Debug, PartialEq, Eq`.
+- **`Subscription`** and **`ShmChannel`** implement `Debug`.
+
+### Changed
+- **Pinned block_idx** read atomically (`AtomicU32::load(Acquire)`) instead of plain pointer read.
+- **`release_block`** and **`free_block`** use runtime bounds checks (not `debug_assert`).
+- **`TopicHandle` validation** promoted from `debug_assert_eq` to runtime check.
+- **`len as u32` truncation** guarded by runtime `assert!` (not `debug_assert!`).
+- **`generate_publisher_id`** uses `AtomicU64` counter + PID + thread hash (was `Instant::now().elapsed()` which returned ~0).
+- **Heartbeat errors propagated**: `update_heartbeat()` returns `Result<_, ClockError>`. `loan_preamble` only advances timer on success.
+- **`blocking_recv`** deduplicated into a single generic method (was 3 copies).
+- **`open_and_validate_region`** shared between `ShmPublisher::open()` and `ShmSubscriber::connect()`.
+- **Magic number `1`** replaced with `TE_STATE_ACTIVE` constant in `subscribe()`.
+- Layout constants gated with `#[cfg(feature = "std")]` — zero `#[allow(dead_code)]`.
+
+### Fixed
+- **CRITICAL**: Pinned publish TOCTOU data race (#13) — publisher used plain `load` instead of CAS, allowing concurrent reader/writer access.
+- **HIGH**: Library panics on pool exhaustion, oversized data, type mismatch (#14).
+- **HIGH**: Silent `unwrap_or_default()` on `SystemTime` in heartbeat (#16) — clock skew silently killed pub/sub fabric.
+- **HIGH**: FFI null pointer UB on all entry points (#15).
+- **HIGH**: Path traversal in segment names (#15) — `../../etc/cron.d/evil` was accepted.
+- **HIGH**: Subscriber config not validated from SHM header (#15) — malicious `ring_depth=0` caused division by zero.
+- C header `crossbar_publisher_heartbeat` return type updated from `void` to `int` to match Rust FFI.
+
 ## 0.3.1 — 2026-03-18
 
 ### Changed
