@@ -6,7 +6,6 @@
 [![no_std](https://img.shields.io/badge/no__std-compatible-brightgreen.svg)](https://docs.rs/crossbar)
 [![CI](https://github.com/userFRM/crossbar/actions/workflows/ci.yml/badge.svg)](https://github.com/userFRM/crossbar/actions/workflows/ci.yml)
 [![MSRV](https://img.shields.io/badge/MSRV-1.87-blue.svg)](https://www.rust-lang.org)
-[![Downloads](https://img.shields.io/crates/d/crossbar.svg)](https://crates.io/crates/crossbar)
 
 **Zero-copy pub/sub over shared memory. URI-addressed. O(1) transfer at any payload size.**
 
