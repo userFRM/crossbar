@@ -8,6 +8,12 @@
 //!
 //! All functions are pure computation -- no OS calls.
 
+// Crossbar uses futex on the low-32 of AtomicU64, which only works on
+// little-endian. All supported platforms (x86-64, aarch64 in default mode)
+// are little-endian.
+#[cfg(not(target_endian = "little"))]
+compile_error!("crossbar requires a little-endian target");
+
 use super::config::PubSubConfig;
 
 pub(crate) const MAGIC: &[u8; 8] = b"XBAR_ZC\0";
@@ -27,6 +33,14 @@ pub(crate) const SEQ_WRITING: u64 = u64::MAX;
 pub(crate) const TE_STATE_FREE: u32 = 0;
 pub(crate) const TE_STATE_INIT: u32 = 2;
 pub(crate) const TE_STATE_ACTIVE: u32 = 1;
+
+/// Maximum allowed `max_topics` to prevent OOM from malicious headers.
+pub(crate) const MAX_TOPICS_LIMIT: u32 = 4096;
+
+/// Writer-active sentinel for pinned publish. Stored in TE_PINNED_READERS
+/// via CAS to atomically prevent subscribers from entering while the
+/// publisher is writing. Must not collide with valid reader counts.
+pub(crate) const PINNED_WRITER_ACTIVE: u32 = u32::MAX;
 
 // Global header offsets
 pub(crate) const GH_MAGIC: usize = 0;
@@ -53,7 +67,7 @@ pub(crate) const TE_TYPE_SIZE: usize = 0x60; // u32 -- size_of::<T>() for typed 
 /// Pinned-publish block index (u32). NO_BLOCK = not pinned.
 /// Located in topic entry cache line 1 (cold path, set once at registration).
 pub(crate) const TE_PINNED_BLOCK: usize = 0x64;
-/// Pinned-publish active reader count (AtomicU32). Publisher panics if > 0
+/// Pinned-publish active reader count (AtomicU32). Publisher returns error if > 0
 /// when loan_pinned is called. Enables safe pinned API without `unsafe`.
 pub(crate) const TE_PINNED_READERS: usize = 0x68; // AtomicU32
 /// Pinned-publish seqlock: packed (seq:32 | data_len:32) in AtomicU64.
@@ -89,12 +103,25 @@ pub(crate) fn ring_entry_off(config: &PubSubConfig, topic_idx: u32, slot: u32) -
         + slot as usize * RING_ENTRY_SIZE
 }
 
+/// Compute block pool offset with checked arithmetic. Returns `None` on overflow.
+pub(crate) fn block_pool_offset_checked(config: &PubSubConfig) -> Option<usize> {
+    let rb = ring_base(config);
+    let ring_size = (config.max_topics as usize)
+        .checked_mul(config.ring_depth as usize)?
+        .checked_mul(RING_ENTRY_SIZE)?;
+    rb.checked_add(ring_size)
+}
+
 pub(crate) fn block_pool_offset(config: &PubSubConfig) -> usize {
+    // Only called after config is validated and region_size_checked passed.
     ring_base(config) + config.max_topics as usize * config.ring_depth as usize * RING_ENTRY_SIZE
 }
 
-pub(crate) fn region_size(config: &PubSubConfig) -> usize {
-    block_pool_offset(config) + config.block_count as usize * config.block_size as usize
+/// Compute the total region size with fully checked arithmetic. Returns `None` on overflow.
+pub(crate) fn region_size_checked(config: &PubSubConfig) -> Option<usize> {
+    let pool_off = block_pool_offset_checked(config)?;
+    let pool_size = (config.block_count as usize).checked_mul(config.block_size as usize)?;
+    pool_off.checked_add(pool_size)
 }
 
 pub(crate) fn uri_hash(uri: &str) -> u64 {
@@ -117,4 +144,14 @@ pub(crate) fn pack(gen: u32, idx: u32) -> u64 {
 #[allow(clippy::cast_possible_truncation)]
 pub(crate) fn unpack(val: u64) -> (u32, u32) {
     ((val >> 32) as u32, val as u32)
+}
+
+/// Validate that a segment name contains no path traversal characters.
+/// Returns `true` if the name is safe.
+pub(crate) fn is_valid_segment_name(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    // Reject path separators, parent-dir references, and null bytes
+    !name.contains('/') && !name.contains('\\') && !name.contains('\0') && !name.contains("..")
 }

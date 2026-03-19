@@ -19,7 +19,7 @@ use super::subscription::{SampleGuard, Subscription};
 
 /// Bidirectional shared-memory channel.
 ///
-/// Composed of two pub/sub regions — one per direction. The server creates
+/// Composed of two pub/sub regions -- one per direction. The server creates
 /// `"{name}-srv"` and subscribes to `"{name}-cli"`; the client does the
 /// reverse. Both endpoints have identical capabilities after construction.
 ///
@@ -29,7 +29,7 @@ use super::subscription::{SampleGuard, Subscription};
 /// use crossbar::*;
 /// use std::time::Duration;
 ///
-/// // Process A (server — start first)
+/// // Process A (server -- start first)
 /// let mut srv = ShmChannel::listen("rpc", PubSubConfig::default(),
 ///     Duration::from_secs(30)).unwrap();
 ///
@@ -37,12 +37,12 @@ use super::subscription::{SampleGuard, Subscription};
 /// let mut cli = ShmChannel::connect("rpc", PubSubConfig::default(),
 ///     Duration::from_secs(5)).unwrap();
 ///
-/// cli.send(b"request");
+/// cli.send(b"request").unwrap();
 /// let msg = srv.recv().unwrap();
 /// assert_eq!(&*msg, b"request");
 /// drop(msg);
 ///
-/// srv.send(b"response");
+/// srv.send(b"response").unwrap();
 /// let reply = cli.recv().unwrap();
 /// assert_eq!(&*reply, b"response");
 /// ```
@@ -51,6 +51,12 @@ pub struct ShmChannel {
     tx_topic: TopicHandle,
     _rx_sub: ShmSubscriber, // keeps mmap alive
     pub(crate) rx: Subscription,
+}
+
+impl core::fmt::Debug for ShmChannel {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ShmChannel").field("rx", &self.rx).finish()
+    }
 }
 
 impl ShmChannel {
@@ -103,19 +109,25 @@ impl ShmChannel {
 
     /// Copies `data` into a pool block and sends it to the other endpoint.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the pool is exhausted or `data` exceeds block capacity.
-    pub fn send(&mut self, data: &[u8]) {
-        let mut loan = self.tx_pub.loan(&self.tx_topic);
-        loan.set_data(data);
+    /// Returns [`IpcError::PoolExhausted`] if all blocks are in use, or
+    /// [`IpcError::DataTooLarge`] if `data` exceeds block capacity.
+    pub fn send(&mut self, data: &[u8]) -> Result<(), IpcError> {
+        let mut loan = self.tx_pub.loan(&self.tx_topic)?;
+        loan.set_data(data)?;
         loan.publish();
+        Ok(())
     }
 
     /// Returns a mutable loan for born-in-SHM writes.
     ///
     /// Write directly into the loan, then call [`ShmLoan::publish`].
-    pub fn loan(&mut self) -> ShmLoan<'_> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpcError::PoolExhausted`] if all blocks are in use.
+    pub fn loan(&mut self) -> Result<ShmLoan<'_>, IpcError> {
         self.tx_pub.loan(&self.tx_topic)
     }
 
@@ -147,8 +159,12 @@ impl ShmChannel {
 
     /// Updates the publisher heartbeat. Call during idle periods when
     /// not sending to prevent the other side from reporting publisher dead.
-    pub fn heartbeat(&mut self) {
-        self.tx_pub.heartbeat();
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpcError::ClockError`] if the system clock is before UNIX epoch.
+    pub fn heartbeat(&mut self) -> Result<(), IpcError> {
+        self.tx_pub.heartbeat()
     }
 }
 
@@ -170,11 +186,11 @@ fn wait_for_peer(
         match ShmSubscriber::connect(region_name) {
             Ok(sub) => match sub.subscribe("/ch") {
                 Ok(rx) => {
-                    // Start from beginning — channel must not miss early messages.
+                    // Start from beginning -- channel must not miss early messages.
                     rx.last_seq.set(0);
                     return Ok((sub, rx));
                 }
-                // Topic not registered yet — retry
+                // Topic not registered yet -- retry
                 Err(_) if deadline.is_some_and(|d| std::time::Instant::now() < d) => {
                     std::thread::sleep(Duration::from_millis(10));
                 }

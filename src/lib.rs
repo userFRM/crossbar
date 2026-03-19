@@ -23,8 +23,8 @@
 //! let mut pub_ = ShmPublisher::create("prices", PubSubConfig::default()).unwrap();
 //! let topic = pub_.register("/tick/AAPL").unwrap();
 //!
-//! let mut loan = pub_.loan(&topic);
-//! loan.set_data(b"hello");
+//! let mut loan = pub_.loan(&topic).unwrap();
+//! loan.set_data(b"hello").unwrap();
 //! loan.publish(); // O(1) — writes 8 bytes to ring
 //! ```
 
@@ -39,10 +39,8 @@ extern crate alloc;
 
 #[allow(unsafe_code)]
 mod pod;
-#[cfg_attr(not(feature = "std"), allow(dead_code))]
 #[allow(unsafe_code)]
 pub mod protocol;
-#[cfg_attr(not(feature = "std"), allow(dead_code))]
 #[allow(unsafe_code)]
 pub mod wait;
 

@@ -27,7 +27,7 @@ Transfers an 8-byte descriptor through a lock-free ring — O(1) regardless of p
 
 ```toml
 [dependencies]
-crossbar = "0.2"
+crossbar = "0.3"
 ```
 
 ---
@@ -44,8 +44,8 @@ use crossbar::*;
 let mut pub_ = ShmPublisher::create("market", PubSubConfig::default())?;
 let topic = pub_.register("/prices/AAPL")?;
 
-let mut loan = pub_.loan(&topic);
-loan.set_data(b"42.50");
+let mut loan = pub_.loan(&topic).unwrap();
+loan.set_data(b"42.50").unwrap();
 loan.publish(); // O(1) — writes 8 bytes to ring
 ```
 
@@ -78,7 +78,7 @@ unsafe impl Pod for Tick {}
 // Publisher
 let mut pub_ = ShmPublisher::create("market", PubSubConfig::default())?;
 let topic = pub_.register_typed::<Tick>("/prices/AAPL")?;
-let mut loan = pub_.loan_typed::<Tick>(&topic);
+let mut loan = pub_.loan_typed::<Tick>(&topic).unwrap();
 *loan.as_mut() = Tick { price: 42.50, volume: 1000 };
 loan.publish();
 
@@ -149,11 +149,11 @@ let reply = cli.recv()?;
 Write directly into the pool block — no intermediate buffer, no copy at any payload size:
 
 ```rust
-let mut loan = pub_.loan(&topic);
+let mut loan = pub_.loan(&topic).unwrap();
 let buf = loan.as_mut_slice();
 // write directly into shared memory
 encode_frame(&mut buf[..frame_len]);
-loan.set_len(frame_len);
+loan.set_len(frame_len).unwrap();
 loan.publish();
 ```
 
@@ -306,10 +306,10 @@ Requirement: `target_has_atomic = "64"` — the ABA-safe Treiber stack uses 64-b
 
 ```toml
 # no_std + alloc only (protocol core, no ShmPublisher/ShmSubscriber)
-crossbar = { version = "0.2", default-features = false }
+crossbar = { version = "0.3", default-features = false }
 
 # std (default — includes everything)
-crossbar = "0.2"
+crossbar = "0.3"
 ```
 
 ---

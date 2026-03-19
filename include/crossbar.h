@@ -61,8 +61,9 @@ crossbar_topic_t crossbar_publisher_register(
     const char* uri
 );
 
-/* Updates publisher heartbeat. Call during idle periods. */
-void crossbar_publisher_heartbeat(crossbar_publisher_t* pub_);
+/* Updates publisher heartbeat. Call during idle periods.
+   Returns 0 on success, -1 on clock error. */
+int crossbar_publisher_heartbeat(crossbar_publisher_t* pub_);
 
 /* Copies data into a SHM block and publishes. Returns 0 on success. */
 int crossbar_publish(

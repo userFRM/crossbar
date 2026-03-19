@@ -12,8 +12,8 @@ fn pubsub_basic_publish_subscribe() {
     let stream = sub.subscribe("/test").unwrap();
 
     // Publish a sample
-    let mut loan = pub_.loan(&topic);
-    loan.set_data(b"hello pubsub");
+    let mut loan = pub_.loan(&topic).unwrap();
+    loan.set_data(b"hello pubsub").unwrap();
     loan.publish();
 
     // Receive it
@@ -32,9 +32,9 @@ fn pubsub_safe_deref() {
     let sub = ShmSubscriber::connect(name).unwrap();
     let stream = sub.subscribe("/tick").unwrap();
 
-    let mut loan = pub_.loan(&topic);
+    let mut loan = pub_.loan(&topic).unwrap();
     loan.as_mut_slice()[..8].copy_from_slice(&42u64.to_le_bytes());
-    loan.set_len(8);
+    loan.set_len(8).unwrap();
     loan.publish();
 
     let guard = stream.try_recv().unwrap();
@@ -59,8 +59,8 @@ fn pubsub_guard_survives_ring_overwrite() {
     let stream = sub.subscribe("/data").unwrap();
 
     // Publish first sample
-    let mut loan = pub_.loan(&topic);
-    loan.set_data(b"first");
+    let mut loan = pub_.loan(&topic).unwrap();
+    loan.set_data(b"first").unwrap();
     loan.publish();
 
     // Read and HOLD the guard
@@ -69,8 +69,8 @@ fn pubsub_guard_survives_ring_overwrite() {
 
     // Overwrite the ring 10x (ring_depth=4, so slot 0 is overwritten)
     for i in 0u32..10 {
-        let mut loan = pub_.loan(&topic);
-        loan.set_data(&i.to_le_bytes());
+        let mut loan = pub_.loan(&topic).unwrap();
+        loan.set_data(&i.to_le_bytes()).unwrap();
         loan.publish();
     }
 
@@ -90,12 +90,12 @@ fn pubsub_multiple_topics() {
     let s1 = sub.subscribe("/a").unwrap();
     let s2 = sub.subscribe("/b").unwrap();
 
-    let mut loan = pub_.loan(&t1);
-    loan.set_data(b"alpha");
+    let mut loan = pub_.loan(&t1).unwrap();
+    loan.set_data(b"alpha").unwrap();
     loan.publish();
 
-    let mut loan = pub_.loan(&t2);
-    loan.set_data(b"beta");
+    let mut loan = pub_.loan(&t2).unwrap();
+    loan.set_data(b"beta").unwrap();
     loan.publish();
 
     assert_eq!(&*s1.try_recv().unwrap(), b"alpha");
@@ -117,14 +117,14 @@ fn pubsub_loan_dropped_without_publish() {
 
     // Allocate and drop 20 loans without publishing — if blocks leak, we'd panic
     for _ in 0..20 {
-        let mut loan = pub_.loan(&topic);
-        loan.set_data(b"unused");
+        let mut loan = pub_.loan(&topic).unwrap();
+        loan.set_data(b"unused").unwrap();
         drop(loan); // should free the block
     }
 
     // Still works — blocks were returned to pool
-    let mut loan = pub_.loan(&topic);
-    loan.set_data(b"ok");
+    let mut loan = pub_.loan(&topic).unwrap();
+    loan.set_data(b"ok").unwrap();
     loan.publish();
 }
 
@@ -139,13 +139,13 @@ fn pubsub_born_in_shm_pattern() {
     let stream = sub.subscribe("/sensor").unwrap();
 
     // Write a struct directly into SHM (born-in-SHM)
-    let mut loan = pub_.loan(&topic);
+    let mut loan = pub_.loan(&topic).unwrap();
     let buf = loan.as_mut_slice();
     let ts: u64 = 1234567890;
     let value: f64 = std::f64::consts::PI;
     buf[..8].copy_from_slice(&ts.to_le_bytes());
     buf[8..16].copy_from_slice(&value.to_le_bytes());
-    loan.set_len(16);
+    loan.set_len(16).unwrap();
     loan.publish();
 
     let guard = stream.try_recv().unwrap();
@@ -166,8 +166,8 @@ fn pubsub_sequential_consistency() {
 
     // Publish 100 sequential values
     for i in 0u64..100 {
-        let mut loan = pub_.loan(&topic);
-        loan.set_data(&i.to_le_bytes());
+        let mut loan = pub_.loan(&topic).unwrap();
+        loan.set_data(&i.to_le_bytes()).unwrap();
         loan.publish();
     }
 
@@ -181,4 +181,5 @@ fn pubsub_sequential_consistency() {
         last = Some(val);
     }
     assert!(last.is_some(), "should have received at least one sample");
+    assert_eq!(last, Some(99));
 }
