@@ -44,6 +44,16 @@ impl core::fmt::Debug for Subscription {
     }
 }
 
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        let off = topic_entry_off(self.topic_idx);
+        let counter = unsafe {
+            &*(self.region.base_ptr().add(off + TE_SUBSCRIBER_COUNT) as *const AtomicU32)
+        };
+        counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 impl Subscription {
     fn write_seq_atom(&self) -> &AtomicU64 {
         let off = topic_entry_off(self.topic_idx);
@@ -411,6 +421,29 @@ impl Subscription {
                         true,
                     );
                     self.waiters_atom().fetch_sub(1, Ordering::Release);
+
+                    // Check heartbeat on timeout
+                    if result.is_err() {
+                        self.region.check_heartbeat()?;
+                    }
+                }
+                #[cfg(target_arch = "x86_64")]
+                WaitStrategy::MonitorWait => {
+                    // UMONITOR/UMWAIT: monitor the write_seq futex address
+                    // for cache-line writes. On CPUs without WAITPKG, this
+                    // falls back to PAUSE inside monitor_wait_on_address.
+                    let seq_futex = unsafe {
+                        &*(self.write_seq_atom() as *const AtomicU64 as *const AtomicU32)
+                    };
+                    let cur = seq_futex.load(Ordering::Acquire);
+                    if let Some(g) = try_fn() {
+                        return Ok(g);
+                    }
+                    let result = notify::wait_until_not_monitored(
+                        seq_futex,
+                        cur,
+                        Duration::from_millis(poll_ms),
+                    );
 
                     // Check heartbeat on timeout
                     if result.is_err() {

@@ -229,6 +229,28 @@ pub unsafe extern "C" fn crossbar_publish(
     0
 }
 
+/// Returns the number of active subscribers for a topic.
+/// Returns 0 if `pub_` is null or the handle is invalid.
+///
+/// # Safety
+///
+/// `pub_` must be a valid publisher pointer.
+#[no_mangle]
+pub unsafe extern "C" fn crossbar_topic_subscriber_count(
+    pub_: *mut ShmPublisher,
+    topic: CrossbarTopic,
+) -> u32 {
+    if pub_.is_null() {
+        return 0;
+    }
+    let pub_ = &*pub_;
+    let handle = crate::platform::loan::TopicHandle {
+        topic_idx: topic.topic_idx,
+        publisher_id: topic.publisher_id,
+    };
+    pub_.subscriber_count(&handle).unwrap_or(0)
+}
+
 // ---- Subscriber ----
 
 /// Connects to an existing publisher region. Returns `NULL` on error.

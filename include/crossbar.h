@@ -73,6 +73,9 @@ int crossbar_publish(
     size_t len
 );
 
+/* Returns the number of active subscribers for a topic. Returns 0 if pub_ is NULL. */
+uint32_t crossbar_topic_subscriber_count(crossbar_publisher_t* pub_, crossbar_topic_t topic);
+
 /* ---- Subscriber ---- */
 
 /* Connects to an existing publisher region. Returns NULL on error. */

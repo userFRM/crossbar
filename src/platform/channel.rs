@@ -49,8 +49,8 @@ use super::subscription::{SampleGuard, Subscription};
 pub struct ShmChannel {
     tx_pub: ShmPublisher,
     tx_topic: TopicHandle,
-    _rx_sub: ShmSubscriber, // keeps mmap alive
-    pub(crate) rx: Subscription,
+    pub(crate) rx: Subscription, // must drop before _rx_sub to avoid use-after-unmap
+    _rx_sub: ShmSubscriber,      // keeps mmap alive
 }
 
 impl core::fmt::Debug for ShmChannel {

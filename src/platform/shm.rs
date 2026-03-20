@@ -826,6 +826,29 @@ impl ShmPublisher {
             readers,
         })
     }
+
+    /// Returns the number of active subscribers for a topic.
+    ///
+    /// This is an informational counter stored in shared memory. It is
+    /// incremented when a [`Subscription`] is created and decremented when
+    /// the subscription is dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpcError::InvalidRegion`] if the handle belongs to a
+    /// different publisher.
+    pub fn subscriber_count(&self, handle: &TopicHandle) -> Result<u32, IpcError> {
+        if handle.publisher_id != self.id {
+            return Err(IpcError::InvalidRegion(
+                "TopicHandle belongs to a different ShmPublisher".into(),
+            ));
+        }
+        let off = topic_entry_off(handle.topic_idx);
+        let counter = unsafe {
+            &*(self.region.base_ptr().add(off + TE_SUBSCRIBER_COUNT) as *const AtomicU32)
+        };
+        Ok(counter.load(Ordering::Relaxed))
+    }
 }
 
 impl Drop for ShmPublisher {
@@ -937,6 +960,11 @@ impl ShmSubscriber {
             let current = write_seq.load(Ordering::Acquire);
 
             let type_size = unsafe { (base_ptr.add(off + TE_TYPE_SIZE) as *const u32).read() };
+
+            // Increment per-topic subscriber count
+            let sub_count =
+                unsafe { &*(base_ptr.add(off + TE_SUBSCRIBER_COUNT) as *const AtomicU32) };
+            sub_count.fetch_add(1, Ordering::Relaxed);
 
             return Ok(Subscription {
                 region: Arc::clone(&self.region),

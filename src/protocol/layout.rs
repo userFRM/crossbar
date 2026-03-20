@@ -76,6 +76,8 @@ mod inner {
     pub(crate) const TE_PINNED_READERS: usize = 0x68;
     /// Pinned-publish seqlock: packed (seq:32 | data_len:32) in AtomicU64.
     pub(crate) const TE_PINNED_SEQ: usize = 0x70;
+    /// Per-topic subscriber count (AtomicU32). Incremented on subscribe, decremented on drop.
+    pub(crate) const TE_SUBSCRIBER_COUNT: usize = 0x78;
 
     // Ring entry offsets (relative to entry start)
     pub(crate) const RE_SEQ: usize = 0; // AtomicU64 (seqlock)

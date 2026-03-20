@@ -12,10 +12,12 @@ mod channel;
 pub(crate) mod loan;
 mod mmap;
 pub(crate) mod notify;
+mod pod_bus;
 mod shm;
 pub(crate) mod subscription;
 
 pub use channel::ShmChannel;
 pub use loan::{PinnedLoan, ShmLoan, TopicHandle, TypedShmLoan};
+pub use pod_bus::{PodBus, PodSubscriber};
 pub use shm::{ShmPublisher, ShmSubscriber};
 pub use subscription::{PinnedGuard, SampleGuard, Subscription, TypedSampleGuard};

@@ -1,6 +1,6 @@
 [package]
 name = "crossbar"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "Zero-copy pub/sub over shared memory. URI-addressed. O(1) transfer at any payload size."
 license = "Apache-2.0"
@@ -41,5 +41,9 @@ name = "subscriber"
 
 [[bench]]
 name = "pubsub"
+harness = false
+
+[[bench]]
+name = "pod_bus"
 harness = false
 

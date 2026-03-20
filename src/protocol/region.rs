@@ -324,6 +324,25 @@ impl Region {
         let entry_ptr = unsafe { self.base.add(entry_off) };
         let entry_seq = unsafe { &*(entry_ptr.add(RE_SEQ) as *const AtomicU64) };
 
+        // Prefetch next slot (slot+1, masked to ring depth) to hide the RFO stall
+        let next_slot = ((seq + 1) & ring_mask) as u32;
+        let next_entry_off = ring_entry_off(&self.config, topic_idx, next_slot);
+        let next_entry_ptr = unsafe { self.base.add(next_entry_off) };
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(
+                next_entry_ptr as *const i8,
+            );
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            core::arch::asm!(
+                "prfm pstl1keep, [{addr}]",
+                addr = in(reg) next_entry_ptr,
+                options(nostack, preserves_flags)
+            );
+        }
+
         // 2. Acquire the ring slot via CAS (prevents two publishers from
         //    writing the same slot when seqs differ by exactly ring_depth).
         //    Single-publisher mode skips the CAS loop entirely.

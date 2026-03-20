@@ -62,6 +62,6 @@ pub use wait::WaitStrategy;
 // std-only exports
 #[cfg(feature = "std")]
 pub use platform::{
-    PinnedGuard, PinnedLoan, SampleGuard, ShmChannel, ShmLoan, ShmPublisher, ShmSubscriber,
-    Subscription, TopicHandle, TypedSampleGuard, TypedShmLoan,
+    PinnedGuard, PinnedLoan, PodBus, PodSubscriber, SampleGuard, ShmChannel, ShmLoan, ShmPublisher,
+    ShmSubscriber, Subscription, TopicHandle, TypedSampleGuard, TypedShmLoan,
 };

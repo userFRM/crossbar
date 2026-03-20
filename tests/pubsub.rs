@@ -1,5 +1,30 @@
 use crossbar::*;
 
+// ─── subscriber count tests ─────────────────────────────────────────────
+
+#[test]
+fn subscriber_count_tracks_subscriptions() {
+    let name = &format!("test-sub-count-{}", std::process::id());
+    let mut pub_ = ShmPublisher::create(name, PubSubConfig::default()).unwrap();
+    let topic = pub_.register("/data").unwrap();
+
+    assert_eq!(pub_.subscriber_count(&topic).unwrap(), 0);
+
+    let sub1 = ShmSubscriber::connect(name).unwrap();
+    let _s1 = sub1.subscribe("/data").unwrap();
+    assert_eq!(pub_.subscriber_count(&topic).unwrap(), 1);
+
+    let sub2 = ShmSubscriber::connect(name).unwrap();
+    let _s2 = sub2.subscribe("/data").unwrap();
+    assert_eq!(pub_.subscriber_count(&topic).unwrap(), 2);
+
+    drop(_s1);
+    assert_eq!(pub_.subscriber_count(&topic).unwrap(), 1);
+
+    drop(_s2);
+    assert_eq!(pub_.subscriber_count(&topic).unwrap(), 0);
+}
+
 // ─── O(1) pub/sub tests ─────────────────────────────────────────────────
 
 #[test]
