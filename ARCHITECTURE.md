@@ -26,6 +26,7 @@ src/
     subscription.rs  Subscription, SampleGuard, TypedSampleGuard
     loan.rs       ShmLoan, TypedShmLoan, TopicHandle
     channel.rs    ShmChannel — bidirectional channel
+    pod_bus.rs    PodBus, PodSubscriber — SPMC broadcast ring
 
 include/
   crossbar.h      C/C++ header
@@ -64,6 +65,10 @@ One mmap region — three logical areas:
 |   0x18 URI_HASH (u64)     |  FNV-1a
 |   0x20 URI      (64B)     |
 |   0x60 TYPE_SIZE(u32)     |  size_of::<T>() for typed topics; 0 = untyped
+|   0x64 PINNED_BLOCK (u32) |  block index for pinned publish; NO_BLOCK = none
+|   0x68 PINNED_READERS     |  AtomicU32 — active pinned-read guard count
+|   0x70 PINNED_SEQ  (u64)  |  AtomicU64 — packed (seq:32 | data_len:32) seqlock
+|   0x78 SUBSCRIBER_COUNT   |  AtomicU32 — live Subscription count for this topic
 +---------------------------+
 | Topic Entry 1 …           |
 +---------------------------+
@@ -83,7 +88,7 @@ One mmap region — three logical areas:
 +---------------------------+
 ```
 
-Hot topic fields (`ACTIVE`, `NOTIFY`, `WRITE_SEQ`, `WAITERS`) are packed into the first cache line of each topic entry to avoid cache misses on the subscriber polling path.
+Hot topic fields (`ACTIVE`, `WRITE_SEQ`, `WAITERS`) are packed into the first cache line of each topic entry to avoid cache misses on the subscriber polling path.
 
 ---
 
@@ -231,3 +236,78 @@ Key design decisions:
 - **Value-type topic handle** — `crossbar_topic_t` is a small `#[repr(C)]` struct, safe to copy.
 
 Build: `cargo rustc --release --features ffi --crate-type cdylib`
+
+---
+
+## PodBus — SPMC broadcast ring
+
+`PodBus<T: Pod>` is a single-producer, multi-consumer broadcast ring for `Pod` types. It lives entirely in process memory (no SHM) and is designed for high fan-out scenarios where one producer feeds many consumers with the same data stream.
+
+**Architecture:**
+
+```
+PodBus<T>
+  ring: Box<[Slot<T>]>     power-of-two array of seqlock-stamped slots
+  mask: u64                 ring_size - 1, for bitmask indexing
+  write_seq: AtomicU64      monotonic publish counter
+
+Slot<T>
+  stamp: AtomicU64          seqlock: 0 = never written, odd = writing, even = committed
+  data: UnsafeCell<T>       payload (volatile read/write)
+
+PodSubscriber<T>
+  cursor: u64               independent read position per consumer
+```
+
+**Seqlock stamp protocol:**
+
+- `0` — slot never written
+- `seq * 2 + 1` (odd) — write in progress, readers must retry
+- `(seq + 1) * 2` (even) — committed and readable
+
+The publisher writes the data between the odd and even stamp transitions. Subscribers snapshot the stamp, read via `read_volatile`, then verify the stamp is unchanged. If the stamp changed mid-read, the data was torn and the read is discarded.
+
+**Key properties:**
+
+- Publish is O(1) regardless of subscriber count — no per-subscriber bookkeeping
+- Each `PodSubscriber` tracks its own cursor independently
+- Subscribers that fall behind auto-skip to the oldest available data (lossy)
+- `T: Pod` ensures all bit patterns are valid, so torn reads are harmless (just discarded)
+- No heap allocation on publish or receive
+
+---
+
+## MonitorWait — UMONITOR/UMWAIT
+
+`WaitStrategy::MonitorWait` is an x86_64-only wait strategy that uses Intel's WAITPKG instructions (available on Tremont, Alder Lake, and newer microarchitectures) for cache-line-aware low-power waiting.
+
+**CPUID detection:**
+
+WAITPKG support is detected via `CPUID leaf 7, sub-leaf 0, ECX bit 5`. The result is cached in a static `AtomicU8` with racy initialization (benign — worst case is redundant `CPUID` calls on first access).
+
+**Instruction encoding:**
+
+`UMONITOR` and `UMWAIT` are not available as stable Rust intrinsics, so they are encoded as raw `.byte` sequences in inline assembly:
+
+- `UMONITOR rax` — `F3 0F AE F0` — sets up monitoring on the cache line containing the address in `rax`
+- `UMWAIT ecx` — `F2 0F AE F1` — waits until a store hits the monitored cache line, or a TSC deadline expires
+
+**Usage in blocking_recv:**
+
+In `blocking_recv`, when `MonitorWait` is the active strategy, the subscriber monitors the `WRITE_SEQ` futex address via `UMONITOR`, then enters C0.1 low-power state via `UMWAIT` with a ~100 us TSC deadline (~300,000 cycles at 3 GHz). A publisher's store to `WRITE_SEQ` invalidates the monitored cache line and wakes the subscriber with ~30 ns latency.
+
+**Fallback:**
+
+On CPUs without WAITPKG, `monitor_wait_on_address` falls back to `PAUSE`. The generic `WaitStrategy::wait()` method (which has no address to monitor) also falls back to `PAUSE`.
+
+---
+
+## Subscriber count
+
+Each topic entry contains an `AtomicU32` counter at offset `0x78` (`TE_SUBSCRIBER_COUNT`) that tracks the number of live `Subscription` objects for that topic.
+
+- **Increment**: When `ShmSubscriber::subscribe()` creates a new `Subscription`, the counter is incremented via `fetch_add(1, Relaxed)`.
+- **Decrement**: `Subscription` implements `Drop`, which decrements the counter via `fetch_sub(1, Relaxed)`.
+- **Query**: `ShmPublisher::subscriber_count(&self, handle) -> Result<u32, IpcError>` reads the counter. The FFI equivalent is `crossbar_topic_subscriber_count()`.
+
+The counter uses `Relaxed` ordering because it is advisory — publishers use it for monitoring and graceful shutdown, not for correctness-critical synchronization. The `ShmChannel` field order ensures `rx: Subscription` is declared before `_rx_sub: ShmSubscriber`, so the subscription drops (and decrements the counter) before the subscriber unmaps the region.
