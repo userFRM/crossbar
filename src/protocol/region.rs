@@ -108,24 +108,30 @@ impl Region {
         unsafe { &*(self.block_ptr(idx).add(BK_REFCOUNT) as *const AtomicU32) }
     }
 
+    /// Allocates a block from the free-list.
+    ///
+    /// Returns:
+    /// - `Ok(Some(idx))` — success, block `idx` was allocated.
+    /// - `Ok(None)` — pool empty (normal backpressure).
+    /// - `Err(())` — free-list corruption detected (out-of-bounds index).
     #[inline]
-    pub(crate) fn alloc_block(&self) -> Option<u32> {
+    pub(crate) fn alloc_block(&self) -> Result<Option<u32>, ()> {
         let mut head = self.pool_head().load(Ordering::Acquire);
         loop {
             let (gen, idx) = unpack(head);
             if idx == NO_BLOCK {
-                return None;
+                return Ok(None);
             }
             // Validate idx is within bounds (H6: free-list corruption defense)
             if (idx as usize) >= self.config.block_count as usize {
-                return None;
+                return Err(());
             }
             let block = self.block_ptr(idx);
             let next = unsafe { &*(block as *const AtomicU32) }.load(Ordering::Relaxed);
 
             // Validate next pointer too (defense against corrupted free-list)
             if next != NO_BLOCK && (next as usize) >= self.config.block_count as usize {
-                return None;
+                return Err(());
             }
 
             let new_head = pack(gen.wrapping_add(1), next);
@@ -152,7 +158,7 @@ impl Region {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Some(idx),
+                Ok(_) => return Ok(Some(idx)),
                 Err(current) => head = current,
             }
         }
@@ -349,9 +355,16 @@ impl Region {
         if single_publisher {
             entry_seq.store(SEQ_WRITING, Ordering::Release);
         } else {
+            let mut spin_count = 0u32;
             loop {
                 let current = entry_seq.load(Ordering::Acquire);
                 if current == SEQ_WRITING {
+                    spin_count += 1;
+                    if spin_count > 1_000_000 {
+                        // Slot stuck in WRITING state — likely a crashed publisher.
+                        // Force-claim it by overwriting.
+                        break;
+                    }
                     crate::wait::yield_hint();
                     continue;
                 }

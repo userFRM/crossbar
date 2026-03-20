@@ -43,9 +43,7 @@ fn lock_path(name: &str) -> PathBuf {
 /// Validate segment name against path traversal (C2).
 fn validate_name(name: &str) -> Result<(), IpcError> {
     if !is_valid_segment_name(name) {
-        return Err(IpcError::InvalidRegion(format!(
-            "invalid segment name '{name}': must be non-empty and contain no '/', '\\\\', '..', or null bytes"
-        )));
+        return Err(IpcError::SegmentNameInvalid(name.into()));
     }
     Ok(())
 }
@@ -56,9 +54,7 @@ fn exclusive_lock(file: &std::fs::File, name: &str) -> Result<(), IpcError> {
     use std::os::unix::io::AsRawFd;
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc != 0 {
-        return Err(IpcError::InvalidRegion(format!(
-            "pub/sub region '{name}' is already active (lock held)"
-        )));
+        return Err(IpcError::LockContention(name.into()));
     }
     Ok(())
 }
@@ -81,9 +77,7 @@ fn exclusive_lock(file: &std::fs::File, name: &str) -> Result<(), IpcError> {
         )
     };
     if ok == 0 {
-        return Err(IpcError::InvalidRegion(format!(
-            "pub/sub region '{name}' is already active (lock held)"
-        )));
+        return Err(IpcError::LockContention(name.into()));
     }
     Ok(())
 }
@@ -98,9 +92,7 @@ fn shared_lock(file: &std::fs::File, name: &str) -> Result<(), IpcError> {
     // If this fd already holds LOCK_EX, atomically downgrades to shared.
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) };
     if rc != 0 {
-        return Err(IpcError::InvalidRegion(format!(
-            "pub/sub region '{name}' cannot acquire shared lock"
-        )));
+        return Err(IpcError::LockContention(name.into()));
     }
     Ok(())
 }
@@ -136,9 +128,7 @@ fn shared_lock(file: &std::fs::File, name: &str) -> Result<(), IpcError> {
         )
     };
     if ok == 0 {
-        return Err(IpcError::InvalidRegion(format!(
-            "pub/sub region '{name}' cannot acquire shared lock"
-        )));
+        return Err(IpcError::LockContention(name.into()));
     }
     Ok(())
 }
@@ -198,9 +188,29 @@ fn open_and_validate_region(
 ) -> Result<(RawMmap, Arc<Region>, PathBuf), IpcError> {
     let path = shm_path(name);
 
+    // Symlink defense: open with O_NOFOLLOW on Unix to prevent symlink attacks.
+    // This is atomic (no TOCTOU) unlike a pre-open symlink_metadata check.
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true).write(needs_write);
+        opts.custom_flags(libc::O_NOFOLLOW);
+        opts.open(&path).map_err(|e| {
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                IpcError::SegmentNameInvalid(format!(
+                    "SHM path is a symlink (possible attack): {}",
+                    path.display()
+                ))
+            } else {
+                IpcError::Io(e)
+            }
+        })?
+    };
+    #[cfg(not(unix))]
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .write(needs_write) // needed for atomic CAS on refcounts
+        .write(needs_write)
         .open(&path)
         .map_err(IpcError::Io)?;
 
@@ -271,8 +281,7 @@ fn open_and_validate_region(
     }
 
     // Use checked arithmetic to prevent overflow (M6)
-    let expected_size = region_size_checked(&config)
-        .ok_or_else(|| IpcError::InvalidRegion("region size computation overflow".into()))?;
+    let expected_size = region_size_checked(&config).ok_or(IpcError::RegionSizeOverflow)?;
 
     if mmap.len() < expected_size {
         return Err(IpcError::InvalidRegion(format!(
@@ -328,31 +337,39 @@ pub struct ShmPublisher {
 impl ShmPublisher {
     /// Allocates a block from the local cache, refilling from the global pool on miss.
     /// Checks the recycled (cache-warm) block first for optimal L1/L2 reuse.
-    fn alloc_cached(&mut self) -> Option<u32> {
+    ///
+    /// Returns `Ok(Some(idx))` on success, `Ok(None)` if the pool is exhausted,
+    /// or `Err(RegionCorrupted)` if free-list corruption is detected.
+    fn alloc_cached(&mut self) -> Result<Option<u32>, IpcError> {
         // First: check for a recycled block (cache-warm from last publish)
         if let Some(idx) = self.region.alloc_recycled() {
-            return Some(idx);
+            return Ok(Some(idx));
         }
         // Then: check the local cache
         if self.cache_len > 0 {
             self.cache_len -= 1;
-            return Some(self.block_cache[self.cache_len as usize]);
+            return Ok(Some(self.block_cache[self.cache_len as usize]));
         }
         // Finally: refill from global Treiber stack
         while (self.cache_len as usize) < self.block_cache.len() {
             match self.region.alloc_block() {
-                Some(idx) => {
+                Ok(Some(idx)) => {
                     self.block_cache[self.cache_len as usize] = idx;
                     self.cache_len += 1;
                 }
-                None => break,
+                Ok(None) => break,
+                Err(()) => {
+                    return Err(IpcError::RegionCorrupted(
+                        "free-list contains out-of-bounds block index".into(),
+                    ));
+                }
             }
         }
         if self.cache_len > 0 {
             self.cache_len -= 1;
-            Some(self.block_cache[self.cache_len as usize])
+            Ok(Some(self.block_cache[self.cache_len as usize]))
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -362,9 +379,7 @@ impl ShmPublisher {
     fn loan_preamble(&mut self, handle: &TopicHandle) -> Result<(u32, u32), IpcError> {
         // Runtime check: reject handles from a different publisher (Codex HIGH)
         if handle.publisher_id != self.id {
-            return Err(IpcError::InvalidRegion(
-                "TopicHandle belongs to a different ShmPublisher".into(),
-            ));
+            return Err(IpcError::HandleMismatch);
         }
 
         // Counter-based heartbeat: check clock every 1024 loans, not every loan.
@@ -378,7 +393,7 @@ impl ShmPublisher {
             }
         }
 
-        let block_idx = self.alloc_cached().ok_or(IpcError::PoolExhausted)?;
+        let block_idx = self.alloc_cached()?.ok_or(IpcError::PoolExhausted)?;
 
         Ok((block_idx, handle.topic_idx))
     }
@@ -419,8 +434,7 @@ impl ShmPublisher {
         }
 
         // Check for overflow in region size computation (M6)
-        let size = region_size_checked(&config)
-            .ok_or_else(|| IpcError::InvalidRegion("region size computation overflow".into()))?;
+        let size = region_size_checked(&config).ok_or(IpcError::RegionSizeOverflow)?;
 
         let path = shm_path(name);
         let lpath = lock_path(name);
@@ -442,15 +456,29 @@ impl ShmPublisher {
         // Remove stale file
         let _ = std::fs::remove_file(&path);
 
+        // Create with O_NOFOLLOW + O_EXCL on Unix to atomically prevent
+        // symlink attacks (no TOCTOU between remove and open).
         let file = {
             let mut opts = std::fs::OpenOptions::new();
             opts.read(true).write(true).create(true).truncate(true);
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(0o600); // H8: restrictive permissions
+                opts.mode(0o600);
+                opts.custom_flags(libc::O_NOFOLLOW);
+                // TODO: Windows DACL — use SECURITY_ATTRIBUTES with owner-only
+                // DACL via Win32_Security to match Unix 0o600.
             }
-            opts.open(&path).map_err(IpcError::Io)?
+            opts.open(&path).map_err(|e| {
+                #[cfg(unix)]
+                if e.raw_os_error() == Some(libc::ELOOP) {
+                    return IpcError::SegmentNameInvalid(format!(
+                        "SHM path is a symlink (possible attack): {}",
+                        path.display()
+                    ));
+                }
+                IpcError::Io(e)
+            })?
         };
         file.set_len(size as u64).map_err(IpcError::Io)?;
 
@@ -585,20 +613,20 @@ impl ShmPublisher {
     pub fn register_typed<T: crate::Pod>(&mut self, uri: &str) -> Result<TopicHandle, IpcError> {
         const { assert!(core::mem::align_of::<u128>() <= 16) }; // sanity
         if core::mem::align_of::<T>() > 8 {
-            return Err(IpcError::InvalidRegion(format!(
-                "Pod type alignment ({}) exceeds block data offset (8)",
-                core::mem::align_of::<T>()
-            )));
+            return Err(IpcError::AlignmentError {
+                align: core::mem::align_of::<T>(),
+                max: 8,
+            });
         }
         self.register_inner(uri, core::mem::size_of::<T>() as u32)
     }
 
     fn register_inner(&mut self, uri: &str, type_size: u32) -> Result<TopicHandle, IpcError> {
         if uri.len() > TE_URI_MAX {
-            return Err(IpcError::InvalidRegion(format!(
-                "topic URI too long ({} > {TE_URI_MAX})",
-                uri.len()
-            )));
+            return Err(IpcError::UriTooLong {
+                len: uri.len(),
+                max: TE_URI_MAX,
+            });
         }
         let hash = uri_hash(uri);
 
@@ -672,7 +700,7 @@ impl ShmPublisher {
             });
         }
 
-        Err(IpcError::InvalidRegion("maximum topics reached".into()))
+        Err(IpcError::MaxTopicsReached)
     }
 
     /// Updates the publisher heartbeat. Call this periodically during idle
@@ -767,9 +795,7 @@ impl ShmPublisher {
     /// - [`IpcError::PoolExhausted`] if the pool is exhausted (first call only).
     pub fn loan_pinned(&mut self, handle: &TopicHandle) -> Result<PinnedLoan<'_>, IpcError> {
         if handle.publisher_id != self.id {
-            return Err(IpcError::InvalidRegion(
-                "TopicHandle belongs to a different ShmPublisher".into(),
-            ));
+            return Err(IpcError::HandleMismatch);
         }
         let topic_idx = handle.topic_idx;
 
@@ -786,7 +812,7 @@ impl ShmPublisher {
         let block_idx = if self.pinned_blocks[topic_idx as usize] != NO_BLOCK {
             self.pinned_blocks[topic_idx as usize]
         } else {
-            let idx = self.alloc_cached().ok_or(IpcError::PoolExhausted)?;
+            let idx = self.alloc_cached()?.ok_or(IpcError::PoolExhausted)?;
             self.pinned_blocks[topic_idx as usize] = idx;
             // Store in SHM topic entry so subscribers can find it
             self.region.set_pinned_block(topic_idx, idx);
@@ -835,13 +861,11 @@ impl ShmPublisher {
     ///
     /// # Errors
     ///
-    /// Returns [`IpcError::InvalidRegion`] if the handle belongs to a
+    /// Returns [`IpcError::HandleMismatch`] if the handle belongs to a
     /// different publisher.
     pub fn subscriber_count(&self, handle: &TopicHandle) -> Result<u32, IpcError> {
         if handle.publisher_id != self.id {
-            return Err(IpcError::InvalidRegion(
-                "TopicHandle belongs to a different ShmPublisher".into(),
-            ));
+            return Err(IpcError::HandleMismatch);
         }
         let off = topic_entry_off(handle.topic_idx);
         let counter = unsafe {
@@ -974,6 +998,6 @@ impl ShmSubscriber {
             });
         }
 
-        Err(IpcError::InvalidRegion(format!("topic '{uri}' not found")))
+        Err(IpcError::TopicNotFound(uri.into()))
     }
 }

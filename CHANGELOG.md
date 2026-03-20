@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.5.0 — 2026-03-20
+
+### Added
+- `ShmPublisher::subscriber_count()` — query active subscriber count per topic.
+- `crossbar_topic_subscriber_count()` FFI function.
+- `WaitStrategy::MonitorWait` — Intel UMONITOR/UMWAIT on Alder Lake+ (x86_64 only).
+- `PodBus<T: Pod>` — SPMC broadcast ring over shared memory.
+- `PodBusSubscriber<T: Pod>` — per-consumer cursor for PodBus.
+- Prefetch next ring slot on publish (PREFETCHT0/PRFM).
+- `Subscription` implements `Drop` (decrements subscriber count).
+- `TE_SUBSCRIBER_COUNT` field at offset 0x78 in topic entry.
+
+### Changed
+- `ShmChannel` field drop order fixed (subscription drops before subscriber).
+
 ## 0.4.0 — 2026-03-19
 
 ### Breaking Changes

@@ -42,6 +42,43 @@ pub enum IpcError {
 
     /// The system clock is before UNIX epoch (NTP jump, VM restore).
     ClockError,
+
+    /// A subscribe() call could not find the requested URI in the topic table.
+    TopicNotFound(alloc::string::String),
+
+    /// A register() call ran out of topic slots.
+    MaxTopicsReached,
+
+    /// The topic URI exceeds the maximum allowed length.
+    UriTooLong {
+        /// Actual URI length.
+        len: usize,
+        /// Maximum allowed length.
+        max: usize,
+    },
+
+    /// An exclusive lock is already held on the region (another publisher is active).
+    LockContention(alloc::string::String),
+
+    /// A `Pod` type's alignment exceeds the block data alignment.
+    AlignmentError {
+        /// Actual type alignment.
+        align: usize,
+        /// Maximum supported alignment.
+        max: usize,
+    },
+
+    /// The segment name is invalid (empty, contains path separators, null bytes, or `..`).
+    SegmentNameInvalid(alloc::string::String),
+
+    /// A `TopicHandle` was used with a different `ShmPublisher` than the one that created it.
+    HandleMismatch,
+
+    /// Checked arithmetic overflow during region size computation.
+    RegionSizeOverflow,
+
+    /// The shared-memory region's free-list is corrupted (out-of-bounds block index).
+    RegionCorrupted(alloc::string::String),
 }
 
 impl fmt::Display for IpcError {
@@ -73,6 +110,40 @@ impl fmt::Display for IpcError {
             }
             IpcError::ClockError => {
                 write!(f, "system clock is before UNIX epoch")
+            }
+            IpcError::TopicNotFound(uri) => {
+                write!(f, "topic '{uri}' not found")
+            }
+            IpcError::MaxTopicsReached => {
+                write!(f, "maximum topics reached")
+            }
+            IpcError::UriTooLong { len, max } => {
+                write!(f, "topic URI too long ({len} > {max})")
+            }
+            IpcError::LockContention(name) => {
+                write!(f, "pub/sub region '{name}' is already active (lock held)")
+            }
+            IpcError::AlignmentError { align, max } => {
+                write!(
+                    f,
+                    "Pod type alignment ({align}) exceeds block data offset ({max})"
+                )
+            }
+            IpcError::SegmentNameInvalid(name) => {
+                write!(
+                    f,
+                    "invalid segment name '{name}': must be non-empty and contain \
+                     no '/', '\\', '..', or null bytes"
+                )
+            }
+            IpcError::HandleMismatch => {
+                write!(f, "TopicHandle belongs to a different ShmPublisher")
+            }
+            IpcError::RegionSizeOverflow => {
+                write!(f, "region size computation overflow")
+            }
+            IpcError::RegionCorrupted(msg) => {
+                write!(f, "shared-memory region corrupted: {msg}")
             }
         }
     }
