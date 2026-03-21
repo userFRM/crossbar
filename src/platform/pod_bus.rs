@@ -1042,21 +1042,8 @@ fn claim_subscriber_slot(
         let slot_base = unsafe { slots_base.add(i * SUBSCRIBER_SLOT_SIZE) };
         let active_atomic = unsafe { &*(slot_base.add(SS_ACTIVE) as *const AtomicU32) };
 
-        // Only attempt slots that appear FREE. Skip ACTIVE/CLAIMING.
-        if active_atomic.load(Ordering::Relaxed) != SS_STATE_FREE {
-            continue;
-        }
-
-        // Write claim timestamp into cursor BEFORE the CAS. This only
-        // runs on slots that appeared FREE (non-owner writes to ACTIVE
-        // slots are avoided by the check above). Multiple claimants
-        // racing on the same FREE slot all write recent timestamps —
-        // the pruner's 5s threshold is never triggered by a live claim.
-        let cursor_atomic = unsafe { &*(slot_base.add(SS_CURSOR) as *const AtomicU64) };
-        let ts = now_micros().unwrap_or(0);
-        cursor_atomic.store(ts, Ordering::Relaxed);
-
         // CAS FREE(0) -> CLAIMING(2) to claim ownership.
+        // All writes happen AFTER the CAS — only the winner writes.
         if active_atomic
             .compare_exchange(
                 SS_STATE_FREE,
@@ -1066,15 +1053,37 @@ fn claim_subscriber_slot(
             )
             .is_ok()
         {
-            // We own this slot. Write PID (only CAS winner writes here).
+            // We own this slot. Write claim timestamp into cursor field
+            // as the FIRST post-CAS operation. The pruner uses this to
+            // detect stuck CLAIMING slots (>5s old). u64::MAX is NOT used
+            // as sentinel because the pruner checks `now - cursor > 5s`.
+            let cursor_atomic = unsafe { &*(slot_base.add(SS_CURSOR) as *const AtomicU64) };
+            let ts = now_micros().unwrap_or(0);
+            cursor_atomic.store(ts, Ordering::Release);
+
+            // Write PID (only CAS winner writes here).
             let pid_atomic = unsafe { &*(slot_base.add(SS_PID) as *const AtomicU32) };
             pid_atomic.store(pid, Ordering::Release);
 
             // Overwrite cursor with real initial value.
             cursor_atomic.store(initial_cursor, Ordering::Release);
 
-            // Transition CLAIMING(2) -> ACTIVE(1) to make slot visible to publisher.
-            active_atomic.store(SS_STATE_ACTIVE, Ordering::Release);
+            // Transition CLAIMING(2) -> ACTIVE(1). Use CAS so that if the
+            // pruner freed this slot (rare race: pruner saw stale cursor in the
+            // nanosecond window between CAS and timestamp write), we detect it
+            // and retry instead of corrupting the state machine.
+            if active_atomic
+                .compare_exchange(
+                    SS_STATE_CLAIMING,
+                    SS_STATE_ACTIVE,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
+                .is_err()
+            {
+                // Pruner freed our slot — retry on next free slot.
+                continue;
+            }
 
             return Ok(i);
         }
