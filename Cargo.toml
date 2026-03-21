@@ -1,6 +1,6 @@
 [package]
 name = "crossbar"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "Zero-copy pub/sub over shared memory. URI-addressed. O(1) transfer at any payload size."
 license = "Apache-2.0"
