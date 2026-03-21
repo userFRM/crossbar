@@ -601,11 +601,22 @@ impl<T: Pod> PodBus<T> {
             // Only consider fully-initialized (ACTIVE) slots for backpressure.
             // CLAIMING slots are still being initialized and are not yet visible.
             if state == SS_STATE_CLAIMING {
-                // CLAIMING = mid-initialization. Do NOT prune — the claimant
-                // may be between the CAS and the PID write (nanosecond window).
-                // If the claimant dies in CLAIMING, the slot is leaked (max 64
-                // slots, bounded waste). This is safer than pruning, which
-                // races with live initialization.
+                // CLAIMING = mid-initialization. The claimant writes PID after
+                // CAS, then cursor, then transitions to ACTIVE. During CLAIMING,
+                // the cursor field holds a timestamp (micros since epoch) set at
+                // claim time. If CLAIMING persists for >5 seconds, the claimant
+                // is dead — prune it. This avoids racing with the nanosecond
+                // PID-write window while still recovering stuck slots.
+                let cursor_atomic = unsafe { &*(slot_base.add(SS_CURSOR) as *const AtomicU64) };
+                let claim_ts = cursor_atomic.load(Ordering::Relaxed);
+                if let Ok(now) = now_micros() {
+                    if now.saturating_sub(claim_ts) > 5_000_000 {
+                        // CLAIMING for >5s — claimant is dead. Prune.
+                        let pid_atomic = unsafe { &*(slot_base.add(SS_PID) as *const AtomicU32) };
+                        pid_atomic.store(0, Ordering::Relaxed);
+                        active_atomic.store(SS_STATE_FREE, Ordering::Release);
+                    }
+                }
                 continue;
             }
             if state != SS_STATE_ACTIVE {
@@ -1041,14 +1052,17 @@ fn claim_subscriber_slot(
             )
             .is_ok()
         {
-            // We own this slot now. Write PID AFTER CAS (authoritative —
-            // only the CAS winner writes here). This ensures the pruner
-            // sees the correct PID for liveness checks.
+            // We own this slot. Write claim timestamp into cursor field
+            // FIRST — the pruner uses this to detect stuck CLAIMING slots.
+            let cursor_atomic = unsafe { &*(slot_base.add(SS_CURSOR) as *const AtomicU64) };
+            let ts = now_micros().unwrap_or(0);
+            cursor_atomic.store(ts, Ordering::Release);
+
+            // Write PID (authoritative — only the CAS winner writes here).
             let pid_atomic = unsafe { &*(slot_base.add(SS_PID) as *const AtomicU32) };
             pid_atomic.store(pid, Ordering::Release);
 
-            // Write initial cursor.
-            let cursor_atomic = unsafe { &*(slot_base.add(SS_CURSOR) as *const AtomicU64) };
+            // Overwrite cursor with real initial value.
             cursor_atomic.store(initial_cursor, Ordering::Release);
 
             // Transition CLAIMING(2) -> ACTIVE(1) to make slot visible to publisher.
