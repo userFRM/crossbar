@@ -510,6 +510,63 @@ impl Sample<'_> {
     pub fn to_vec(&self) -> Vec<u8> {
         self.deref().to_vec()
     }
+
+    /// Read a `T: Pod` header from the start of the sample.
+    ///
+    /// Returns a reference pointing directly into shared memory -- zero copy.
+    ///
+    /// Returns `None` if the sample is smaller than `size_of::<T>()` or the
+    /// pointer is not properly aligned for `T`.
+    pub fn read_header<T: crate::Pod>(&self) -> Option<&T> {
+        if self.len < core::mem::size_of::<T>() {
+            return None;
+        }
+        // Check alignment
+        let ptr = self.as_ptr();
+        if !(ptr as usize).is_multiple_of(core::mem::align_of::<T>()) {
+            return None;
+        }
+        Some(unsafe { &*(ptr as *const T) })
+    }
+
+    /// Read a `[E: Pod]` array following a `T: Pod` header.
+    ///
+    /// The array starts at offset `size_of::<T>()` and the entry count
+    /// is stored as a little-endian u32 at the end of the data.
+    ///
+    /// Returns a slice pointing directly into shared memory -- zero copy.
+    ///
+    /// Returns `None` if the layout is invalid (too small, misaligned, or
+    /// the stored entry count doesn't match the available bytes).
+    pub fn read_array<T: crate::Pod, E: crate::Pod>(&self) -> Option<&[E]> {
+        let header_size = core::mem::size_of::<T>();
+        let entry_size = core::mem::size_of::<E>();
+
+        // Need at least header + 4 bytes for count
+        if self.len < header_size + 4 {
+            return None;
+        }
+
+        // Read entry count from the last 4 bytes
+        let count_offset = self.len - 4;
+        let data = &**self; // Deref to &[u8]
+        let count =
+            u32::from_le_bytes(data[count_offset..count_offset + 4].try_into().ok()?) as usize;
+
+        // Verify the array fits between header and count
+        let array_bytes = count * entry_size;
+        if header_size + array_bytes + 4 != self.len {
+            return None;
+        }
+
+        // Check alignment
+        let array_ptr = unsafe { self.as_ptr().add(header_size) };
+        if !(array_ptr as usize).is_multiple_of(core::mem::align_of::<E>()) {
+            return None;
+        }
+
+        Some(unsafe { core::slice::from_raw_parts(array_ptr as *const E, count) })
+    }
 }
 
 impl Deref for Sample<'_> {

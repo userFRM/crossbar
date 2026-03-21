@@ -142,6 +142,58 @@ impl<'a> Loan<'a> {
         self.capacity
     }
 
+    /// Write a `T: Pod` header followed by a `[E: Pod]` array into the block.
+    ///
+    /// Layout in the block: `[T bytes][E bytes * entries.len()][u32 entry_count]`
+    /// The entry count is stored at the END so the reader can verify.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::DataTooLarge` if header + array + 4 bytes exceeds capacity.
+    pub fn write_structured<T: crate::Pod, E: crate::Pod>(
+        &mut self,
+        header: &T,
+        entries: &[E],
+    ) -> Result<(), Error> {
+        let header_size = core::mem::size_of::<T>();
+        let array_size = core::mem::size_of_val(entries);
+        let total = header_size + array_size + 4; // +4 for entry count u32
+
+        if total > self.capacity {
+            return Err(Error::DataTooLarge {
+                size: total,
+                capacity: self.capacity,
+            });
+        }
+
+        let buf = self.as_mut_slice();
+        // Write header
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                header as *const T as *const u8,
+                buf.as_mut_ptr(),
+                header_size,
+            );
+        }
+        // Write array
+        if !entries.is_empty() {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    entries.as_ptr() as *const u8,
+                    buf.as_mut_ptr().add(header_size),
+                    array_size,
+                );
+            }
+        }
+        // Write entry count at the end
+        let count = entries.len() as u32;
+        buf[header_size + array_size..header_size + array_size + 4]
+            .copy_from_slice(&count.to_le_bytes());
+
+        self.set_len(total)?;
+        Ok(())
+    }
+
     /// Publishes the block and wakes any blocked subscribers.
     /// O(1) -- writes 8 bytes to the ring regardless of payload size.
     #[inline]
@@ -347,6 +399,58 @@ impl<'a> PinnedLoan<'a> {
     /// Maximum bytes this loan can hold.
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    /// Write a `T: Pod` header followed by a `[E: Pod]` array into the block.
+    ///
+    /// Layout in the block: `[T bytes][E bytes * entries.len()][u32 entry_count]`
+    /// The entry count is stored at the END so the reader can verify.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::DataTooLarge` if header + array + 4 bytes exceeds capacity.
+    pub fn write_structured<T: crate::Pod, E: crate::Pod>(
+        &mut self,
+        header: &T,
+        entries: &[E],
+    ) -> Result<(), Error> {
+        let header_size = core::mem::size_of::<T>();
+        let array_size = core::mem::size_of_val(entries);
+        let total = header_size + array_size + 4; // +4 for entry count u32
+
+        if total > self.capacity {
+            return Err(Error::DataTooLarge {
+                size: total,
+                capacity: self.capacity,
+            });
+        }
+
+        let buf = self.as_mut_slice();
+        // Write header
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                header as *const T as *const u8,
+                buf.as_mut_ptr(),
+                header_size,
+            );
+        }
+        // Write array
+        if !entries.is_empty() {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    entries.as_ptr() as *const u8,
+                    buf.as_mut_ptr().add(header_size),
+                    array_size,
+                );
+            }
+        }
+        // Write entry count at the end
+        let count = entries.len() as u32;
+        buf[header_size + array_size..header_size + array_size + 4]
+            .copy_from_slice(&count.to_le_bytes());
+
+        self.set_len(total)?;
+        Ok(())
     }
 
     /// Publish. 1 atomic Release store + clear writer sentinel.
