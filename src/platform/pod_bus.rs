@@ -13,6 +13,14 @@
 //! processes -- can independently read from the ring without blocking the
 //! publisher or each other. Publish is O(1) regardless of subscriber count.
 //!
+//! ## Bounded backpressure (lossless mode)
+//!
+//! [`PodBus::create_bounded`] creates a ring where the publisher blocks (or
+//! returns [`Error::Full`]) when the slowest subscriber is too far behind,
+//! preventing data loss. Subscriber cursors are tracked via an atomic slot
+//! array in the SHM header, supporting up to [`MAX_SUBSCRIBER_SLOTS`]
+//! concurrent subscribers across processes.
+//!
 //! ## Soundness guarantees
 //!
 //! - **Single-producer enforcement**: `publish(&mut self)` requires exclusive
@@ -36,20 +44,27 @@
 //!   the one recorded at creation before deleting, preventing removal of
 //!   a successor publisher's file.
 //!
-//! ## SHM region layout
+//! ## SHM region layout (version 2, bounded)
 //!
 //! ```text
 //! +----------------------------------------------------------+
 //! | Header (64 bytes)                                        |
 //! |   [0..8)   magic: "XPOD_ZC\0"                           |
-//! |   [8..12)  version: u32                                  |
+//! |   [8..12)  version: u32 (1 = unbounded, 2 = bounded)    |
 //! |   [12..16) ring_size: u32                                |
 //! |   [16..20) value_size: u32 (size_of::<T>())              |
 //! |   [20..24) value_align: u32 (align_of::<T>())            |
 //! |   [24..32) heartbeat_us: AtomicU64                       |
 //! |   [32..40) write_seq: AtomicU64                          |
 //! |   [40..48) publisher_pid: u64                            |
-//! |   [48..64) reserved                                      |
+//! |   [48..52) watermark: u32 (0 for v1 unbounded)           |
+//! |   [52..64) reserved                                      |
+//! +----------------------------------------------------------+
+//! | Subscriber slots (v2 only): 64 x SubscriberSlot          |
+//! |   Each slot (16 bytes, naturally aligned):                |
+//! |     [+0..+4)  active: AtomicU32  (0=free, 1=active)      |
+//! |     [+4..+8)  pid: AtomicU32     (subscriber PID)        |
+//! |     [+8..+16) cursor: AtomicU64  (subscriber read pos)   |
 //! +----------------------------------------------------------+
 //! | Ring: ring_size x Slot<T>                                |
 //! |   Each slot: stamp (AtomicU64, 8 bytes) + T data         |
@@ -63,7 +78,7 @@
 //! - `seq * 2 + 2` -- write complete for sequence `seq`
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::path::PathBuf;
 
 use crate::error::Error;
@@ -76,8 +91,22 @@ use super::shm::{exclusive_lock, file_identity, shared_lock};
 // ---- Constants ----
 
 const POD_BUS_MAGIC: &[u8; 8] = b"XPOD_ZC\0";
-const POD_BUS_VERSION: u32 = 1;
+/// Version 1: unbounded (lossy) ring, no subscriber tracking.
+const POD_BUS_VERSION_V1: u32 = 1;
+/// Version 2: bounded (lossless) ring with subscriber cursor slots.
+const POD_BUS_VERSION_V2: u32 = 2;
+
+/// Header size for both v1 and v2 (the base header).
 const POD_BUS_HEADER_SIZE: usize = 64;
+
+/// Maximum number of concurrent subscribers tracked for backpressure.
+pub const MAX_SUBSCRIBER_SLOTS: usize = 64;
+
+/// Size of each subscriber slot in the SHM header (active: u32, pid: u32, cursor: u64).
+const SUBSCRIBER_SLOT_SIZE: usize = 16;
+
+/// Total size of the subscriber slots section.
+const SUBSCRIBER_SLOTS_SECTION_SIZE: usize = MAX_SUBSCRIBER_SLOTS * SUBSCRIBER_SLOT_SIZE;
 
 // Header field offsets
 const PH_MAGIC: usize = 0;
@@ -88,6 +117,7 @@ const PH_VALUE_ALIGN: usize = 20;
 const PH_HEARTBEAT_US: usize = 24;
 const PH_WRITE_SEQ: usize = 32;
 const PH_PUBLISHER_PID: usize = 40;
+const PH_WATERMARK: usize = 48;
 
 /// Stale threshold: if heartbeat older than 5 seconds, publisher is considered dead.
 const HEARTBEAT_STALE_US: u64 = 5_000_000;
@@ -167,18 +197,31 @@ fn slot_size<T: Pod>() -> usize {
     core::mem::size_of::<Slot<T>>()
 }
 
-/// Compute total SHM region size for a given ring_size and type T.
-fn region_size<T: Pod>(ring_size: usize) -> usize {
-    POD_BUS_HEADER_SIZE + ring_size * slot_size::<T>()
+/// Compute total SHM region size for a given ring_size, type T, and version.
+fn region_size_for_version<T: Pod>(ring_size: usize, version: u32) -> usize {
+    let header_total = if version >= POD_BUS_VERSION_V2 {
+        POD_BUS_HEADER_SIZE + SUBSCRIBER_SLOTS_SECTION_SIZE
+    } else {
+        POD_BUS_HEADER_SIZE
+    };
+    header_total + ring_size * slot_size::<T>()
 }
+
+// ---- Subscriber slot field offsets (relative to slot start) ----
+const SS_ACTIVE: usize = 0;
+const SS_PID: usize = 4;
+const SS_CURSOR: usize = 8;
 
 // ---- PodBus (publisher) ----
 
 /// SPMC broadcast ring for [`Pod`] types, backed by shared memory.
 ///
 /// The publisher creates the SHM region and writes into a power-of-two ring.
-/// Each publish is O(1) regardless of how many subscribers exist. Subscribers
-/// that fall behind will skip to the newest available data (lossy).
+/// Each publish is O(1) regardless of how many subscribers exist. In the
+/// default (unbounded / lossy) mode, subscribers that fall behind will skip to
+/// the newest available data. In bounded mode (created with
+/// [`create_bounded`](Self::create_bounded)), the publisher blocks or returns
+/// [`Error::Full`] when the slowest subscriber is too far behind.
 ///
 /// `PodBus` is `Send` but **not** `Sync`. The `publish(&mut self)` signature
 /// enforces the single-producer guarantee at the type level -- no runtime
@@ -204,6 +247,12 @@ pub struct PodBus<T: Pod> {
     lock_path: PathBuf,
     created_ino: Option<u64>,
     _lock_file: std::fs::File,
+    /// Pointer to the subscriber-slots section in SHM (v2 only, null for v1).
+    sub_slots_base: *mut u8,
+    /// Backpressure watermark. `None` for unbounded (v1) buses.
+    watermark: Option<u64>,
+    /// Cached minimum subscriber cursor to avoid scanning every publish.
+    cached_slowest: u64,
     _marker: core::marker::PhantomData<T>,
 }
 
@@ -237,15 +286,20 @@ pub struct BusSubscriber<T: Pod> {
     cursor: u64,
     total_lagged: u64,
     _lock_file: std::fs::File,
+    /// Index into the subscriber-slots array (v2 only, `None` for v1).
+    slot_index: Option<usize>,
+    /// Pointer to the subscriber-slots section in SHM (v2 only, null for v1).
+    sub_slots_base: *mut u8,
     _marker: core::marker::PhantomData<T>,
 }
 
-// Safety: same reasoning as PodBus. Subscriber is read-only.
+// Safety: same reasoning as PodBus. Subscriber is read-only (aside from its own
+// cursor slot, which is exclusively owned by this subscriber instance).
 unsafe impl<T: Pod> Send for BusSubscriber<T> {}
 unsafe impl<T: Pod> Sync for BusSubscriber<T> {}
 
 impl<T: Pod> PodBus<T> {
-    /// Create a new SPMC broadcast ring backed by shared memory.
+    /// Create a new unbounded (lossy) SPMC broadcast ring backed by shared memory.
     ///
     /// Creates a file at `/dev/shm/crossbar-pod-{name}` (Linux) containing the
     /// header and `ring_size` slots. Acquires an exclusive lock on the lock
@@ -263,6 +317,37 @@ impl<T: Pod> PodBus<T> {
     ///
     /// Panics if `ring_size` is zero or not a power of two.
     pub fn create(name: &str, ring_size: usize) -> Result<Self, Error> {
+        Self::create_inner(name, ring_size, None)
+    }
+
+    /// Create a new bounded (lossless) SPMC broadcast ring backed by shared memory.
+    ///
+    /// When backpressure is enabled, [`publish`](Self::publish) spin-waits until
+    /// the slowest subscriber has advanced enough, and [`try_publish`](Self::try_publish)
+    /// returns [`Error::Full`] instead of blocking.
+    ///
+    /// The `watermark` parameter controls how many slots of headroom to leave
+    /// between the publisher and the slowest subscriber. Backpressure triggers
+    /// when `write_seq - slowest_cursor >= ring_size - watermark`.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`create`](Self::create).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `ring_size` is zero or not a power of two, or if
+    /// `watermark >= ring_size`.
+    pub fn create_bounded(name: &str, ring_size: usize, watermark: usize) -> Result<Self, Error> {
+        assert!(
+            watermark < ring_size,
+            "watermark ({watermark}) must be less than ring_size ({ring_size})"
+        );
+        Self::create_inner(name, ring_size, Some(watermark as u64))
+    }
+
+    /// Internal constructor shared by `create` and `create_bounded`.
+    fn create_inner(name: &str, ring_size: usize, watermark: Option<u64>) -> Result<Self, Error> {
         assert!(
             ring_size > 0 && ring_size.is_power_of_two(),
             "ring_size must be a power of two"
@@ -271,9 +356,16 @@ impl<T: Pod> PodBus<T> {
         validate_name(name)?;
         check_alignment::<T>()?;
 
+        let bounded = watermark.is_some();
+        let version = if bounded {
+            POD_BUS_VERSION_V2
+        } else {
+            POD_BUS_VERSION_V1
+        };
+
         let path = pod_bus_shm_path(name);
         let lpath = pod_bus_lock_path(name);
-        let size = region_size::<T>(ring_size);
+        let size = region_size_for_version::<T>(ring_size, version);
 
         // Create/open lock file and acquire exclusive lock
         let lock_file = {
@@ -309,17 +401,42 @@ impl<T: Pod> PodBus<T> {
         let base = mmap.as_mut_ptr();
         unsafe {
             core::ptr::copy_nonoverlapping(POD_BUS_MAGIC.as_ptr(), base.add(PH_MAGIC), 8);
-            (base.add(PH_VERSION) as *mut u32).write(POD_BUS_VERSION);
+            (base.add(PH_VERSION) as *mut u32).write(version);
             (base.add(PH_RING_SIZE) as *mut u32).write(ring_size as u32);
             (base.add(PH_VALUE_SIZE) as *mut u32).write(core::mem::size_of::<T>() as u32);
             (base.add(PH_VALUE_ALIGN) as *mut u32).write(core::mem::align_of::<T>() as u32);
             // write_seq starts at 0 (already zero from truncate, but be explicit)
             (base.add(PH_WRITE_SEQ) as *mut u64).write(0);
             (base.add(PH_PUBLISHER_PID) as *mut u64).write(u64::from(std::process::id()));
+            (base.add(PH_WATERMARK) as *mut u32).write(watermark.unwrap_or(0) as u32);
         }
 
+        // Initialize subscriber slots (v2 only) -- already zeroed from truncate,
+        // but be explicit about the active flags.
+        let sub_slots_base = if bounded {
+            let slots_base = unsafe { base.add(POD_BUS_HEADER_SIZE) };
+            for i in 0..MAX_SUBSCRIBER_SLOTS {
+                unsafe {
+                    let slot_ptr = slots_base.add(i * SUBSCRIBER_SLOT_SIZE);
+                    (slot_ptr.add(SS_ACTIVE) as *mut u32).write(0);
+                    (slot_ptr.add(SS_PID) as *mut u32).write(0);
+                    (slot_ptr.add(SS_CURSOR) as *mut u64).write(0);
+                }
+            }
+            slots_base
+        } else {
+            core::ptr::null_mut()
+        };
+
+        // Compute ring base: after header + subscriber slots (v2) or just header (v1)
+        let ring_offset = if bounded {
+            POD_BUS_HEADER_SIZE + SUBSCRIBER_SLOTS_SECTION_SIZE
+        } else {
+            POD_BUS_HEADER_SIZE
+        };
+        let ring_base = unsafe { base.add(ring_offset) };
+
         // Initialize all slot stamps to 0
-        let ring_base = unsafe { base.add(POD_BUS_HEADER_SIZE) };
         let slot_sz = slot_size::<T>();
         for i in 0..ring_size {
             unsafe {
@@ -353,16 +470,74 @@ impl<T: Pod> PodBus<T> {
             lock_path: lpath,
             created_ino,
             _lock_file: lock_file,
+            sub_slots_base,
+            watermark,
+            cached_slowest: 0,
             _marker: core::marker::PhantomData,
         })
     }
 
     /// Publish a value into the ring. O(1) regardless of subscriber count.
     ///
+    /// On an unbounded bus, this always succeeds immediately.
+    ///
+    /// On a bounded bus, this spin-waits until the slowest subscriber has
+    /// advanced enough to make room, ensuring lossless delivery.
+    ///
     /// Takes `&mut self` to enforce the single-producer guarantee at the type
     /// level. `PodBus` is `Send` but not `Sync`, so this cannot be called from
     /// multiple threads simultaneously.
     pub fn publish(&mut self, value: T) {
+        if self.watermark.is_some() {
+            // Bounded: spin-wait until there is room.
+            loop {
+                match self.try_publish(value) {
+                    Ok(()) => return,
+                    Err(_) => core::hint::spin_loop(),
+                }
+            }
+        }
+        self.publish_unchecked(value);
+    }
+
+    /// Try to publish a value into the ring with backpressure awareness.
+    ///
+    /// On an unbounded bus, this always succeeds and returns `Ok(())`.
+    ///
+    /// On a bounded bus, this checks whether the slowest subscriber has fallen
+    /// too far behind. If `write_seq - slowest_cursor >= ring_size - watermark`,
+    /// returns `Err(Error::Full)` without writing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Full`] if the ring is full (bounded mode only).
+    pub fn try_publish(&mut self, value: T) -> Result<(), Error> {
+        if let Some(watermark) = self.watermark {
+            let write_seq = self.write_seq().load(Ordering::Relaxed);
+            let effective = self.ring_size as u64 - watermark;
+
+            // Fast path: use cached slowest cursor.
+            if write_seq >= self.cached_slowest + effective {
+                // Slow path: rescan all subscriber slots.
+                match self.slowest_subscriber_cursor() {
+                    Some(slowest) => {
+                        self.cached_slowest = slowest;
+                        if write_seq >= slowest + effective {
+                            return Err(Error::Full);
+                        }
+                    }
+                    None => {
+                        // No active subscribers -- ring is unbounded.
+                    }
+                }
+            }
+        }
+        self.publish_unchecked(value);
+        Ok(())
+    }
+
+    /// Write a value into the ring without any backpressure check.
+    fn publish_unchecked(&mut self, value: T) {
         let write_seq = self.write_seq().load(Ordering::Relaxed);
 
         // Update heartbeat every 1024 publishes
@@ -391,6 +566,51 @@ impl<T: Pod> PodBus<T> {
 
         // Advance sequence.
         self.write_seq().store(write_seq + 1, Ordering::Release);
+    }
+
+    /// Scan all subscriber slots in SHM and return the minimum (slowest) cursor.
+    ///
+    /// Returns `None` if no active subscribers exist. Prunes stale subscribers
+    /// whose PID no longer exists.
+    fn slowest_subscriber_cursor(&self) -> Option<u64> {
+        if self.sub_slots_base.is_null() {
+            return None;
+        }
+
+        let mut min_cursor = u64::MAX;
+        let mut has_active = false;
+
+        for i in 0..MAX_SUBSCRIBER_SLOTS {
+            let slot_base = unsafe { self.sub_slots_base.add(i * SUBSCRIBER_SLOT_SIZE) };
+
+            let active_atomic = unsafe { &*(slot_base.add(SS_ACTIVE) as *const AtomicU32) };
+            if active_atomic.load(Ordering::Acquire) != 1 {
+                continue;
+            }
+
+            // Check if subscriber PID is still alive.
+            let pid_atomic = unsafe { &*(slot_base.add(SS_PID) as *const AtomicU32) };
+            let pid = pid_atomic.load(Ordering::Relaxed);
+            if pid != 0 && !is_pid_alive(pid) {
+                // Subscriber crashed -- prune the slot.
+                active_atomic.store(0, Ordering::Release);
+                continue;
+            }
+
+            let cursor_atomic = unsafe { &*(slot_base.add(SS_CURSOR) as *const AtomicU64) };
+            let cursor = cursor_atomic.load(Ordering::Acquire);
+
+            has_active = true;
+            if cursor < min_cursor {
+                min_cursor = cursor;
+            }
+        }
+
+        if has_active {
+            Some(min_cursor)
+        } else {
+            None
+        }
     }
 
     /// Explicitly update the heartbeat timestamp.
@@ -436,6 +656,11 @@ impl<T: Pod> PodBus<T> {
         self.ring_size
     }
 
+    /// Returns `true` if this bus was created with bounded backpressure.
+    pub fn is_bounded(&self) -> bool {
+        self.watermark.is_some()
+    }
+
     /// Get a reference to the heartbeat atomic in SHM (for internal auto-update).
     #[inline]
     fn heartbeat_atomic(&self) -> &AtomicU64 {
@@ -478,6 +703,9 @@ impl<T: Pod> BusSubscriber<T> {
     /// the current write position. Acquires a shared lock on the lock file
     /// to verify the publisher is still alive.
     ///
+    /// On a bounded (v2) bus, the subscriber claims a slot in the SHM header
+    /// for cursor tracking. The slot is released on [`Drop`].
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Io`] if the file doesn't exist.
@@ -486,6 +714,7 @@ impl<T: Pod> BusSubscriber<T> {
     /// type parameters don't match.
     /// Returns [`Error::PublisherDead`] if the heartbeat is stale.
     /// Returns [`Error::LockContention`] if the lock cannot be acquired.
+    /// Returns [`Error::PoolExhausted`] if all subscriber slots are taken (v2 only).
     pub fn connect(name: &str) -> Result<Self, Error> {
         validate_name(name)?;
         check_alignment::<T>()?;
@@ -528,13 +757,15 @@ impl<T: Pod> BusSubscriber<T> {
             }
         }
 
-        // Validate version
+        // Validate version (accept both v1 and v2)
         let version = unsafe { (base.add(PH_VERSION) as *const u32).read() };
-        if version != POD_BUS_VERSION {
+        if version != POD_BUS_VERSION_V1 && version != POD_BUS_VERSION_V2 {
             return Err(Error::InvalidRegion(alloc::format!(
-                "unsupported PodBus version {version}, expected {POD_BUS_VERSION}"
+                "unsupported PodBus version {version}, expected {POD_BUS_VERSION_V1} or {POD_BUS_VERSION_V2}"
             )));
         }
+
+        let bounded = version == POD_BUS_VERSION_V2;
 
         // Read ring parameters
         let ring_size = unsafe { (base.add(PH_RING_SIZE) as *const u32).read() } as usize;
@@ -563,7 +794,7 @@ impl<T: Pod> BusSubscriber<T> {
         }
 
         // Validate total region size
-        let expected_size = region_size::<T>(ring_size);
+        let expected_size = region_size_for_version::<T>(ring_size, version);
         if mmap.len() < expected_size {
             return Err(Error::InvalidRegion(alloc::format!(
                 "PodBus region size {} < expected {expected_size}",
@@ -584,7 +815,22 @@ impl<T: Pod> BusSubscriber<T> {
             unsafe { &*(base.add(PH_WRITE_SEQ) as *const AtomicU64) };
         let cursor = unsafe { &*write_seq_ptr }.load(Ordering::Acquire);
 
-        let ring_ptr = unsafe { base.add(POD_BUS_HEADER_SIZE) };
+        let ring_offset = if bounded {
+            POD_BUS_HEADER_SIZE + SUBSCRIBER_SLOTS_SECTION_SIZE
+        } else {
+            POD_BUS_HEADER_SIZE
+        };
+        let ring_ptr = unsafe { base.add(ring_offset) };
+
+        // For v2 bounded buses, claim a subscriber slot via CAS.
+        let (slot_index, sub_slots_base) = if bounded {
+            let slots_base = unsafe { mmap.as_mut_ptr().add(POD_BUS_HEADER_SIZE) };
+            let my_pid = std::process::id();
+            let idx = claim_subscriber_slot(slots_base, cursor, my_pid)?;
+            (Some(idx), slots_base)
+        } else {
+            (None, core::ptr::null_mut())
+        };
 
         Ok(Self {
             _mmap: mmap,
@@ -595,6 +841,8 @@ impl<T: Pod> BusSubscriber<T> {
             cursor,
             total_lagged: 0,
             _lock_file: lock_file,
+            slot_index,
+            sub_slots_base,
             _marker: core::marker::PhantomData,
         })
     }
@@ -661,6 +909,10 @@ impl<T: Pod> BusSubscriber<T> {
         }
 
         self.cursor += 1;
+
+        // Update cursor in SHM for backpressure tracking (v2 only).
+        self.update_shm_cursor(self.cursor);
+
         Some(value)
     }
 
@@ -683,6 +935,16 @@ impl<T: Pod> BusSubscriber<T> {
         self.ring_size
     }
 
+    /// Update this subscriber's cursor in SHM (v2 only).
+    #[inline]
+    fn update_shm_cursor(&self, new_cursor: u64) {
+        if let Some(idx) = self.slot_index {
+            let slot_base = unsafe { self.sub_slots_base.add(idx * SUBSCRIBER_SLOT_SIZE) };
+            let cursor_atomic = unsafe { &*(slot_base.add(SS_CURSOR) as *const AtomicU64) };
+            cursor_atomic.store(new_cursor, Ordering::Release);
+        }
+    }
+
     /// Get a reference to the write_seq atomic in SHM.
     #[inline]
     fn write_seq(&self) -> &AtomicU64 {
@@ -696,6 +958,72 @@ impl<T: Pod> BusSubscriber<T> {
         let slot_sz = slot_size::<T>();
         unsafe { &*(self.ring_ptr.add(idx * slot_sz) as *const Slot<T>) }
     }
+}
+
+impl<T: Pod> Drop for BusSubscriber<T> {
+    fn drop(&mut self) {
+        // Release subscriber slot in SHM (v2 only).
+        if let Some(idx) = self.slot_index {
+            if !self.sub_slots_base.is_null() {
+                let slot_base = unsafe { self.sub_slots_base.add(idx * SUBSCRIBER_SLOT_SIZE) };
+                let active_atomic = unsafe { &*(slot_base.add(SS_ACTIVE) as *const AtomicU32) };
+                active_atomic.store(0, Ordering::Release);
+            }
+        }
+    }
+}
+
+// ---- Subscriber slot helpers ----
+
+/// Claim a free subscriber slot via CAS. Returns the slot index on success.
+fn claim_subscriber_slot(
+    slots_base: *mut u8,
+    initial_cursor: u64,
+    pid: u32,
+) -> Result<usize, Error> {
+    for i in 0..MAX_SUBSCRIBER_SLOTS {
+        let slot_base = unsafe { slots_base.add(i * SUBSCRIBER_SLOT_SIZE) };
+        let active_atomic = unsafe { &*(slot_base.add(SS_ACTIVE) as *const AtomicU32) };
+
+        // Try to claim this slot: CAS 0 -> 1
+        if active_atomic
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            // Write PID and initial cursor.
+            let pid_atomic = unsafe { &*(slot_base.add(SS_PID) as *const AtomicU32) };
+            pid_atomic.store(pid, Ordering::Release);
+
+            let cursor_atomic = unsafe { &*(slot_base.add(SS_CURSOR) as *const AtomicU64) };
+            cursor_atomic.store(initial_cursor, Ordering::Release);
+
+            return Ok(i);
+        }
+    }
+    Err(Error::PoolExhausted)
+}
+
+/// Check if a process with the given PID is still alive.
+#[cfg(unix)]
+fn is_pid_alive(pid: u32) -> bool {
+    // kill(pid, 0) checks if the process exists without sending a signal.
+    // Returns 0 on success, -1 on error. ESRCH means the process doesn't exist.
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+#[cfg(windows)]
+fn is_pid_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return false;
+    }
+    unsafe {
+        CloseHandle(handle);
+    }
+    true
 }
 
 #[cfg(test)]
@@ -869,5 +1197,145 @@ mod tests {
         let mut bus = PodBus::<u64>::create(&name, 4).unwrap();
         // Should succeed without publishing anything.
         bus.heartbeat().unwrap();
+    }
+
+    // ---- Bounded backpressure tests ----
+
+    #[test]
+    fn bounded_backpressure_blocks() {
+        let name = test_name("bp-blocks");
+        // Ring of 4, watermark 1 => effective capacity = 3
+        let mut bus = PodBus::<u64>::create_bounded(&name, 4, 1).unwrap();
+        assert!(bus.is_bounded());
+
+        let mut sub = bus.subscriber().unwrap();
+
+        // Fill up to effective capacity (3 values).
+        assert!(bus.try_publish(1).is_ok());
+        assert!(bus.try_publish(2).is_ok());
+        assert!(bus.try_publish(3).is_ok());
+
+        // 4th should fail -- ring is full.
+        let result = bus.try_publish(4);
+        assert!(
+            matches!(result, Err(Error::Full)),
+            "expected Error::Full, got {result:?}"
+        );
+
+        // Subscriber reads one value, freeing a slot.
+        assert_eq!(sub.try_recv(), Some(1));
+
+        // Now we can publish again.
+        assert!(bus.try_publish(4).is_ok());
+    }
+
+    #[test]
+    fn bounded_subscriber_advances() {
+        let name = test_name("bp-adv");
+        // Ring of 8, watermark 0 => effective capacity = 8
+        let mut bus = PodBus::<u64>::create_bounded(&name, 8, 0).unwrap();
+        let mut sub = bus.subscriber().unwrap();
+
+        // Fill ring completely.
+        for i in 0..8u64 {
+            assert!(bus.try_publish(i).is_ok(), "failed to publish {i}");
+        }
+
+        // Ring is full.
+        assert!(matches!(bus.try_publish(99), Err(Error::Full)));
+
+        // Subscriber reads all values.
+        let mut received = alloc::vec::Vec::new();
+        while let Some(v) = sub.try_recv() {
+            received.push(v);
+        }
+        assert_eq!(received, alloc::vec![0, 1, 2, 3, 4, 5, 6, 7]);
+
+        // Now we can publish again (subscriber advanced cursor).
+        for i in 100..108u64 {
+            assert!(bus.try_publish(i).is_ok(), "failed to publish {i}");
+        }
+        assert!(matches!(bus.try_publish(999), Err(Error::Full)));
+    }
+
+    #[test]
+    fn bounded_no_subscribers_unbounded() {
+        let name = test_name("bp-nosub");
+        // With no subscribers, a bounded bus should publish freely.
+        let mut bus = PodBus::<u64>::create_bounded(&name, 4, 1).unwrap();
+
+        for i in 0..100u64 {
+            assert!(bus.try_publish(i).is_ok());
+        }
+    }
+
+    #[test]
+    fn bounded_crashed_subscriber_pruned() {
+        let name = test_name("bp-crash");
+        // Ring of 4, watermark 0 => effective capacity = 4
+        let mut bus = PodBus::<u64>::create_bounded(&name, 4, 0).unwrap();
+
+        // Create subscriber and fill the ring.
+        let sub = bus.subscriber().unwrap();
+        for i in 0..4u64 {
+            assert!(bus.try_publish(i).is_ok());
+        }
+
+        // Ring is full.
+        assert!(matches!(bus.try_publish(99), Err(Error::Full)));
+
+        // Drop the subscriber (simulates crash -- slot released on drop).
+        drop(sub);
+
+        // With no active subscribers, publisher can proceed.
+        assert!(bus.try_publish(99).is_ok());
+    }
+
+    #[test]
+    fn bounded_publish_spin_waits() {
+        let name = test_name("bp-spin");
+        let mut bus = PodBus::<u64>::create_bounded(&name, 4, 1).unwrap();
+        let mut sub = bus.subscriber().unwrap();
+
+        // Spawn a thread that reads after a short delay.
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let mut count = 0;
+            while count < 5 {
+                if sub.try_recv().is_some() {
+                    count += 1;
+                } else {
+                    std::hint::spin_loop();
+                }
+            }
+            count
+        });
+
+        // Publish 5 values using blocking publish (ring only holds 3).
+        for i in 0..5u64 {
+            bus.publish(i);
+        }
+
+        let count = handle.join().unwrap();
+        assert_eq!(count, 5);
+    }
+
+    #[test]
+    #[should_panic(expected = "watermark")]
+    fn bounded_rejects_watermark_ge_ring_size() {
+        let name = test_name("bp-wm");
+        let _ = PodBus::<u64>::create_bounded(&name, 4, 4);
+    }
+
+    #[test]
+    fn unbounded_try_publish_always_succeeds() {
+        let name = test_name("unbounded-try");
+        let mut bus = PodBus::<u64>::create(&name, 4).unwrap();
+        let _sub = bus.subscriber().unwrap();
+
+        // Even without reading, try_publish should always succeed on an unbounded bus.
+        for i in 0..100u64 {
+            assert!(bus.try_publish(i).is_ok());
+        }
     }
 }

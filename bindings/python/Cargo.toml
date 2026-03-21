@@ -1,0 +1,14 @@
+[package]
+name = "crossbar-python"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "crossbar_python"
+crate-type = ["cdylib"]
+
+[dependencies]
+crossbar = { path = "../.." }
+pyo3 = { version = "0.24", features = ["extension-module"] }
+# NOTE: PyO3 0.24 supports up to Python 3.13. If building with Python 3.14+,
+# either upgrade pyo3 or set PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1

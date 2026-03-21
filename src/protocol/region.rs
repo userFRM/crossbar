@@ -349,38 +349,32 @@ impl Region {
             );
         }
 
-        // 2. Acquire the ring slot via CAS (prevents two publishers from
-        //    writing the same slot when seqs differ by exactly ring_depth).
-        //    Single-publisher mode skips the CAS loop entirely.
+        // 2. Mark the slot as being written.
+        //    Single-publisher mode stores unconditionally.
+        //    Multi-publisher mode: the fetch_add above already claimed a unique seq,
+        //    so no two live publishers target the same slot. We only need to wait
+        //    briefly for any in-progress write to complete. If the slot is stuck in
+        //    SEQ_WRITING (crashed publisher), we force-overwrite after a short spin
+        //    — the data is stale anyway.
         if single_publisher {
             entry_seq.store(SEQ_WRITING, Ordering::Release);
         } else {
-            let mut spin_count = 0u32;
+            let mut spins = 0u32;
             loop {
                 let current = entry_seq.load(Ordering::Acquire);
-                if current == SEQ_WRITING {
-                    spin_count += 1;
-                    if spin_count > 1_000_000 {
-                        // Slot stuck in WRITING state — likely a crashed publisher.
-                        // Force-claim it by overwriting.
-                        break;
-                    }
-                    crate::wait::yield_hint();
-                    continue;
+                if current != SEQ_WRITING {
+                    break; // Slot is not being written — safe to proceed
                 }
-                if entry_seq
-                    .compare_exchange_weak(
-                        current,
-                        SEQ_WRITING,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_ok()
-                {
+                spins += 1;
+                if spins > 1024 {
+                    // Stuck in WRITING state — crashed publisher. Force overwrite.
+                    // This is safe because our fetch_add already claimed this seq,
+                    // so no other live publisher is targeting this slot.
                     break;
                 }
                 crate::wait::yield_hint();
             }
+            entry_seq.store(SEQ_WRITING, Ordering::Release);
         }
 
         // 3. Read old block_idx from the slot we're overwriting

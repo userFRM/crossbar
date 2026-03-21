@@ -13,11 +13,13 @@ pub(crate) mod loan;
 mod mmap;
 pub(crate) mod notify;
 mod pod_bus;
+pub mod registry;
 mod shm;
 pub(crate) mod subscription;
 
 pub use channel::Channel;
 pub use loan::{Loan, PinnedLoan, Topic, TypedLoan};
 pub use pod_bus::{BusSubscriber, PodBus};
+pub use registry::{DiscoveredTopic, Registry};
 pub use shm::{Publisher, Subscriber};
 pub use subscription::{PinnedSample, Sample, Stream, TypedSample};

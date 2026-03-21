@@ -1,3 +1,4 @@
+use crossbar::error::Error;
 use crossbar::{BusSubscriber, Pod, PodBus};
 
 /// Generate a unique test name to avoid SHM file collisions between tests.
@@ -245,4 +246,161 @@ fn heartbeat_method_works() {
     let mut bus = PodBus::<u64>::create(&name, 4).unwrap();
     // Should succeed without publishing anything.
     bus.heartbeat().unwrap();
+}
+
+// ---- Bounded backpressure integration tests ----
+
+#[test]
+fn bounded_backpressure_blocks() {
+    let name = test_name("bp-blocks");
+    // Ring of 4, watermark 1 => effective capacity = 3
+    let mut bus = PodBus::<u64>::create_bounded(&name, 4, 1).unwrap();
+    assert!(bus.is_bounded());
+
+    let mut sub = bus.subscriber().unwrap();
+
+    // Fill up to effective capacity (3 values).
+    assert!(bus.try_publish(1).is_ok());
+    assert!(bus.try_publish(2).is_ok());
+    assert!(bus.try_publish(3).is_ok());
+
+    // 4th should fail -- ring is full.
+    let result = bus.try_publish(4);
+    assert!(
+        matches!(result, Err(Error::Full)),
+        "expected Error::Full, got {result:?}"
+    );
+
+    // Subscriber reads one value, freeing a slot.
+    assert_eq!(sub.try_recv(), Some(1));
+
+    // Now we can publish again.
+    assert!(bus.try_publish(4).is_ok());
+}
+
+#[test]
+fn bounded_subscriber_advances() {
+    let name = test_name("bp-adv");
+    // Ring of 8, watermark 0 => effective capacity = 8
+    let mut bus = PodBus::<u64>::create_bounded(&name, 8, 0).unwrap();
+    let mut sub = bus.subscriber().unwrap();
+
+    // Fill ring completely.
+    for i in 0..8u64 {
+        assert!(bus.try_publish(i).is_ok(), "failed to publish {i}");
+    }
+
+    // Ring is full.
+    assert!(matches!(bus.try_publish(99), Err(Error::Full)));
+
+    // Subscriber reads all values.
+    let mut received = Vec::new();
+    while let Some(v) = sub.try_recv() {
+        received.push(v);
+    }
+    assert_eq!(received, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+
+    // Now we can publish again (subscriber advanced cursor).
+    for i in 100..108u64 {
+        assert!(bus.try_publish(i).is_ok(), "failed to publish {i}");
+    }
+    assert!(matches!(bus.try_publish(999), Err(Error::Full)));
+}
+
+#[test]
+fn bounded_crashed_subscriber_pruned() {
+    let name = test_name("bp-crash");
+    // Ring of 4, watermark 0 => effective capacity = 4
+    let mut bus = PodBus::<u64>::create_bounded(&name, 4, 0).unwrap();
+
+    // Create subscriber and fill the ring.
+    let sub = bus.subscriber().unwrap();
+    for i in 0..4u64 {
+        assert!(bus.try_publish(i).is_ok());
+    }
+
+    // Ring is full.
+    assert!(matches!(bus.try_publish(99), Err(Error::Full)));
+
+    // Drop the subscriber (simulates crash -- slot released on drop).
+    drop(sub);
+
+    // With no active subscribers, publisher can proceed.
+    assert!(bus.try_publish(99).is_ok());
+}
+
+#[test]
+fn bounded_publish_spin_waits() {
+    use std::thread;
+    use std::time::Duration;
+
+    let name = test_name("bp-spin");
+    let mut bus = PodBus::<u64>::create_bounded(&name, 4, 1).unwrap();
+    let mut sub = bus.subscriber().unwrap();
+
+    // Spawn a thread that reads after a short delay.
+    let handle = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(10));
+        let mut count = 0;
+        while count < 5 {
+            if sub.try_recv().is_some() {
+                count += 1;
+            } else {
+                std::hint::spin_loop();
+            }
+        }
+        count
+    });
+
+    // Publish 5 values using blocking publish (ring only holds 3).
+    for i in 0..5u64 {
+        bus.publish(i);
+    }
+
+    let count = handle.join().unwrap();
+    assert_eq!(count, 5);
+}
+
+#[test]
+fn bounded_multiple_subscribers_slowest_wins() {
+    let name = test_name("bp-slow");
+    // Ring of 4, watermark 0 => effective capacity = 4
+    let mut bus = PodBus::<u64>::create_bounded(&name, 4, 0).unwrap();
+    let mut fast_sub = bus.subscriber().unwrap();
+    let _slow_sub = bus.subscriber().unwrap(); // never reads
+
+    // Fill ring.
+    for i in 0..4u64 {
+        assert!(bus.try_publish(i).is_ok());
+    }
+
+    // Ring is full because slow_sub hasn't advanced.
+    assert!(matches!(bus.try_publish(99), Err(Error::Full)));
+
+    // Fast subscriber reads, but ring is still full because slow_sub holds position 0.
+    assert_eq!(fast_sub.try_recv(), Some(0));
+    assert!(matches!(bus.try_publish(99), Err(Error::Full)));
+}
+
+#[test]
+fn bounded_no_subscribers_unbounded() {
+    let name = test_name("bp-nosub");
+    // With no subscribers, a bounded bus should publish freely.
+    let mut bus = PodBus::<u64>::create_bounded(&name, 4, 1).unwrap();
+
+    for i in 0..100u64 {
+        assert!(bus.try_publish(i).is_ok());
+    }
+}
+
+#[test]
+fn unbounded_try_publish_always_succeeds() {
+    let name = test_name("unbounded-try");
+    let mut bus = PodBus::<u64>::create(&name, 4).unwrap();
+    let _sub = bus.subscriber().unwrap();
+
+    // Even without reading, try_publish should always succeed on an unbounded bus.
+    for i in 0..100u64 {
+        assert!(bus.try_publish(i).is_ok());
+    }
 }

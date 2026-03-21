@@ -24,6 +24,12 @@ pub enum Error {
     /// The block pool is exhausted (all blocks are in use by subscribers).
     PoolExhausted,
 
+    /// The bounded PodBus ring is full (backpressure).
+    ///
+    /// Returned by [`PodBus::try_publish`] when the slowest subscriber is
+    /// too far behind the publisher. The caller should wait or drop the value.
+    Full,
+
     /// Data exceeds the block's data capacity.
     DataTooLarge {
         /// Attempted write size.
@@ -94,6 +100,12 @@ impl fmt::Display for Error {
             }
             Error::PoolExhausted => {
                 write!(f, "block pool exhausted -- increase block_count in Config")
+            }
+            Error::Full => {
+                write!(
+                    f,
+                    "bounded PodBus ring is full -- slowest subscriber is too far behind"
+                )
             }
             Error::DataTooLarge { size, capacity } => {
                 write!(f, "data ({size}) exceeds block data capacity ({capacity})")
