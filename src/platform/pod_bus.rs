@@ -601,15 +601,11 @@ impl<T: Pod> PodBus<T> {
             // Only consider fully-initialized (ACTIVE) slots for backpressure.
             // CLAIMING slots are still being initialized and are not yet visible.
             if state == SS_STATE_CLAIMING {
-                // CLAIMING always has a valid PID (written before the CAS).
-                // If the PID is dead, the subscriber crashed during init —
-                // prune it. Clear PID so the next claimant starts clean.
-                let pid_atomic = unsafe { &*(slot_base.add(SS_PID) as *const AtomicU32) };
-                let pid = pid_atomic.load(Ordering::Relaxed);
-                if pid != 0 && !is_pid_alive(pid) {
-                    pid_atomic.store(0, Ordering::Relaxed);
-                    active_atomic.store(SS_STATE_FREE, Ordering::Release);
-                }
+                // CLAIMING = mid-initialization. Do NOT prune — the claimant
+                // may be between the CAS and the PID write (nanosecond window).
+                // If the claimant dies in CLAIMING, the slot is leaked (max 64
+                // slots, bounded waste). This is safer than pruning, which
+                // races with live initialization.
                 continue;
             }
             if state != SS_STATE_ACTIVE {
@@ -1035,16 +1031,7 @@ fn claim_subscriber_slot(
         let slot_base = unsafe { slots_base.add(i * SUBSCRIBER_SLOT_SIZE) };
         let active_atomic = unsafe { &*(slot_base.add(SS_ACTIVE) as *const AtomicU32) };
 
-        // Write PID BEFORE the CAS so that CLAIMING always has a valid PID.
-        // This prevents the publisher from pruning a legitimately in-progress
-        // claim (Codex: pid==0 in CLAIMING must mean "dead", not "still writing").
-        // Writing to a FREE slot's PID field is safe — no other thread reads
-        // PID unless active != FREE, and our CAS below is the gate.
-        let pid_atomic = unsafe { &*(slot_base.add(SS_PID) as *const AtomicU32) };
-        pid_atomic.store(pid, Ordering::Relaxed);
-
-        // CAS FREE(0) -> CLAIMING(2). Now the slot is visible as CLAIMING
-        // with a valid PID — the publisher can check liveness if needed.
+        // CAS FREE(0) -> CLAIMING(2) to claim ownership of this slot.
         if active_atomic
             .compare_exchange(
                 SS_STATE_FREE,
@@ -1054,7 +1041,13 @@ fn claim_subscriber_slot(
             )
             .is_ok()
         {
-            // Write initial cursor while in CLAIMING state.
+            // We own this slot now. Write PID AFTER CAS (authoritative —
+            // only the CAS winner writes here). This ensures the pruner
+            // sees the correct PID for liveness checks.
+            let pid_atomic = unsafe { &*(slot_base.add(SS_PID) as *const AtomicU32) };
+            pid_atomic.store(pid, Ordering::Release);
+
+            // Write initial cursor.
             let cursor_atomic = unsafe { &*(slot_base.add(SS_CURSOR) as *const AtomicU64) };
             cursor_atomic.store(initial_cursor, Ordering::Release);
 
