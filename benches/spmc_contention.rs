@@ -8,7 +8,7 @@
 //! - No refcount CAS contention between subscribers
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use crossbar::{BusSubscriber, Config, Pod, PodBus, Publisher, Subscriber};
+use crossbar::{BusSubscriber, Config, PodBus, Publisher, Subscriber};
 use std::hint::black_box;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};

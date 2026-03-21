@@ -345,7 +345,7 @@ impl Registry {
     /// Called automatically by `Publisher::Drop`.
     ///
     /// Uses `compare_exchange` to atomically transition the slot from ACTIVE
-    /// to FREE, preventing a double-decrement race with [`prune_stale`].
+    /// to FREE, preventing a double-decrement race with [`Self::prune_stale`].
     pub fn unregister(&self, region: &str, pid: u32) {
         for i in 0..REG_MAX_ENTRIES {
             let entry = self.entry_ptr(i);
@@ -438,7 +438,7 @@ impl Registry {
     /// the latest `timestamp_us` from the previous batch and pass it as
     /// `since_us` on the next call.
     ///
-    /// Pattern supports trailing `*` wildcard (same as [`discover`]).
+    /// Pattern supports trailing `*` wildcard (same as [`Self::discover`]).
     pub fn discover_since(&self, pattern: &str, since_us: u64) -> Vec<DiscoveredTopic> {
         let mut results = Vec::new();
         let (prefix, is_wildcard) = if let Some(prefix) = pattern.strip_suffix('*') {
@@ -489,7 +489,7 @@ impl Registry {
     /// Removes entries whose timestamp is older than `stale_timeout` from now.
     ///
     /// Uses `compare_exchange` to atomically transition the slot from ACTIVE
-    /// to FREE, preventing a double-decrement race with [`unregister`].
+    /// to FREE, preventing a double-decrement race with [`Self::unregister`].
     pub fn prune_stale(&self, stale_timeout: Duration) {
         let now = match now_micros() {
             Some(t) => t,
