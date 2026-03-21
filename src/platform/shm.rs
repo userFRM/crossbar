@@ -321,6 +321,7 @@ pub struct Publisher {
     _mmap: RawMmap,
     region: Arc<Region>,
     path: PathBuf,
+    name: alloc::string::String,
     _lock_file: Option<std::fs::File>,
     created_ino: Option<u64>,
     is_owner: bool,
@@ -530,6 +531,7 @@ impl Publisher {
             _mmap: mmap,
             region,
             path,
+            name: name.into(),
             _lock_file: Some(lock_file),
             created_ino,
             is_owner: true,
@@ -576,6 +578,7 @@ impl Publisher {
             _mmap: mmap,
             region,
             path,
+            name: name.into(),
             _lock_file: Some(lock_file),
             created_ino: None,
             is_owner: false,
@@ -691,6 +694,12 @@ impl Publisher {
             }
             // Transition INIT -> ACTIVE (now visible to subscribers)
             active.store(TE_STATE_ACTIVE, Ordering::Release);
+
+            // Best-effort registration in the global discovery registry.
+            // Failure here must not prevent the topic from working.
+            if let Ok(reg) = super::registry::Registry::open() {
+                let _ = reg.register(&self.name, uri, std::process::id());
+            }
 
             return Ok(Topic {
                 topic_idx: i,
@@ -872,6 +881,11 @@ impl Publisher {
 
 impl Drop for Publisher {
     fn drop(&mut self) {
+        // Best-effort unregister from the global discovery registry.
+        if let Ok(reg) = super::registry::Registry::open() {
+            reg.unregister(&self.name, std::process::id());
+        }
+
         // Free pinned blocks
         for &blk in &self.pinned_blocks {
             if blk != NO_BLOCK {

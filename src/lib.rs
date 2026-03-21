@@ -62,9 +62,26 @@ pub use wait::WaitStrategy;
 // std-only exports
 #[cfg(feature = "std")]
 pub use platform::{
-    BusSubscriber, Channel, Loan, PinnedLoan, PinnedSample, PodBus, Publisher, Sample, Stream,
-    Subscriber, Topic, TypedLoan, TypedSample,
+    BusSubscriber, Channel, DiscoveredTopic, Loan, PinnedLoan, PinnedSample, PodBus, Publisher,
+    Registry, Sample, Stream, Subscriber, Topic, TypedLoan, TypedSample,
 };
+
+/// Discover topics matching a URI pattern.
+///
+/// Opens the global registry, prunes stale entries (older than 10 seconds),
+/// and returns all topics whose URI matches `pattern`.
+///
+/// Pattern supports trailing `*` wildcard: `"/tick/*"` matches `"/tick/AAPL"`.
+///
+/// # Errors
+///
+/// Returns an error if the registry file cannot be opened or created.
+#[cfg(feature = "std")]
+pub fn discover(pattern: &str) -> Result<alloc::vec::Vec<DiscoveredTopic>, error::Error> {
+    let reg = Registry::open()?;
+    reg.prune_stale(core::time::Duration::from_secs(10));
+    Ok(reg.discover(pattern))
+}
 
 // ---- Backwards compatibility — will be removed in v1.0 ----
 
