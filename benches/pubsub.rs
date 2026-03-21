@@ -10,11 +10,11 @@ use std::time::Duration;
 
 fn bench_pubsub(c: &mut Criterion) {
     let ps_name = &format!("crossbar-bench-ps-{}", std::process::id());
-    let cfg = Config {
+    let cfg = crossbar::Config {
         block_size: 1_048_576 + 8, // 1 MB data + 8B header
         block_count: 64,
         ring_depth: 8,
-        ..Config::default()
+        ..crossbar::Config::default()
     };
     let mut pub_ = Publisher::create(ps_name, cfg).unwrap();
     let h_8b = pub_.register("/bench/8b").unwrap();
@@ -228,11 +228,11 @@ fn bench_iceoryx2_vs_crossbar(c: &mut Criterion) {
         // crossbar: loan large block, write only 8 bytes, publish
         for &(label, buf_size) in o1_sizes {
             let ps_name = format!("xbar-o1-{buf_size}");
-            let cfg = Config {
+            let cfg = crossbar::Config {
                 block_size: (buf_size as u32) + 64,
                 block_count: 64,
                 ring_depth: 8,
-                ..Config::default()
+                ..crossbar::Config::default()
             };
             let mut pub_ = Publisher::create(&ps_name, cfg).unwrap();
             let handle = pub_.register("/bench/o1").unwrap();
@@ -298,11 +298,11 @@ fn bench_iceoryx2_vs_crossbar(c: &mut Criterion) {
 
         // crossbar
         let ps_name = "crossbar-bench-h2h";
-        let cfg = Config {
+        let cfg = crossbar::Config {
             block_size: 1_048_576 + 64,
             block_count: 64,
             ring_depth: 8,
-            ..Config::default()
+            ..crossbar::Config::default()
         };
         let mut pub_ = Publisher::create(ps_name, cfg).unwrap();
         let handles: Vec<_> = sizes
@@ -391,11 +391,11 @@ fn bench_iceoryx2_vs_crossbar(c: &mut Criterion) {
 
         // crossbar: loan_pinned + write directly + publish — true zero-copy, same buffer every time
         let ps_name = "crossbar-bench-shm";
-        let cfg = Config {
+        let cfg = crossbar::Config {
             block_size: 1_048_576 + 64,
             block_count: 64,
             ring_depth: 8,
-            ..Config::default()
+            ..crossbar::Config::default()
         };
         let mut pub_ = Publisher::create(ps_name, cfg).unwrap();
         let handles: Vec<_> = shm_sizes
