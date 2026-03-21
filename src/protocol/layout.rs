@@ -16,11 +16,11 @@
 compile_error!("crossbar requires a little-endian target");
 
 // Everything below is only used by the std-gated `platform` module.
-// In no_std mode, only PubSubConfig, Region (type), WaitStrategy, and Pod
+// In no_std mode, only Config, Region (type), WaitStrategy, and Pod
 // are needed — none of which depend on layout constants.
 #[cfg(feature = "std")]
 mod inner {
-    use super::super::config::PubSubConfig;
+    use super::super::config::Config;
 
     pub(crate) const MAGIC: &[u8; 8] = b"XBAR_ZC\0";
     pub(crate) const VERSION: u32 = 3;
@@ -92,19 +92,19 @@ mod inner {
         HEADER_SIZE + idx as usize * TOPIC_ENTRY_SIZE
     }
 
-    pub(crate) fn ring_base(config: &PubSubConfig) -> usize {
+    pub(crate) fn ring_base(config: &Config) -> usize {
         HEADER_SIZE + config.max_topics as usize * TOPIC_ENTRY_SIZE
     }
 
     #[inline]
-    pub(crate) fn ring_entry_off(config: &PubSubConfig, topic_idx: u32, slot: u32) -> usize {
+    pub(crate) fn ring_entry_off(config: &Config, topic_idx: u32, slot: u32) -> usize {
         ring_base(config)
             + topic_idx as usize * config.ring_depth as usize * RING_ENTRY_SIZE
             + slot as usize * RING_ENTRY_SIZE
     }
 
     /// Compute block pool offset with checked arithmetic. Returns `None` on overflow.
-    pub(crate) fn block_pool_offset_checked(config: &PubSubConfig) -> Option<usize> {
+    pub(crate) fn block_pool_offset_checked(config: &Config) -> Option<usize> {
         let rb = ring_base(config);
         let ring_size = (config.max_topics as usize)
             .checked_mul(config.ring_depth as usize)?
@@ -112,14 +112,14 @@ mod inner {
         rb.checked_add(ring_size)
     }
 
-    pub(crate) fn block_pool_offset(config: &PubSubConfig) -> usize {
+    pub(crate) fn block_pool_offset(config: &Config) -> usize {
         // Only called after config is validated and region_size_checked passed.
         ring_base(config)
             + config.max_topics as usize * config.ring_depth as usize * RING_ENTRY_SIZE
     }
 
     /// Compute the total region size with fully checked arithmetic. Returns `None` on overflow.
-    pub(crate) fn region_size_checked(config: &PubSubConfig) -> Option<usize> {
+    pub(crate) fn region_size_checked(config: &Config) -> Option<usize> {
         let pool_off = block_pool_offset_checked(config)?;
         let pool_size = (config.block_count as usize).checked_mul(config.block_size as usize)?;
         pool_off.checked_add(pool_size)

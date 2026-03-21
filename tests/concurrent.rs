@@ -19,15 +19,15 @@ fn concurrent_publish_subscribe() {
     const MESSAGES_PER_PUBLISHER: u64 = 1000;
 
     let name = unique_name("pub-sub");
-    let cfg = PubSubConfig {
+    let cfg = Config {
         max_topics: 16,
         block_count: 256,
         ring_depth: 8,
-        ..PubSubConfig::default()
+        ..Config::default()
     };
 
     // Create the region and register topics
-    let mut creator = ShmPublisher::create(&name, cfg).unwrap();
+    let mut creator = Publisher::create(&name, cfg).unwrap();
     let mut topic_handles = Vec::new();
     for i in 0..NUM_PUBLISHERS {
         let topic = creator.register(&format!("/topic/{i}")).unwrap();
@@ -42,7 +42,7 @@ fn concurrent_publish_subscribe() {
             let name = name.clone();
             let barrier = Arc::clone(&barrier);
             thread::spawn(move || {
-                let sub = ShmSubscriber::connect(&name).unwrap();
+                let sub = Subscriber::connect(&name).unwrap();
                 let mut streams = Vec::new();
                 for i in 0..NUM_PUBLISHERS {
                     streams.push(sub.subscribe(&format!("/topic/{i}")).unwrap());
@@ -100,7 +100,7 @@ fn concurrent_publish_subscribe() {
             let barrier = Arc::clone(&barrier);
             let _topic_handle = topic_handles[pub_id];
             thread::spawn(move || {
-                let mut pub_ = ShmPublisher::open(&name).unwrap();
+                let mut pub_ = Publisher::open(&name).unwrap();
                 // Re-register the same topic (gets same handle via URI match)
                 let topic = pub_.register(&format!("/topic/{pub_id}")).unwrap();
 
@@ -141,14 +141,14 @@ fn concurrent_multi_topic() {
     const SUBS_PER_TOPIC: usize = 2;
 
     let name = unique_name("multi-topic");
-    let cfg = PubSubConfig {
+    let cfg = Config {
         max_topics: 16,
         block_count: 256,
         ring_depth: 8,
-        ..PubSubConfig::default()
+        ..Config::default()
     };
 
-    let mut creator = ShmPublisher::create(&name, cfg).unwrap();
+    let mut creator = Publisher::create(&name, cfg).unwrap();
     for i in 0..NUM_TOPICS {
         creator.register(&format!("/mt/{i}")).unwrap();
     }
@@ -163,7 +163,7 @@ fn concurrent_multi_topic() {
             let name = name.clone();
             let barrier = Arc::clone(&barrier);
             let handle = thread::spawn(move || {
-                let sub = ShmSubscriber::connect(&name).unwrap();
+                let sub = Subscriber::connect(&name).unwrap();
                 let stream = sub.subscribe(&format!("/mt/{topic_id}")).unwrap();
 
                 barrier.wait();
@@ -209,7 +209,7 @@ fn concurrent_multi_topic() {
         let name = name.clone();
         let barrier = Arc::clone(&barrier);
         let handle = thread::spawn(move || {
-            let mut pub_ = ShmPublisher::open(&name).unwrap();
+            let mut pub_ = Publisher::open(&name).unwrap();
             let topic = pub_.register(&format!("/mt/{topic_id}")).unwrap();
 
             barrier.wait();
@@ -245,12 +245,12 @@ fn concurrent_loan_drop_stress() {
     const OPS_PER_THREAD: usize = 500;
 
     let name = unique_name("loan-drop-stress");
-    let cfg = PubSubConfig {
+    let cfg = Config {
         block_count: 32,
-        ..PubSubConfig::default()
+        ..Config::default()
     };
 
-    let mut creator = ShmPublisher::create(&name, cfg).unwrap();
+    let mut creator = Publisher::create(&name, cfg).unwrap();
     for i in 0..NUM_THREADS {
         creator.register(&format!("/stress/{i}")).unwrap();
     }
@@ -262,7 +262,7 @@ fn concurrent_loan_drop_stress() {
             let name = name.clone();
             let barrier = Arc::clone(&barrier);
             thread::spawn(move || {
-                let mut pub_ = ShmPublisher::open(&name).unwrap();
+                let mut pub_ = Publisher::open(&name).unwrap();
                 let topic = pub_.register(&format!("/stress/{thread_id}")).unwrap();
 
                 barrier.wait();

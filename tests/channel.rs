@@ -11,8 +11,7 @@ fn channel_bidirectional() {
 
     let name2 = name.clone();
     let server = std::thread::spawn(move || {
-        let mut srv =
-            ShmChannel::listen(&name2, PubSubConfig::default(), Duration::from_secs(5)).unwrap();
+        let mut srv = Channel::listen(&name2, Config::default(), Duration::from_secs(5)).unwrap();
         let msg = srv.recv().unwrap();
         assert_eq!(&*msg, b"ping");
         drop(msg);
@@ -21,8 +20,7 @@ fn channel_bidirectional() {
 
     std::thread::sleep(Duration::from_millis(50));
 
-    let mut cli =
-        ShmChannel::connect(&name, PubSubConfig::default(), Duration::from_secs(5)).unwrap();
+    let mut cli = Channel::connect(&name, Config::default(), Duration::from_secs(5)).unwrap();
     cli.send(b"ping").unwrap();
     let reply = cli.recv().unwrap();
     assert_eq!(&*reply, b"pong");
@@ -36,8 +34,7 @@ fn channel_loan_pattern() {
 
     let name2 = name.clone();
     let server = std::thread::spawn(move || {
-        let srv =
-            ShmChannel::listen(&name2, PubSubConfig::default(), Duration::from_secs(5)).unwrap();
+        let srv = Channel::listen(&name2, Config::default(), Duration::from_secs(5)).unwrap();
         let msg = srv.recv().unwrap();
         assert_eq!(msg.len(), 8);
         let val = u64::from_le_bytes(msg[..8].try_into().unwrap());
@@ -46,8 +43,7 @@ fn channel_loan_pattern() {
 
     std::thread::sleep(Duration::from_millis(50));
 
-    let mut cli =
-        ShmChannel::connect(&name, PubSubConfig::default(), Duration::from_secs(5)).unwrap();
+    let mut cli = Channel::connect(&name, Config::default(), Duration::from_secs(5)).unwrap();
     let mut loan = cli.loan().unwrap();
     loan.as_mut_slice()[..8].copy_from_slice(&42u64.to_le_bytes());
     loan.set_len(8).unwrap();
@@ -62,8 +58,7 @@ fn channel_multiple_messages() {
 
     let name2 = name.clone();
     let server = std::thread::spawn(move || {
-        let mut srv =
-            ShmChannel::listen(&name2, PubSubConfig::default(), Duration::from_secs(5)).unwrap();
+        let mut srv = Channel::listen(&name2, Config::default(), Duration::from_secs(5)).unwrap();
         for i in 0u32..10 {
             let msg = srv.recv().unwrap();
             let val = u32::from_le_bytes(msg[..4].try_into().unwrap());
@@ -75,8 +70,7 @@ fn channel_multiple_messages() {
 
     std::thread::sleep(Duration::from_millis(50));
 
-    let mut cli =
-        ShmChannel::connect(&name, PubSubConfig::default(), Duration::from_secs(5)).unwrap();
+    let mut cli = Channel::connect(&name, Config::default(), Duration::from_secs(5)).unwrap();
     for i in 0u32..10 {
         cli.send(&i.to_le_bytes()).unwrap();
         let reply = cli.recv().unwrap();

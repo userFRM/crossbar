@@ -14,13 +14,13 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::error::IpcError;
+use crate::error::Error;
 use crate::protocol::layout::*;
-use crate::protocol::{PubSubConfig, Region};
+use crate::protocol::{Config, Region};
 
-use super::loan::{PinnedLoan, ShmLoan, TopicHandle, TypedShmLoan};
+use super::loan::{Loan, PinnedLoan, Topic, TypedLoan};
 use super::mmap::RawMmap;
-use super::subscription::Subscription;
+use super::subscription::Stream;
 
 // ---- File helpers ----
 
@@ -41,27 +41,27 @@ fn lock_path(name: &str) -> PathBuf {
 }
 
 /// Validate segment name against path traversal (C2).
-fn validate_name(name: &str) -> Result<(), IpcError> {
+fn validate_name(name: &str) -> Result<(), Error> {
     if !is_valid_segment_name(name) {
-        return Err(IpcError::SegmentNameInvalid(name.into()));
+        return Err(Error::SegmentNameInvalid(name.into()));
     }
     Ok(())
 }
 
 /// Acquire an exclusive, non-blocking lock on `file`.
 #[cfg(unix)]
-pub(crate) fn exclusive_lock(file: &std::fs::File, name: &str) -> Result<(), IpcError> {
+pub(crate) fn exclusive_lock(file: &std::fs::File, name: &str) -> Result<(), Error> {
     use std::os::unix::io::AsRawFd;
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc != 0 {
-        return Err(IpcError::LockContention(name.into()));
+        return Err(Error::LockContention(name.into()));
     }
     Ok(())
 }
 
 /// Acquire an exclusive, non-blocking lock on `file`.
 #[cfg(windows)]
-pub(crate) fn exclusive_lock(file: &std::fs::File, name: &str) -> Result<(), IpcError> {
+pub(crate) fn exclusive_lock(file: &std::fs::File, name: &str) -> Result<(), Error> {
     use std::os::windows::io::AsRawHandle;
     let handle = file.as_raw_handle();
     let mut overlapped: windows_sys::Win32::System::IO::OVERLAPPED = unsafe { std::mem::zeroed() };
@@ -77,7 +77,7 @@ pub(crate) fn exclusive_lock(file: &std::fs::File, name: &str) -> Result<(), Ipc
         )
     };
     if ok == 0 {
-        return Err(IpcError::LockContention(name.into()));
+        return Err(Error::LockContention(name.into()));
     }
     Ok(())
 }
@@ -86,13 +86,13 @@ pub(crate) fn exclusive_lock(file: &std::fs::File, name: &str) -> Result<(), Ipc
 /// On Unix, this atomically downgrades an exclusive lock to shared.
 /// Multiple shared locks can coexist, but shared locks prevent new exclusive locks.
 #[cfg(unix)]
-pub(crate) fn shared_lock(file: &std::fs::File, name: &str) -> Result<(), IpcError> {
+pub(crate) fn shared_lock(file: &std::fs::File, name: &str) -> Result<(), Error> {
     use std::os::unix::io::AsRawFd;
     // LOCK_SH without LOCK_NB: blocks until shared lock is available.
     // If this fd already holds LOCK_EX, atomically downgrades to shared.
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) };
     if rc != 0 {
-        return Err(IpcError::LockContention(name.into()));
+        return Err(Error::LockContention(name.into()));
     }
     Ok(())
 }
@@ -101,7 +101,7 @@ pub(crate) fn shared_lock(file: &std::fs::File, name: &str) -> Result<(), IpcErr
 /// Note: Windows has no atomic downgrade. There is a brief unlock window
 /// between releasing the exclusive lock and acquiring the shared lock.
 #[cfg(windows)]
-pub(crate) fn shared_lock(file: &std::fs::File, name: &str) -> Result<(), IpcError> {
+pub(crate) fn shared_lock(file: &std::fs::File, name: &str) -> Result<(), Error> {
     use std::os::windows::io::AsRawHandle;
     let handle = file.as_raw_handle();
     // Unlock first (no atomic downgrade on Windows), then reacquire as shared.
@@ -128,7 +128,7 @@ pub(crate) fn shared_lock(file: &std::fs::File, name: &str) -> Result<(), IpcErr
         )
     };
     if ok == 0 {
-        return Err(IpcError::LockContention(name.into()));
+        return Err(Error::LockContention(name.into()));
     }
     Ok(())
 }
@@ -181,11 +181,11 @@ fn generate_publisher_id() -> u64 {
 }
 
 /// Shared logic for opening and validating an existing SHM region.
-/// Used by both `ShmPublisher::open()` and `ShmSubscriber::connect()`.
+/// Used by both `Publisher::open()` and `Subscriber::connect()`.
 fn open_and_validate_region(
     name: &str,
     needs_write: bool,
-) -> Result<(RawMmap, Arc<Region>, PathBuf), IpcError> {
+) -> Result<(RawMmap, Arc<Region>, PathBuf), Error> {
     let path = shm_path(name);
 
     // Symlink defense: open with O_NOFOLLOW on Unix to prevent symlink attacks.
@@ -198,12 +198,12 @@ fn open_and_validate_region(
         opts.custom_flags(libc::O_NOFOLLOW);
         opts.open(&path).map_err(|e| {
             if e.raw_os_error() == Some(libc::ELOOP) {
-                IpcError::SegmentNameInvalid(format!(
+                Error::SegmentNameInvalid(format!(
                     "SHM path is a symlink (possible attack): {}",
                     path.display()
                 ))
             } else {
-                IpcError::Io(e)
+                Error::Io(e)
             }
         })?
     };
@@ -212,14 +212,12 @@ fn open_and_validate_region(
         .read(true)
         .write(needs_write)
         .open(&path)
-        .map_err(IpcError::Io)?;
+        .map_err(Error::Io)?;
 
-    let mmap = RawMmap::from_file(&file).map_err(IpcError::Io)?;
+    let mmap = RawMmap::from_file(&file).map_err(Error::Io)?;
 
     if mmap.len() < HEADER_SIZE {
-        return Err(IpcError::InvalidRegion(
-            "region too small for header".into(),
-        ));
+        return Err(Error::InvalidRegion("region too small for header".into()));
     }
 
     // Validate header
@@ -228,13 +226,13 @@ fn open_and_validate_region(
         let mut magic = [0u8; 8];
         core::ptr::copy_nonoverlapping(ptr.add(GH_MAGIC), magic.as_mut_ptr(), 8);
         if &magic != MAGIC {
-            return Err(IpcError::InvalidRegion(
+            return Err(Error::InvalidRegion(
                 "invalid magic (expected XBAR_ZC)".into(),
             ));
         }
         let ver = (ptr.add(GH_VERSION) as *const u32).read();
         if ver != VERSION {
-            return Err(IpcError::InvalidRegion(format!(
+            return Err(Error::InvalidRegion(format!(
                 "unsupported version {ver}, expected {VERSION}"
             )));
         }
@@ -242,7 +240,7 @@ fn open_and_validate_region(
 
     // Read config from header
     let config = unsafe {
-        PubSubConfig {
+        Config {
             max_topics: (ptr.add(GH_MAX_TOPICS) as *const u32).read(),
             block_count: (ptr.add(GH_BLOCK_COUNT) as *const u32).read(),
             block_size: (ptr.add(GH_BLOCK_SIZE) as *const u32).read(),
@@ -250,41 +248,41 @@ fn open_and_validate_region(
             stale_timeout: Duration::from_micros(
                 (ptr.add(GH_STALE_TIMEOUT_US) as *const u64).read(),
             ),
-            ..PubSubConfig::default()
+            ..Config::default()
         }
     };
 
     // Validate config read from SHM header (H5: defense against malicious header)
     if config.block_size < BLOCK_DATA_OFFSET as u32 + 1 {
-        return Err(IpcError::InvalidRegion(format!(
+        return Err(Error::InvalidRegion(format!(
             "header block_size {} too small",
             config.block_size
         )));
     }
     if !config.ring_depth.is_power_of_two() || config.ring_depth == 0 {
-        return Err(IpcError::InvalidRegion(format!(
+        return Err(Error::InvalidRegion(format!(
             "header ring_depth {} is not a power of 2",
             config.ring_depth
         )));
     }
     if config.block_count == 0 {
-        return Err(IpcError::InvalidRegion("header block_count is 0".into()));
+        return Err(Error::InvalidRegion("header block_count is 0".into()));
     }
     if config.max_topics == 0 {
-        return Err(IpcError::InvalidRegion("header max_topics is 0".into()));
+        return Err(Error::InvalidRegion("header max_topics is 0".into()));
     }
     if config.max_topics > MAX_TOPICS_LIMIT {
-        return Err(IpcError::InvalidRegion(format!(
+        return Err(Error::InvalidRegion(format!(
             "header max_topics {} exceeds limit {MAX_TOPICS_LIMIT}",
             config.max_topics
         )));
     }
 
     // Use checked arithmetic to prevent overflow (M6)
-    let expected_size = region_size_checked(&config).ok_or(IpcError::RegionSizeOverflow)?;
+    let expected_size = region_size_checked(&config).ok_or(Error::RegionSizeOverflow)?;
 
     if mmap.len() < expected_size {
-        return Err(IpcError::InvalidRegion(format!(
+        return Err(Error::InvalidRegion(format!(
             "region size {} < expected {expected_size}",
             mmap.len()
         )));
@@ -298,7 +296,7 @@ fn open_and_validate_region(
     Ok((mmap, region, path))
 }
 
-// ---- ShmPublisher ----
+// ---- Publisher ----
 
 /// O(1) zero-copy publisher over shared memory.
 ///
@@ -311,7 +309,7 @@ fn open_and_validate_region(
 /// ```rust,no_run
 /// use crossbar::*;
 ///
-/// let mut pub_ = ShmPublisher::create("prices", PubSubConfig::default()).unwrap();
+/// let mut pub_ = Publisher::create("prices", Config::default()).unwrap();
 /// let topic = pub_.register("/tick/AAPL").unwrap();
 ///
 /// let mut loan = pub_.loan(&topic).unwrap();
@@ -319,7 +317,7 @@ fn open_and_validate_region(
 /// loan.set_len(8).unwrap();
 /// loan.publish(); // O(1) -- writes 8 bytes to ring
 /// ```
-pub struct ShmPublisher {
+pub struct Publisher {
     _mmap: RawMmap,
     region: Arc<Region>,
     path: PathBuf,
@@ -334,13 +332,13 @@ pub struct ShmPublisher {
     pinned_blocks: alloc::vec::Vec<u32>,
 }
 
-impl ShmPublisher {
+impl Publisher {
     /// Allocates a block from the local cache, refilling from the global pool on miss.
     /// Checks the recycled (cache-warm) block first for optimal L1/L2 reuse.
     ///
     /// Returns `Ok(Some(idx))` on success, `Ok(None)` if the pool is exhausted,
     /// or `Err(RegionCorrupted)` if free-list corruption is detected.
-    fn alloc_cached(&mut self) -> Result<Option<u32>, IpcError> {
+    fn alloc_cached(&mut self) -> Result<Option<u32>, Error> {
         // First: check for a recycled block (cache-warm from last publish)
         if let Some(idx) = self.region.alloc_recycled() {
             return Ok(Some(idx));
@@ -359,7 +357,7 @@ impl ShmPublisher {
                 }
                 Ok(None) => break,
                 Err(()) => {
-                    return Err(IpcError::RegionCorrupted(
+                    return Err(Error::RegionCorrupted(
                         "free-list contains out-of-bounds block index".into(),
                     ));
                 }
@@ -376,10 +374,10 @@ impl ShmPublisher {
     /// Shared preamble for `loan` and `loan_typed`: heartbeat check + block alloc.
     /// Returns (block_idx, topic_idx). Atomic refs are computed by the caller
     /// from `self.region` to avoid borrow conflicts.
-    fn loan_preamble(&mut self, handle: &TopicHandle) -> Result<(u32, u32), IpcError> {
+    fn loan_preamble(&mut self, handle: &Topic) -> Result<(u32, u32), Error> {
         // Runtime check: reject handles from a different publisher (Codex HIGH)
         if handle.publisher_id != self.id {
-            return Err(IpcError::HandleMismatch);
+            return Err(Error::HandleMismatch);
         }
 
         // Counter-based heartbeat: check clock every 1024 loans, not every loan.
@@ -393,7 +391,7 @@ impl ShmPublisher {
             }
         }
 
-        let block_idx = self.alloc_cached()?.ok_or(IpcError::PoolExhausted)?;
+        let block_idx = self.alloc_cached()?.ok_or(Error::PoolExhausted)?;
 
         Ok((block_idx, handle.topic_idx))
     }
@@ -402,39 +400,39 @@ impl ShmPublisher {
     ///
     /// # Errors
     ///
-    /// Returns [`IpcError::Io`] if the backing file cannot be created,
-    /// or [`IpcError::InvalidRegion`] if another publisher is active.
-    pub fn create(name: &str, config: PubSubConfig) -> Result<Self, IpcError> {
+    /// Returns [`Error::Io`] if the backing file cannot be created,
+    /// or [`Error::InvalidRegion`] if another publisher is active.
+    pub fn create(name: &str, config: Config) -> Result<Self, Error> {
         // Validate segment name against path traversal (C2)
         validate_name(name)?;
 
         // Validate config to prevent panics from invalid values
         if config.block_size < BLOCK_DATA_OFFSET as u32 + 1 {
-            return Err(IpcError::InvalidRegion(format!(
+            return Err(Error::InvalidRegion(format!(
                 "block_size must be at least {} (got {})",
                 BLOCK_DATA_OFFSET + 1,
                 config.block_size
             )));
         }
         if !config.ring_depth.is_power_of_two() {
-            return Err(IpcError::InvalidRegion(format!(
+            return Err(Error::InvalidRegion(format!(
                 "ring_depth must be a power of 2 (got {})",
                 config.ring_depth
             )));
         }
         if config.block_count == 0 {
-            return Err(IpcError::InvalidRegion(
+            return Err(Error::InvalidRegion(
                 "block_count must be at least 1".to_string(),
             ));
         }
         if config.max_topics == 0 {
-            return Err(IpcError::InvalidRegion(
+            return Err(Error::InvalidRegion(
                 "max_topics must be at least 1".to_string(),
             ));
         }
 
         // Check for overflow in region size computation (M6)
-        let size = region_size_checked(&config).ok_or(IpcError::RegionSizeOverflow)?;
+        let size = region_size_checked(&config).ok_or(Error::RegionSizeOverflow)?;
 
         let path = shm_path(name);
         let lpath = lock_path(name);
@@ -447,7 +445,7 @@ impl ShmPublisher {
                 use std::os::unix::fs::OpenOptionsExt;
                 opts.mode(0o600); // H8: restrictive permissions
             }
-            opts.open(&lpath).map_err(IpcError::Io)?
+            opts.open(&lpath).map_err(Error::Io)?
         };
 
         // Exclusive lock -- only one publisher per region
@@ -472,17 +470,17 @@ impl ShmPublisher {
             opts.open(&path).map_err(|e| {
                 #[cfg(unix)]
                 if e.raw_os_error() == Some(libc::ELOOP) {
-                    return IpcError::SegmentNameInvalid(format!(
+                    return Error::SegmentNameInvalid(format!(
                         "SHM path is a symlink (possible attack): {}",
                         path.display()
                     ));
                 }
-                IpcError::Io(e)
+                Error::Io(e)
             })?
         };
-        file.set_len(size as u64).map_err(IpcError::Io)?;
+        file.set_len(size as u64).map_err(Error::Io)?;
 
-        let mmap = RawMmap::from_file_with_len(&file, size).map_err(IpcError::Io)?;
+        let mmap = RawMmap::from_file_with_len(&file, size).map_err(Error::Io)?;
 
         // Write global header
         let ptr = mmap.as_mut_ptr();
@@ -528,7 +526,7 @@ impl ShmPublisher {
         let created_ino = file_identity(&path);
         let id = generate_publisher_id();
 
-        Ok(ShmPublisher {
+        Ok(Publisher {
             _mmap: mmap,
             region,
             path,
@@ -548,13 +546,13 @@ impl ShmPublisher {
     ///
     /// Unlike [`create`](Self::create), this does not create the SHM file or
     /// hold an exclusive lock. The region must already exist (created by
-    /// another `ShmPublisher::create` call). Config is read from the header.
+    /// another `Publisher::create` call). Config is read from the header.
     ///
     /// # Errors
     ///
     /// Returns an error if the region file doesn't exist, has invalid
     /// magic/version, or the publisher's heartbeat is stale.
-    pub fn open(name: &str) -> Result<Self, IpcError> {
+    pub fn open(name: &str) -> Result<Self, Error> {
         validate_name(name)?;
 
         let lpath = lock_path(name);
@@ -567,14 +565,14 @@ impl ShmPublisher {
             .create(true)
             .truncate(false)
             .open(&lpath)
-            .map_err(IpcError::Io)?;
+            .map_err(Error::Io)?;
         shared_lock(&lock_file, name)?;
 
         let (mmap, region, path) = open_and_validate_region(name, true)?;
         let id = generate_publisher_id();
         let max_topics = region.config.max_topics;
 
-        Ok(ShmPublisher {
+        Ok(Publisher {
             _mmap: mmap,
             region,
             path,
@@ -596,7 +594,7 @@ impl ShmPublisher {
     ///
     /// Returns an error if the maximum number of topics has been reached
     /// or the URI exceeds 64 bytes.
-    pub fn register(&mut self, uri: &str) -> Result<TopicHandle, IpcError> {
+    pub fn register(&mut self, uri: &str) -> Result<Topic, Error> {
         self.register_inner(uri, 0)
     }
 
@@ -610,10 +608,10 @@ impl ShmPublisher {
     ///
     /// Returns an error if `T`'s alignment exceeds 8, the maximum number
     /// of topics has been reached, or the URI exceeds 64 bytes.
-    pub fn register_typed<T: crate::Pod>(&mut self, uri: &str) -> Result<TopicHandle, IpcError> {
+    pub fn register_typed<T: crate::Pod>(&mut self, uri: &str) -> Result<Topic, Error> {
         const { assert!(core::mem::align_of::<u128>() <= 16) }; // sanity
         if core::mem::align_of::<T>() > 8 {
-            return Err(IpcError::AlignmentError {
+            return Err(Error::AlignmentError {
                 align: core::mem::align_of::<T>(),
                 max: 8,
             });
@@ -621,9 +619,9 @@ impl ShmPublisher {
         self.register_inner(uri, core::mem::size_of::<T>() as u32)
     }
 
-    fn register_inner(&mut self, uri: &str, type_size: u32) -> Result<TopicHandle, IpcError> {
+    fn register_inner(&mut self, uri: &str, type_size: u32) -> Result<Topic, Error> {
         if uri.len() > TE_URI_MAX {
-            return Err(IpcError::UriTooLong {
+            return Err(Error::UriTooLong {
                 len: uri.len(),
                 max: TE_URI_MAX,
             });
@@ -648,7 +646,7 @@ impl ShmPublisher {
                         core::slice::from_raw_parts(base_ptr.add(off + TE_URI), existing_len)
                     };
                     if existing_len == uri.len() && existing_bytes == uri.as_bytes() {
-                        return Ok(TopicHandle {
+                        return Ok(Topic {
                             topic_idx: i,
                             publisher_id: self.id,
                         });
@@ -694,13 +692,13 @@ impl ShmPublisher {
             // Transition INIT -> ACTIVE (now visible to subscribers)
             active.store(TE_STATE_ACTIVE, Ordering::Release);
 
-            return Ok(TopicHandle {
+            return Ok(Topic {
                 topic_idx: i,
                 publisher_id: self.id,
             });
         }
 
-        Err(IpcError::MaxTopicsReached)
+        Err(Error::MaxTopicsReached)
     }
 
     /// Updates the publisher heartbeat. Call this periodically during idle
@@ -713,24 +711,24 @@ impl ShmPublisher {
     ///
     /// # Errors
     ///
-    /// Returns [`IpcError::ClockError`] if the system clock is before UNIX epoch.
-    pub fn heartbeat(&mut self) -> Result<(), IpcError> {
+    /// Returns [`Error::ClockError`] if the system clock is before UNIX epoch.
+    pub fn heartbeat(&mut self) -> Result<(), Error> {
         self.region.update_heartbeat()?;
         self.last_heartbeat = std::time::Instant::now();
         Ok(())
     }
 
     /// Loans a block from the pool for writing. Write your data, then call
-    /// [`publish`](ShmLoan::publish) to make it visible to subscribers.
+    /// [`publish`](Loan::publish) to make it visible to subscribers.
     ///
     /// If the loan is dropped without publishing, the block is returned to
     /// the pool automatically.
     ///
     /// # Errors
     ///
-    /// Returns [`IpcError::PoolExhausted`] if all blocks are in use.
+    /// Returns [`Error::PoolExhausted`] if all blocks are in use.
     #[inline]
-    pub fn loan(&mut self, handle: &TopicHandle) -> Result<ShmLoan<'_>, IpcError> {
+    pub fn loan(&mut self, handle: &Topic) -> Result<Loan<'_>, Error> {
         let (block_idx, topic_idx) = self.loan_preamble(handle)?;
         let off = topic_entry_off(topic_idx);
         let base_ptr = self.region.base_ptr();
@@ -738,7 +736,7 @@ impl ShmPublisher {
         let waiters_atom = unsafe { &*(base_ptr.add(off + TE_WAITERS) as *const AtomicU32) };
         let data_ptr = unsafe { self.region.block_ptr(block_idx).add(BLOCK_DATA_OFFSET) };
 
-        Ok(ShmLoan {
+        Ok(Loan {
             region: &self.region,
             data_ptr,
             capacity: self.region.data_capacity(),
@@ -753,25 +751,22 @@ impl ShmPublisher {
 
     /// Loans a typed block from the pool for writing a `T: Pod` value.
     ///
-    /// Use [`TypedShmLoan::send`] to write and publish in one step,
-    /// or [`TypedShmLoan::as_mut`] + [`TypedShmLoan::publish`] to
+    /// Use [`TypedLoan::send`] to write and publish in one step,
+    /// or [`TypedLoan::as_mut`] + [`TypedLoan::publish`] to
     /// fill fields individually (born-in-SHM pattern).
     ///
     /// # Errors
     ///
-    /// Returns [`IpcError::PoolExhausted`] if all blocks are in use.
+    /// Returns [`Error::PoolExhausted`] if all blocks are in use.
     #[inline]
-    pub fn loan_typed<T: crate::Pod>(
-        &mut self,
-        handle: &TopicHandle,
-    ) -> Result<TypedShmLoan<'_, T>, IpcError> {
+    pub fn loan_typed<T: crate::Pod>(&mut self, handle: &Topic) -> Result<TypedLoan<'_, T>, Error> {
         let (block_idx, topic_idx) = self.loan_preamble(handle)?;
         let off = topic_entry_off(topic_idx);
         let base_ptr = self.region.base_ptr();
         let write_seq_atom = unsafe { &*(base_ptr.add(off + TE_WRITE_SEQ) as *const AtomicU64) };
         let waiters_atom = unsafe { &*(base_ptr.add(off + TE_WAITERS) as *const AtomicU32) };
 
-        Ok(TypedShmLoan {
+        Ok(TypedLoan {
             region: &self.region,
             block_idx,
             topic_idx,
@@ -786,22 +781,22 @@ impl ShmPublisher {
     /// dedicated block. Subsequent calls return the same block -- no alloc.
     ///
     /// The publisher uses a CAS-based writer sentinel to prevent data races:
-    /// if any subscriber holds a [`PinnedGuard`](super::subscription::PinnedGuard) for this topic, this method
+    /// if any subscriber holds a [`PinnedSample`](super::subscription::PinnedSample) for this topic, this method
     /// returns an error.
     ///
     /// # Errors
     ///
-    /// - [`IpcError::PinnedReadersActive`] if a subscriber holds a `PinnedGuard`.
-    /// - [`IpcError::PoolExhausted`] if the pool is exhausted (first call only).
-    pub fn loan_pinned(&mut self, handle: &TopicHandle) -> Result<PinnedLoan<'_>, IpcError> {
+    /// - [`Error::PinnedReadersActive`] if a subscriber holds a `PinnedSample`.
+    /// - [`Error::PoolExhausted`] if the pool is exhausted (first call only).
+    pub fn loan_pinned(&mut self, handle: &Topic) -> Result<PinnedLoan<'_>, Error> {
         if handle.publisher_id != self.id {
-            return Err(IpcError::HandleMismatch);
+            return Err(Error::HandleMismatch);
         }
         let topic_idx = handle.topic_idx;
 
         // Bounds check (H2: pinned_blocks is now Vec sized to max_topics)
         if topic_idx as usize >= self.pinned_blocks.len() {
-            return Err(IpcError::InvalidRegion(format!(
+            return Err(Error::InvalidRegion(format!(
                 "topic_idx {} >= max_topics {}",
                 topic_idx,
                 self.pinned_blocks.len()
@@ -812,7 +807,7 @@ impl ShmPublisher {
         let block_idx = if self.pinned_blocks[topic_idx as usize] != NO_BLOCK {
             self.pinned_blocks[topic_idx as usize]
         } else {
-            let idx = self.alloc_cached()?.ok_or(IpcError::PoolExhausted)?;
+            let idx = self.alloc_cached()?.ok_or(Error::PoolExhausted)?;
             self.pinned_blocks[topic_idx as usize] = idx;
             // Store in SHM topic entry so subscribers can find it
             self.region.set_pinned_block(topic_idx, idx);
@@ -831,7 +826,7 @@ impl ShmPublisher {
                 } else {
                     current
                 };
-                return Err(IpcError::PinnedReadersActive { count, topic_idx });
+                return Err(Error::PinnedReadersActive { count, topic_idx });
             }
         }
 
@@ -856,16 +851,16 @@ impl ShmPublisher {
     /// Returns the number of active subscribers for a topic.
     ///
     /// This is an informational counter stored in shared memory. It is
-    /// incremented when a [`Subscription`] is created and decremented when
+    /// incremented when a [`Stream`] is created and decremented when
     /// the subscription is dropped.
     ///
     /// # Errors
     ///
-    /// Returns [`IpcError::HandleMismatch`] if the handle belongs to a
+    /// Returns [`Error::HandleMismatch`] if the handle belongs to a
     /// different publisher.
-    pub fn subscriber_count(&self, handle: &TopicHandle) -> Result<u32, IpcError> {
+    pub fn subscriber_count(&self, handle: &Topic) -> Result<u32, Error> {
         if handle.publisher_id != self.id {
-            return Err(IpcError::HandleMismatch);
+            return Err(Error::HandleMismatch);
         }
         let off = topic_entry_off(handle.topic_idx);
         let counter = unsafe {
@@ -875,7 +870,7 @@ impl ShmPublisher {
     }
 }
 
-impl Drop for ShmPublisher {
+impl Drop for Publisher {
     fn drop(&mut self) {
         // Free pinned blocks
         for &blk in &self.pinned_blocks {
@@ -905,43 +900,43 @@ impl Drop for ShmPublisher {
     }
 }
 
-// ---- ShmSubscriber ----
+// ---- Subscriber ----
 
 /// O(1) zero-copy subscriber for pool-backed pub/sub.
 ///
-/// Connects to an existing [`ShmPublisher`] region. Returns safe
-/// [`super::subscription::SampleGuard`] references -- no `unsafe` needed to read data.
+/// Connects to an existing [`Publisher`] region. Returns safe
+/// [`super::subscription::Sample`] references -- no `unsafe` needed to read data.
 ///
 /// # Examples
 ///
 /// ```rust,no_run
 /// use crossbar::*;
 ///
-/// let sub = ShmSubscriber::connect("prices").unwrap();
+/// let sub = Subscriber::connect("prices").unwrap();
 /// let stream = sub.subscribe("/tick/AAPL").unwrap();
 ///
 /// if let Some(sample) = stream.try_recv() {
 ///     println!("data: {:?}", &*sample); // safe Deref<Target=[u8]>
 /// };
 /// ```
-pub struct ShmSubscriber {
+pub struct Subscriber {
     _mmap: RawMmap,
     region: Arc<Region>,
 }
 
-impl ShmSubscriber {
+impl Subscriber {
     /// Connects to an existing pool pub/sub region.
     ///
     /// # Errors
     ///
     /// Returns an error if the region file doesn't exist, has invalid
     /// magic/version, or the publisher's heartbeat is stale.
-    pub fn connect(name: &str) -> Result<Self, IpcError> {
+    pub fn connect(name: &str) -> Result<Self, Error> {
         validate_name(name)?;
 
         let (mmap, region, _path) = open_and_validate_region(name, true)?;
 
-        Ok(ShmSubscriber {
+        Ok(Subscriber {
             _mmap: mmap,
             region,
         })
@@ -952,7 +947,7 @@ impl ShmSubscriber {
     /// # Errors
     ///
     /// Returns an error if the topic is not registered by the publisher.
-    pub fn subscribe(&self, uri: &str) -> Result<Subscription, IpcError> {
+    pub fn subscribe(&self, uri: &str) -> Result<Stream, Error> {
         let hash = uri_hash(uri);
 
         let base_ptr = self.region.base_ptr();
@@ -990,7 +985,7 @@ impl ShmSubscriber {
                 unsafe { &*(base_ptr.add(off + TE_SUBSCRIBER_COUNT) as *const AtomicU32) };
             sub_count.fetch_add(1, Ordering::Relaxed);
 
-            return Ok(Subscription {
+            return Ok(Stream {
                 region: Arc::clone(&self.region),
                 topic_idx: i,
                 last_seq: std::cell::Cell::new(current),
@@ -998,6 +993,6 @@ impl ShmSubscriber {
             });
         }
 
-        Err(IpcError::TopicNotFound(uri.into()))
+        Err(Error::TopicNotFound(uri.into()))
     }
 }

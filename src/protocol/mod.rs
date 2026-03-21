@@ -13,7 +13,7 @@ mod config;
 pub(crate) mod layout;
 mod region;
 
-pub use config::PubSubConfig;
+pub use config::Config;
 #[cfg(feature = "std")]
 pub(crate) use region::release_block;
 pub use region::Region;

@@ -34,12 +34,12 @@ fn mono_nanos() -> u64 {
 }
 
 fn main() {
-    let mut pub_ = ShmPublisher::create(
+    let mut pub_ = Publisher::create(
         "bench-xproc",
-        PubSubConfig {
+        Config {
             ring_depth: 64, // deep ring so subscriber doesn't miss
             max_topics: 1,  // only one topic
-            ..PubSubConfig::default()
+            ..Config::default()
         },
     )
     .unwrap();

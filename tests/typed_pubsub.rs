@@ -12,10 +12,10 @@ unsafe impl Pod for Tick {}
 #[test]
 fn typed_publish_subscribe() {
     let name = &format!("test-typed-{}", std::process::id());
-    let mut pub_ = ShmPublisher::create(name, PubSubConfig::default()).unwrap();
+    let mut pub_ = Publisher::create(name, Config::default()).unwrap();
     let handle = pub_.register_typed::<Tick>("/tick/AAPL").unwrap();
 
-    let sub = ShmSubscriber::connect(name).unwrap();
+    let sub = Subscriber::connect(name).unwrap();
     let stream = sub.subscribe("/tick/AAPL").unwrap();
 
     let tick = Tick {
@@ -32,10 +32,10 @@ fn typed_publish_subscribe() {
 #[test]
 fn typed_send_multiple() {
     let name = &format!("test-typed-multi-{}", std::process::id());
-    let mut pub_ = ShmPublisher::create(name, PubSubConfig::default()).unwrap();
+    let mut pub_ = Publisher::create(name, Config::default()).unwrap();
     let handle = pub_.register_typed::<u64>("/counter").unwrap();
 
-    let sub = ShmSubscriber::connect(name).unwrap();
+    let sub = Subscriber::connect(name).unwrap();
     let stream = sub.subscribe("/counter").unwrap();
 
     for i in 0..10u64 {
@@ -54,10 +54,10 @@ fn typed_send_multiple() {
 #[test]
 fn typed_loan_as_mut() {
     let name = &format!("test-typed-mut-{}", std::process::id());
-    let mut pub_ = ShmPublisher::create(name, PubSubConfig::default()).unwrap();
+    let mut pub_ = Publisher::create(name, Config::default()).unwrap();
     let handle = pub_.register_typed::<Tick>("/tick").unwrap();
 
-    let sub = ShmSubscriber::connect(name).unwrap();
+    let sub = Subscriber::connect(name).unwrap();
     let stream = sub.subscribe("/tick").unwrap();
 
     let mut loan = pub_.loan_typed::<Tick>(&handle).unwrap();
@@ -75,13 +75,13 @@ fn typed_loan_as_mut() {
 #[test]
 fn typed_size_mismatch_returns_none() {
     let name = &format!("test-typed-mismatch-{}", std::process::id());
-    let mut pub_ = ShmPublisher::create(name, PubSubConfig::default()).unwrap();
+    let mut pub_ = Publisher::create(name, Config::default()).unwrap();
     let handle = pub_.register_typed::<u64>("/data").unwrap();
 
     // Publish a u64 value so there's data available
     pub_.loan_typed::<u64>(&handle).unwrap().send(42u64);
 
-    let sub = ShmSubscriber::connect(name).unwrap();
+    let sub = Subscriber::connect(name).unwrap();
     let stream = sub.subscribe("/data").unwrap();
     // Mismatched type size: topic is u64 (8 bytes), we request u32 (4 bytes)
     // Should return None instead of panicking
@@ -94,10 +94,10 @@ fn typed_size_mismatch_returns_none() {
 #[test]
 fn untyped_api_still_works() {
     let name = &format!("test-untyped-{}", std::process::id());
-    let mut pub_ = ShmPublisher::create(name, PubSubConfig::default()).unwrap();
+    let mut pub_ = Publisher::create(name, Config::default()).unwrap();
     let handle = pub_.register("/raw").unwrap();
 
-    let sub = ShmSubscriber::connect(name).unwrap();
+    let sub = Subscriber::connect(name).unwrap();
     let stream = sub.subscribe("/raw").unwrap();
 
     let mut loan = pub_.loan(&handle).unwrap();

@@ -10,10 +10,10 @@ fn unique_name(suffix: &str) -> String {
 #[test]
 fn write_basic() {
     let name = unique_name("basic");
-    let mut pub_ = ShmPublisher::create(&name, PubSubConfig::default()).unwrap();
+    let mut pub_ = Publisher::create(&name, Config::default()).unwrap();
     let topic = pub_.register("/data").unwrap();
 
-    let sub = ShmSubscriber::connect(&name).unwrap();
+    let sub = Subscriber::connect(&name).unwrap();
     let stream = sub.subscribe("/data").unwrap();
 
     let mut loan = pub_.loan(&topic).unwrap();
@@ -30,11 +30,11 @@ fn write_basic() {
 fn write_partial_then_write_zero() {
     let name = unique_name("partial");
     // block_size=16 means data capacity = 16 - 8 = 8 bytes
-    let cfg = PubSubConfig {
+    let cfg = Config {
         block_size: 16,
-        ..PubSubConfig::default()
+        ..Config::default()
     };
-    let mut pub_ = ShmPublisher::create(&name, cfg).unwrap();
+    let mut pub_ = Publisher::create(&name, cfg).unwrap();
     let topic = pub_.register("/data").unwrap();
 
     let mut loan = pub_.loan(&topic).unwrap();
@@ -60,10 +60,10 @@ fn write_partial_then_write_zero() {
 #[test]
 fn write_accumulates_len() {
     let name = unique_name("accum");
-    let mut pub_ = ShmPublisher::create(&name, PubSubConfig::default()).unwrap();
+    let mut pub_ = Publisher::create(&name, Config::default()).unwrap();
     let topic = pub_.register("/data").unwrap();
 
-    let sub = ShmSubscriber::connect(&name).unwrap();
+    let sub = Subscriber::connect(&name).unwrap();
     let stream = sub.subscribe("/data").unwrap();
 
     let mut loan = pub_.loan(&topic).unwrap();
@@ -85,7 +85,7 @@ fn write_accumulates_len() {
 #[test]
 fn write_empty_succeeds() {
     let name = unique_name("empty");
-    let mut pub_ = ShmPublisher::create(&name, PubSubConfig::default()).unwrap();
+    let mut pub_ = Publisher::create(&name, Config::default()).unwrap();
     let topic = pub_.register("/data").unwrap();
 
     let mut loan = pub_.loan(&topic).unwrap();
@@ -99,10 +99,10 @@ fn write_empty_succeeds() {
 #[test]
 fn write_then_set_data_overwrites() {
     let name = unique_name("overwrite");
-    let mut pub_ = ShmPublisher::create(&name, PubSubConfig::default()).unwrap();
+    let mut pub_ = Publisher::create(&name, Config::default()).unwrap();
     let topic = pub_.register("/data").unwrap();
 
-    let sub = ShmSubscriber::connect(&name).unwrap();
+    let sub = Subscriber::connect(&name).unwrap();
     let stream = sub.subscribe("/data").unwrap();
 
     let mut loan = pub_.loan(&topic).unwrap();
@@ -122,7 +122,7 @@ fn write_then_set_data_overwrites() {
 #[test]
 fn flush_is_noop() {
     let name = unique_name("flush");
-    let mut pub_ = ShmPublisher::create(&name, PubSubConfig::default()).unwrap();
+    let mut pub_ = Publisher::create(&name, Config::default()).unwrap();
     let topic = pub_.register("/data").unwrap();
 
     let mut loan = pub_.loan(&topic).unwrap();
@@ -134,10 +134,10 @@ fn flush_is_noop() {
 #[test]
 fn write_formatted() {
     let name = unique_name("formatted");
-    let mut pub_ = ShmPublisher::create(&name, PubSubConfig::default()).unwrap();
+    let mut pub_ = Publisher::create(&name, Config::default()).unwrap();
     let topic = pub_.register("/data").unwrap();
 
-    let sub = ShmSubscriber::connect(&name).unwrap();
+    let sub = Subscriber::connect(&name).unwrap();
     let stream = sub.subscribe("/data").unwrap();
 
     let mut loan = pub_.loan(&topic).unwrap();
@@ -153,14 +153,14 @@ fn write_formatted() {
 #[test]
 fn write_exactly_fills_capacity() {
     let name = unique_name("exact-fill");
-    let cfg = PubSubConfig {
+    let cfg = Config {
         block_size: 16,
-        ..PubSubConfig::default()
+        ..Config::default()
     };
-    let mut pub_ = ShmPublisher::create(&name, cfg).unwrap();
+    let mut pub_ = Publisher::create(&name, cfg).unwrap();
     let topic = pub_.register("/data").unwrap();
 
-    let sub = ShmSubscriber::connect(&name).unwrap();
+    let sub = Subscriber::connect(&name).unwrap();
     let stream = sub.subscribe("/data").unwrap();
 
     let mut loan = pub_.loan(&topic).unwrap();

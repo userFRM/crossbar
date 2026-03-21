@@ -8,18 +8,18 @@ fn unique_name(suffix: &str) -> String {
 #[test]
 fn multi_publisher_same_topic() {
     let name = unique_name("same-topic");
-    let config = PubSubConfig::default();
+    let config = Config::default();
 
     // Publisher A creates the region
-    let mut pub_a = ShmPublisher::create(&name, config).unwrap();
+    let mut pub_a = Publisher::create(&name, config).unwrap();
     let topic_a = pub_a.register("/data").unwrap();
 
     // Publisher B opens the same region
-    let mut pub_b = ShmPublisher::open(&name).unwrap();
+    let mut pub_b = Publisher::open(&name).unwrap();
     let topic_b = pub_b.register("/data").unwrap();
 
     // Subscriber
-    let sub = ShmSubscriber::connect(&name).unwrap();
+    let sub = Subscriber::connect(&name).unwrap();
     let stream = sub.subscribe("/data").unwrap();
 
     // Both publish
@@ -51,15 +51,15 @@ fn multi_publisher_same_topic() {
 #[test]
 fn multi_publisher_different_topics() {
     let name = unique_name("diff-topics");
-    let config = PubSubConfig::default();
+    let config = Config::default();
 
-    let mut pub_a = ShmPublisher::create(&name, config).unwrap();
+    let mut pub_a = Publisher::create(&name, config).unwrap();
     let topic_a = pub_a.register("/prices/AAPL").unwrap();
 
-    let mut pub_b = ShmPublisher::open(&name).unwrap();
+    let mut pub_b = Publisher::open(&name).unwrap();
     let topic_b = pub_b.register("/prices/GOOG").unwrap();
 
-    let sub = ShmSubscriber::connect(&name).unwrap();
+    let sub = Subscriber::connect(&name).unwrap();
     let stream_a = sub.subscribe("/prices/AAPL").unwrap();
     let stream_b = sub.subscribe("/prices/GOOG").unwrap();
 
@@ -82,19 +82,19 @@ fn multi_publisher_different_topics() {
 fn multi_publisher_owner_cleanup() {
     // Only the owner (creator) should delete the SHM file on drop
     let name = unique_name("owner-cleanup");
-    let config = PubSubConfig::default();
+    let config = Config::default();
 
-    let mut pub_a = ShmPublisher::create(&name, config).unwrap();
+    let mut pub_a = Publisher::create(&name, config).unwrap();
     let _topic_a = pub_a.register("/test").unwrap();
 
-    let mut pub_b = ShmPublisher::open(&name).unwrap();
+    let mut pub_b = Publisher::open(&name).unwrap();
     let _topic_b = pub_b.register("/test").unwrap();
 
     // Drop non-owner first -- file should still exist
     drop(pub_b);
 
     // Owner can still publish
-    let sub = ShmSubscriber::connect(&name).unwrap();
+    let sub = Subscriber::connect(&name).unwrap();
     let stream = sub.subscribe("/test").unwrap();
 
     let mut loan = pub_a.loan(&_topic_a).unwrap();
@@ -109,12 +109,12 @@ fn multi_publisher_owner_cleanup() {
 fn multi_publisher_heartbeat() {
     // Both publishers should be able to update heartbeat
     let name = unique_name("heartbeat");
-    let config = PubSubConfig::default();
+    let config = Config::default();
 
-    let mut pub_a = ShmPublisher::create(&name, config).unwrap();
+    let mut pub_a = Publisher::create(&name, config).unwrap();
     let _topic_a = pub_a.register("/hb").unwrap();
 
-    let mut pub_b = ShmPublisher::open(&name).unwrap();
+    let mut pub_b = Publisher::open(&name).unwrap();
     let _topic_b = pub_b.register("/hb").unwrap();
 
     // Both update heartbeat -- should not error
@@ -122,7 +122,7 @@ fn multi_publisher_heartbeat() {
     pub_b.heartbeat().unwrap();
 
     // Subscriber should still see the region as alive
-    let sub = ShmSubscriber::connect(&name).unwrap();
+    let sub = Subscriber::connect(&name).unwrap();
     let stream = sub.subscribe("/hb").unwrap();
     assert!(stream.try_recv().is_none(), "should have no pending data");
 }

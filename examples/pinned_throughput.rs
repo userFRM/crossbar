@@ -2,9 +2,9 @@ use crossbar::*;
 use std::time::Instant;
 
 fn main() {
-    let mut pub_ = ShmPublisher::create("tp-bench", PubSubConfig::default()).unwrap();
+    let mut pub_ = Publisher::create("tp-bench", Config::default()).unwrap();
     let handle = pub_.register("/throughput").unwrap();
-    let sub = ShmSubscriber::connect("tp-bench").unwrap();
+    let sub = Subscriber::connect("tp-bench").unwrap();
     let stream = sub.subscribe("/throughput").unwrap();
 
     // Warmup

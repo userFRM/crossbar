@@ -9,7 +9,7 @@
 //!
 //! [`PodBus`] publishes values into a fixed-size ring buffer stored in a
 //! memory-mapped file under `/dev/shm` (Linux), `/tmp` (macOS), or `%TEMP%`
-//! (Windows). Any number of [`PodBusSubscriber`]s -- in the same or different
+//! (Windows). Any number of [`BusSubscriber`]s -- in the same or different
 //! processes -- can independently read from the ring without blocking the
 //! publisher or each other. Publish is O(1) regardless of subscriber count.
 //!
@@ -66,7 +66,7 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::path::PathBuf;
 
-use crate::error::IpcError;
+use crate::error::Error;
 use crate::protocol::layout::is_valid_segment_name;
 use crate::Pod;
 
@@ -113,27 +113,27 @@ fn pod_bus_lock_path(name: &str) -> PathBuf {
     p
 }
 
-fn validate_name(name: &str) -> Result<(), IpcError> {
+fn validate_name(name: &str) -> Result<(), Error> {
     if !is_valid_segment_name(name) {
-        return Err(IpcError::SegmentNameInvalid(name.into()));
+        return Err(Error::SegmentNameInvalid(name.into()));
     }
     Ok(())
 }
 
 /// Return microseconds since UNIX epoch, or `Err` if the clock is before epoch.
-fn now_micros() -> Result<u64, IpcError> {
+fn now_micros() -> Result<u64, Error> {
     let d = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| IpcError::ClockError)?;
+        .map_err(|_| Error::ClockError)?;
     #[allow(clippy::cast_possible_truncation)]
     Ok(d.as_micros() as u64)
 }
 
 /// Reject types with alignment > 8.
-fn check_alignment<T>() -> Result<(), IpcError> {
+fn check_alignment<T>() -> Result<(), Error> {
     let align = core::mem::align_of::<T>();
     if align > MAX_POD_ALIGN {
-        return Err(IpcError::AlignmentError {
+        return Err(Error::AlignmentError {
             align,
             max: MAX_POD_ALIGN,
         });
@@ -221,14 +221,14 @@ unsafe impl<T: Pod> Send for PodBus<T> {}
 /// # Examples
 ///
 /// ```rust,no_run
-/// use crossbar::{Pod, PodBusSubscriber};
+/// use crossbar::{Pod, BusSubscriber};
 ///
-/// let mut sub = PodBusSubscriber::<u64>::connect("example-prices").unwrap();
+/// let mut sub = BusSubscriber::<u64>::connect("example-prices").unwrap();
 /// if let Some(value) = sub.try_recv() {
 ///     println!("got: {value}");
 /// }
 /// ```
-pub struct PodBusSubscriber<T: Pod> {
+pub struct BusSubscriber<T: Pod> {
     _mmap: RawMmap,
     ring_ptr: *const u8,
     mask: u64,
@@ -241,8 +241,8 @@ pub struct PodBusSubscriber<T: Pod> {
 }
 
 // Safety: same reasoning as PodBus. Subscriber is read-only.
-unsafe impl<T: Pod> Send for PodBusSubscriber<T> {}
-unsafe impl<T: Pod> Sync for PodBusSubscriber<T> {}
+unsafe impl<T: Pod> Send for BusSubscriber<T> {}
+unsafe impl<T: Pod> Sync for BusSubscriber<T> {}
 
 impl<T: Pod> PodBus<T> {
     /// Create a new SPMC broadcast ring backed by shared memory.
@@ -253,16 +253,16 @@ impl<T: Pod> PodBus<T> {
     ///
     /// # Errors
     ///
-    /// Returns [`IpcError::SegmentNameInvalid`] if the name contains path
+    /// Returns [`Error::SegmentNameInvalid`] if the name contains path
     /// separators or null bytes.
-    /// Returns [`IpcError::AlignmentError`] if `align_of::<T>() > 8`.
-    /// Returns [`IpcError::LockContention`] if another publisher is active.
-    /// Returns [`IpcError::Io`] if the backing file cannot be created.
+    /// Returns [`Error::AlignmentError`] if `align_of::<T>() > 8`.
+    /// Returns [`Error::LockContention`] if another publisher is active.
+    /// Returns [`Error::Io`] if the backing file cannot be created.
     ///
     /// # Panics
     ///
     /// Panics if `ring_size` is zero or not a power of two.
-    pub fn create(name: &str, ring_size: usize) -> Result<Self, IpcError> {
+    pub fn create(name: &str, ring_size: usize) -> Result<Self, Error> {
         assert!(
             ring_size > 0 && ring_size.is_power_of_two(),
             "ring_size must be a power of two"
@@ -284,7 +284,7 @@ impl<T: Pod> PodBus<T> {
                 use std::os::unix::fs::OpenOptionsExt;
                 opts.mode(0o600);
             }
-            opts.open(&lpath).map_err(IpcError::Io)?
+            opts.open(&lpath).map_err(Error::Io)?
         };
         exclusive_lock(&lock_file, name)?;
 
@@ -299,11 +299,11 @@ impl<T: Pod> PodBus<T> {
                 use std::os::unix::fs::OpenOptionsExt;
                 opts.mode(0o600);
             }
-            opts.open(&path).map_err(IpcError::Io)?
+            opts.open(&path).map_err(Error::Io)?
         };
-        file.set_len(size as u64).map_err(IpcError::Io)?;
+        file.set_len(size as u64).map_err(Error::Io)?;
 
-        let mmap = RawMmap::from_file_with_len(&file, size).map_err(IpcError::Io)?;
+        let mmap = RawMmap::from_file_with_len(&file, size).map_err(Error::Io)?;
 
         // Write header
         let base = mmap.as_mut_ptr();
@@ -403,9 +403,9 @@ impl<T: Pod> PodBus<T> {
     ///
     /// # Errors
     ///
-    /// Returns [`IpcError::ClockError`] if the system clock is before the UNIX
+    /// Returns [`Error::ClockError`] if the system clock is before the UNIX
     /// epoch.
-    pub fn heartbeat(&mut self) -> Result<(), IpcError> {
+    pub fn heartbeat(&mut self) -> Result<(), Error> {
         let now = now_micros()?;
         self.heartbeat_atomic().store(now, Ordering::Release);
         Ok(())
@@ -420,10 +420,10 @@ impl<T: Pod> PodBus<T> {
     ///
     /// # Errors
     ///
-    /// Returns [`IpcError::Io`] if the SHM file cannot be re-opened.
-    /// Returns [`IpcError::LockContention`] if the lock file cannot be opened.
-    pub fn subscriber(&self) -> Result<PodBusSubscriber<T>, IpcError> {
-        PodBusSubscriber::connect(&self.name)
+    /// Returns [`Error::Io`] if the SHM file cannot be re-opened.
+    /// Returns [`Error::LockContention`] if the lock file cannot be opened.
+    pub fn subscriber(&self) -> Result<BusSubscriber<T>, Error> {
+        BusSubscriber::connect(&self.name)
     }
 
     /// Return the total number of values published so far.
@@ -470,7 +470,7 @@ impl<T: Pod> Drop for PodBus<T> {
     }
 }
 
-impl<T: Pod> PodBusSubscriber<T> {
+impl<T: Pod> BusSubscriber<T> {
     /// Connect to an existing [`PodBus`] by name.
     ///
     /// Opens its OWN mmap of the SHM file and validates the header (magic,
@@ -480,13 +480,13 @@ impl<T: Pod> PodBusSubscriber<T> {
     ///
     /// # Errors
     ///
-    /// Returns [`IpcError::Io`] if the file doesn't exist.
-    /// Returns [`IpcError::AlignmentError`] if `align_of::<T>() > 8`.
-    /// Returns [`IpcError::InvalidRegion`] if the header is invalid or the
+    /// Returns [`Error::Io`] if the file doesn't exist.
+    /// Returns [`Error::AlignmentError`] if `align_of::<T>() > 8`.
+    /// Returns [`Error::InvalidRegion`] if the header is invalid or the
     /// type parameters don't match.
-    /// Returns [`IpcError::PublisherDead`] if the heartbeat is stale.
-    /// Returns [`IpcError::LockContention`] if the lock cannot be acquired.
-    pub fn connect(name: &str) -> Result<Self, IpcError> {
+    /// Returns [`Error::PublisherDead`] if the heartbeat is stale.
+    /// Returns [`Error::LockContention`] if the lock cannot be acquired.
+    pub fn connect(name: &str) -> Result<Self, Error> {
         validate_name(name)?;
         check_alignment::<T>()?;
 
@@ -497,7 +497,7 @@ impl<T: Pod> PodBusSubscriber<T> {
         let lock_file = {
             let mut opts = std::fs::OpenOptions::new();
             opts.read(true).write(true).create(false).truncate(false);
-            opts.open(&lpath).map_err(IpcError::Io)?
+            opts.open(&lpath).map_err(Error::Io)?
         };
         shared_lock(&lock_file, name)?;
 
@@ -505,12 +505,12 @@ impl<T: Pod> PodBusSubscriber<T> {
             .read(true)
             .write(true) // needed for atomic operations on the mmap
             .open(&path)
-            .map_err(IpcError::Io)?;
+            .map_err(Error::Io)?;
 
-        let mmap = RawMmap::from_file(&file).map_err(IpcError::Io)?;
+        let mmap = RawMmap::from_file(&file).map_err(Error::Io)?;
 
         if mmap.len() < POD_BUS_HEADER_SIZE {
-            return Err(IpcError::InvalidRegion(
+            return Err(Error::InvalidRegion(
                 "PodBus region too small for header".into(),
             ));
         }
@@ -522,7 +522,7 @@ impl<T: Pod> PodBusSubscriber<T> {
             let mut magic = [0u8; 8];
             core::ptr::copy_nonoverlapping(base.add(PH_MAGIC), magic.as_mut_ptr(), 8);
             if &magic != POD_BUS_MAGIC {
-                return Err(IpcError::InvalidRegion(
+                return Err(Error::InvalidRegion(
                     "invalid PodBus magic (expected XPOD_ZC)".into(),
                 ));
             }
@@ -531,7 +531,7 @@ impl<T: Pod> PodBusSubscriber<T> {
         // Validate version
         let version = unsafe { (base.add(PH_VERSION) as *const u32).read() };
         if version != POD_BUS_VERSION {
-            return Err(IpcError::InvalidRegion(alloc::format!(
+            return Err(Error::InvalidRegion(alloc::format!(
                 "unsupported PodBus version {version}, expected {POD_BUS_VERSION}"
             )));
         }
@@ -543,20 +543,20 @@ impl<T: Pod> PodBusSubscriber<T> {
 
         // Validate ring_size
         if ring_size == 0 || !ring_size.is_power_of_two() {
-            return Err(IpcError::InvalidRegion(alloc::format!(
+            return Err(Error::InvalidRegion(alloc::format!(
                 "PodBus ring_size {ring_size} is not a power of two"
             )));
         }
 
         // Validate type compatibility
         if value_size != core::mem::size_of::<T>() {
-            return Err(IpcError::InvalidRegion(alloc::format!(
+            return Err(Error::InvalidRegion(alloc::format!(
                 "PodBus value_size mismatch: file has {value_size}, type needs {}",
                 core::mem::size_of::<T>()
             )));
         }
         if value_align != core::mem::align_of::<T>() {
-            return Err(IpcError::InvalidRegion(alloc::format!(
+            return Err(Error::InvalidRegion(alloc::format!(
                 "PodBus value_align mismatch: file has {value_align}, type needs {}",
                 core::mem::align_of::<T>()
             )));
@@ -565,7 +565,7 @@ impl<T: Pod> PodBusSubscriber<T> {
         // Validate total region size
         let expected_size = region_size::<T>(ring_size);
         if mmap.len() < expected_size {
-            return Err(IpcError::InvalidRegion(alloc::format!(
+            return Err(Error::InvalidRegion(alloc::format!(
                 "PodBus region size {} < expected {expected_size}",
                 mmap.len()
             )));
@@ -576,7 +576,7 @@ impl<T: Pod> PodBusSubscriber<T> {
             unsafe { &*(base.add(PH_HEARTBEAT_US) as *const AtomicU64) }.load(Ordering::Acquire);
         let now = now_micros()?;
         if now.saturating_sub(hb) > HEARTBEAT_STALE_US {
-            return Err(IpcError::PublisherDead);
+            return Err(Error::PublisherDead);
         }
 
         // Derive all pointers from THIS subscriber's own mmap.
@@ -774,7 +774,7 @@ mod tests {
         bus.publish(200);
 
         // Connect as a separate subscriber (simulates cross-process).
-        let mut sub = PodBusSubscriber::<u64>::connect(&name).unwrap();
+        let mut sub = BusSubscriber::<u64>::connect(&name).unwrap();
         // Subscriber connects at current write position, so previous values
         // are not visible unless we rewind. Publish new values.
         bus.publish(300);
@@ -801,7 +801,7 @@ mod tests {
         let _bus = PodBus::<u64>::create(&name, 8).unwrap();
 
         // Try connecting with wrong type size
-        let result = PodBusSubscriber::<u32>::connect(&name);
+        let result = BusSubscriber::<u32>::connect(&name);
         assert!(result.is_err());
     }
 
