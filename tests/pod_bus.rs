@@ -11,8 +11,8 @@ fn test_name(base: &str) -> String {
 #[test]
 fn basic_publish_subscribe() {
     let name = test_name("basic");
-    let bus = PodBus::<u64>::create(&name, 8).unwrap();
-    let mut sub = bus.subscriber();
+    let mut bus = PodBus::<u64>::create(&name, 8).unwrap();
+    let mut sub = bus.subscriber().unwrap();
 
     assert!(sub.try_recv().is_none());
 
@@ -25,10 +25,10 @@ fn basic_publish_subscribe() {
 #[test]
 fn multiple_subscribers_same_data() {
     let name = test_name("multi");
-    let bus = PodBus::<u64>::create(&name, 16).unwrap();
-    let mut s1 = bus.subscriber();
-    let mut s2 = bus.subscriber();
-    let mut s3 = bus.subscriber();
+    let mut bus = PodBus::<u64>::create(&name, 16).unwrap();
+    let mut s1 = bus.subscriber().unwrap();
+    let mut s2 = bus.subscriber().unwrap();
+    let mut s3 = bus.subscriber().unwrap();
 
     for i in 1..=5u64 {
         bus.publish(i);
@@ -46,8 +46,8 @@ fn multiple_subscribers_same_data() {
 #[test]
 fn ring_overwrite() {
     let name = test_name("overwrite");
-    let bus = PodBus::<u64>::create(&name, 4).unwrap();
-    let mut sub = bus.subscriber();
+    let mut bus = PodBus::<u64>::create(&name, 4).unwrap();
+    let mut sub = bus.subscriber().unwrap();
 
     // Publish 20 values into a ring of size 4.
     for i in 0..20u64 {
@@ -78,8 +78,8 @@ unsafe impl Pod for Tick {}
 #[test]
 fn custom_pod_struct() {
     let name = test_name("pod-struct");
-    let bus = PodBus::<Tick>::create(&name, 8).unwrap();
-    let mut sub = bus.subscriber();
+    let mut bus = PodBus::<Tick>::create(&name, 8).unwrap();
+    let mut sub = bus.subscriber().unwrap();
 
     let tick = Tick {
         price: 123.45,
@@ -96,7 +96,7 @@ fn custom_pod_struct() {
 #[test]
 fn connect_by_name() {
     let name = test_name("connect");
-    let bus = PodBus::<u64>::create(&name, 8).unwrap();
+    let mut bus = PodBus::<u64>::create(&name, 8).unwrap();
 
     // Publish some values before connecting
     bus.publish(10);
@@ -123,22 +123,30 @@ fn type_mismatch_rejected() {
 
 #[test]
 fn concurrent() {
-    use std::sync::{Arc, Barrier};
+    use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
 
     const N: u64 = 10_000;
     const NUM_SUBS: usize = 4;
 
     let name = test_name("concurrent");
-    let bus = Arc::new(PodBus::<u64>::create(&name, 1024).unwrap());
+    let bus = Arc::new(Mutex::new(PodBus::<u64>::create(&name, 1024).unwrap()));
     let barrier = Arc::new(Barrier::new(NUM_SUBS + 1));
 
-    let handles: Vec<_> = (0..NUM_SUBS)
-        .map(|_| {
+    // Create subscribers before spawning threads (publisher is behind Mutex).
+    let subs: Vec<_> = {
+        let bus_guard = bus.lock().unwrap();
+        (0..NUM_SUBS)
+            .map(|_| bus_guard.subscriber().unwrap())
+            .collect()
+    };
+
+    let handles: Vec<_> = subs
+        .into_iter()
+        .map(|mut sub| {
             let bus = Arc::clone(&bus);
             let barrier = Arc::clone(&barrier);
             thread::spawn(move || {
-                let mut sub = bus.subscriber();
                 barrier.wait();
 
                 let mut last = None;
@@ -158,7 +166,7 @@ fn concurrent() {
                         }
                         None => {
                             // If publisher is done and we got the last value, stop.
-                            if bus.published_count() >= N && last == Some(N) {
+                            if bus.lock().unwrap().published_count() >= N && last == Some(N) {
                                 break;
                             }
                             std::hint::spin_loop();
@@ -173,7 +181,7 @@ fn concurrent() {
     // Publisher.
     barrier.wait();
     for i in 1..=N {
-        bus.publish(i);
+        bus.lock().unwrap().publish(i);
     }
 
     for h in handles {
@@ -181,4 +189,60 @@ fn concurrent() {
         // Each subscriber should have received some values (may miss some due to ring overwrite).
         assert!(count > 0, "subscriber received nothing");
     }
+}
+
+#[test]
+fn subscriber_survives_publisher_drop() {
+    let name = test_name("survive");
+    let mut sub;
+    {
+        let mut bus = PodBus::<u64>::create(&name, 8).unwrap();
+        bus.publish(42);
+        bus.publish(43);
+        sub = bus.subscriber().unwrap();
+        bus.publish(44);
+        // bus drops here -- subscriber has its own mmap
+    }
+    // subscriber can still read what was published before drop
+    let mut received = Vec::new();
+    while let Some(v) = sub.try_recv() {
+        received.push(v);
+    }
+    assert_eq!(received, vec![44]);
+}
+
+#[test]
+fn second_create_fails_while_first_alive() {
+    let name = test_name("locktest");
+    let _bus = PodBus::<u64>::create(&name, 4).unwrap();
+
+    // A second create on the same name should fail (lock contention).
+    let result = PodBus::<u64>::create(&name, 4);
+    assert!(result.is_err());
+}
+
+#[test]
+fn lag_detection_via_total_lagged() {
+    let name = test_name("lag");
+    let mut bus = PodBus::<u64>::create(&name, 4).unwrap();
+    let mut sub = bus.subscriber().unwrap();
+
+    // Publish way more than ring_size
+    for i in 0..100u64 {
+        bus.publish(i);
+    }
+
+    // Drain what we can
+    while sub.try_recv().is_some() {}
+
+    // total_lagged should be > 0
+    assert!(sub.total_lagged() > 0, "expected lag but got 0");
+}
+
+#[test]
+fn heartbeat_method_works() {
+    let name = test_name("hb");
+    let mut bus = PodBus::<u64>::create(&name, 4).unwrap();
+    // Should succeed without publishing anything.
+    bus.heartbeat().unwrap();
 }
