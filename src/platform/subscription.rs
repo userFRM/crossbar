@@ -4,7 +4,7 @@
 
 // SPDX-License-Identifier: Apache-2.0
 
-//! Subscription, SampleGuard, TypedSampleGuard.
+//! Stream, Sample, TypedSample.
 
 use alloc::vec::Vec;
 use std::cell::Cell;
@@ -13,30 +13,30 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::error::IpcError;
+use crate::error::Error;
 use crate::protocol::layout::*;
 use crate::protocol::{release_block, Region};
 use crate::wait::WaitStrategy;
 
 use super::notify;
 
-// ---- Subscription ----
+// ---- Stream ----
 
 /// A subscription to a single topic on a pool-backed pub/sub region.
 ///
-/// Returns [`SampleGuard`] references that implement `Deref<Target=[u8]>`.
+/// Returns [`Sample`] references that implement `Deref<Target=[u8]>`.
 /// These guards are **safe** -- the block is held alive by atomic refcounting
 /// until the guard is dropped.
-pub struct Subscription {
+pub struct Stream {
     pub(crate) region: Arc<Region>,
     pub(crate) topic_idx: u32,
     pub(crate) last_seq: Cell<u64>,
     pub(crate) type_size: u32,
 }
 
-impl core::fmt::Debug for Subscription {
+impl core::fmt::Debug for Stream {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Subscription")
+        f.debug_struct("Stream")
             .field("topic_idx", &self.topic_idx)
             .field("type_size", &self.type_size)
             .field("last_seq", &self.last_seq.get())
@@ -44,7 +44,7 @@ impl core::fmt::Debug for Subscription {
     }
 }
 
-impl Drop for Subscription {
+impl Drop for Stream {
     fn drop(&mut self) {
         let off = topic_entry_off(self.topic_idx);
         let counter = unsafe {
@@ -54,7 +54,7 @@ impl Drop for Subscription {
     }
 }
 
-impl Subscription {
+impl Stream {
     fn write_seq_atom(&self) -> &AtomicU64 {
         let off = topic_entry_off(self.topic_idx);
         unsafe { &*(self.region.base_ptr().add(off + TE_WRITE_SEQ) as *const AtomicU64) }
@@ -74,7 +74,7 @@ impl Subscription {
     /// sequence numbers are claimed atomically and slots may be committed
     /// out of order.
     #[inline]
-    pub fn try_recv(&self) -> Option<SampleGuard<'_>> {
+    pub fn try_recv(&self) -> Option<Sample<'_>> {
         let current_seq = self.write_seq_atom().load(Ordering::Acquire);
         if current_seq <= self.last_seq.get() {
             return None;
@@ -182,16 +182,16 @@ impl Subscription {
     }
 
     #[inline]
-    fn try_read_slot(&self, seq: u64) -> Option<SampleGuard<'_>> {
+    fn try_read_slot(&self, seq: u64) -> Option<Sample<'_>> {
         let slot = self.try_read_slot_raw(seq)?;
-        Some(SampleGuard {
+        Some(Sample {
             region: &self.region,
             block_idx: slot.block_idx,
             len: slot.data_len as usize,
         })
     }
 
-    /// Non-blocking typed receive. Returns a [`TypedSampleGuard`] that
+    /// Non-blocking typed receive. Returns a [`TypedSample`] that
     /// dereferences to `&T`.
     ///
     /// Uses the same ring-window scan as [`try_recv`](Self::try_recv) to
@@ -199,7 +199,7 @@ impl Subscription {
     ///
     /// Returns `None` if no new data is available or if the topic's
     /// registered type size doesn't match `size_of::<T>()`.
-    pub fn try_recv_typed<T: crate::Pod>(&self) -> Option<TypedSampleGuard<'_, T>> {
+    pub fn try_recv_typed<T: crate::Pod>(&self) -> Option<TypedSample<'_, T>> {
         if self.type_size != 0 && self.type_size as usize != core::mem::size_of::<T>() {
             return None; // Type size mismatch — return None instead of panicking
         }
@@ -222,7 +222,7 @@ impl Subscription {
         // Scan for the first committed slot in the window
         for seq in scan_start..=current_seq {
             if let Some(slot) = self.try_read_slot_raw(seq) {
-                return Some(TypedSampleGuard {
+                return Some(TypedSample {
                     region: &self.region,
                     block_idx: slot.block_idx,
                     _marker: core::marker::PhantomData,
@@ -237,10 +237,8 @@ impl Subscription {
     ///
     /// # Errors
     ///
-    /// Returns [`IpcError::PublisherDead`] if the publisher heartbeat goes stale.
-    pub fn recv_typed<T: crate::Pod>(
-        &self,
-    ) -> Result<TypedSampleGuard<'_, T>, crate::error::IpcError> {
+    /// Returns [`Error::PublisherDead`] if the publisher heartbeat goes stale.
+    pub fn recv_typed<T: crate::Pod>(&self) -> Result<TypedSample<'_, T>, crate::error::Error> {
         self.recv_typed_with::<T>(crate::WaitStrategy::default())
     }
 
@@ -248,11 +246,11 @@ impl Subscription {
     ///
     /// # Errors
     ///
-    /// Returns [`IpcError::PublisherDead`] if the publisher heartbeat goes stale.
+    /// Returns [`Error::PublisherDead`] if the publisher heartbeat goes stale.
     pub fn recv_typed_with<T: crate::Pod>(
         &self,
         strategy: crate::WaitStrategy,
-    ) -> Result<TypedSampleGuard<'_, T>, crate::error::IpcError> {
+    ) -> Result<TypedSample<'_, T>, crate::error::Error> {
         self.blocking_recv(strategy, || self.try_recv_typed::<T>())
     }
 
@@ -266,8 +264,8 @@ impl Subscription {
     ///
     /// # Errors
     ///
-    /// Returns [`IpcError::PublisherDead`] if the publisher heartbeat goes stale.
-    pub fn recv_with(&self, strategy: WaitStrategy) -> Result<SampleGuard<'_>, IpcError> {
+    /// Returns [`Error::PublisherDead`] if the publisher heartbeat goes stale.
+    pub fn recv_with(&self, strategy: WaitStrategy) -> Result<Sample<'_>, Error> {
         self.blocking_recv(strategy, || self.try_recv())
     }
 
@@ -276,8 +274,8 @@ impl Subscription {
     ///
     /// # Errors
     ///
-    /// Returns [`IpcError::PublisherDead`] if the publisher heartbeat goes stale.
-    pub fn recv(&self) -> Result<SampleGuard<'_>, IpcError> {
+    /// Returns [`Error::PublisherDead`] if the publisher heartbeat goes stale.
+    pub fn recv(&self) -> Result<Sample<'_>, Error> {
         self.recv_with(WaitStrategy::default())
     }
 
@@ -289,7 +287,7 @@ impl Subscription {
     /// readers exist, `loan_pinned` returns an error instead of causing UB.
     ///
     /// Returns `None` if no new data has been published since the last recv.
-    pub fn try_recv_pinned(&self) -> Option<PinnedGuard<'_>> {
+    pub fn try_recv_pinned(&self) -> Option<PinnedSample<'_>> {
         // Load the pinned seqlock: packed (seq:32 | data_len:32)
         let off = topic_entry_off(self.topic_idx);
         let pinned_seq =
@@ -353,7 +351,7 @@ impl Subscription {
 
         let data_ptr = unsafe { self.region.block_ptr(block_idx).add(BLOCK_DATA_OFFSET) };
 
-        Some(PinnedGuard {
+        Some(PinnedSample {
             data_ptr,
             len: data_len as usize,
             readers,
@@ -366,8 +364,8 @@ impl Subscription {
     ///
     /// # Errors
     ///
-    /// Returns [`IpcError::PublisherDead`] if the publisher heartbeat goes stale.
-    pub fn recv_pinned(&self) -> Result<PinnedGuard<'_>, IpcError> {
+    /// Returns [`Error::PublisherDead`] if the publisher heartbeat goes stale.
+    pub fn recv_pinned(&self) -> Result<PinnedSample<'_>, Error> {
         self.recv_pinned_with(WaitStrategy::default())
     }
 
@@ -375,8 +373,8 @@ impl Subscription {
     ///
     /// # Errors
     ///
-    /// Returns [`IpcError::PublisherDead`] if the publisher heartbeat goes stale.
-    pub fn recv_pinned_with(&self, strategy: WaitStrategy) -> Result<PinnedGuard<'_>, IpcError> {
+    /// Returns [`Error::PublisherDead`] if the publisher heartbeat goes stale.
+    pub fn recv_pinned_with(&self, strategy: WaitStrategy) -> Result<PinnedSample<'_>, Error> {
         self.blocking_recv(strategy, || self.try_recv_pinned())
     }
 
@@ -386,7 +384,7 @@ impl Subscription {
         &self,
         strategy: WaitStrategy,
         try_fn: impl Fn() -> Option<T>,
-    ) -> Result<T, IpcError> {
+    ) -> Result<T, Error> {
         // Fast path: check immediately
         if let Some(g) = try_fn() {
             return Ok(g);
@@ -470,7 +468,7 @@ struct SlotRead {
     data_len: u32,
 }
 
-// ---- SampleGuard ----
+// ---- Sample ----
 
 /// Safe zero-copy reference to a published sample in shared memory.
 ///
@@ -482,17 +480,17 @@ struct SlotRead {
 ///
 /// This is safe because:
 /// 1. The mmap is kept alive via the borrowed `&Region` (which itself is
-///    inside an `Arc<Region>` held by the `Subscription`).
+///    inside an `Arc<Region>` held by the `Stream`).
 /// 2. The block cannot be freed while refcount > 0.
 /// 3. No writer touches the block's data region after publishing.
 /// 4. The data region does not overlap the free-list link field.
-pub struct SampleGuard<'a> {
+pub struct Sample<'a> {
     pub(crate) region: &'a Region,
     pub(crate) block_idx: u32,
     pub(crate) len: usize,
 }
 
-impl SampleGuard<'_> {
+impl Sample<'_> {
     /// Returns the data length.
     pub fn len(&self) -> usize {
         self.len
@@ -514,7 +512,7 @@ impl SampleGuard<'_> {
     }
 }
 
-impl Deref for SampleGuard<'_> {
+impl Deref for Sample<'_> {
     type Target = [u8];
 
     fn deref(&self) -> &[u8] {
@@ -525,40 +523,38 @@ impl Deref for SampleGuard<'_> {
     }
 }
 
-impl AsRef<[u8]> for SampleGuard<'_> {
+impl AsRef<[u8]> for Sample<'_> {
     fn as_ref(&self) -> &[u8] {
         self.deref()
     }
 }
 
-impl core::fmt::Debug for SampleGuard<'_> {
+impl core::fmt::Debug for Sample<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("SampleGuard")
-            .field("len", &self.len)
-            .finish()
+        f.debug_struct("Sample").field("len", &self.len).finish()
     }
 }
 
-impl Drop for SampleGuard<'_> {
+impl Drop for Sample<'_> {
     fn drop(&mut self) {
         release_block(self.region, self.block_idx);
     }
 }
 
-// ---- TypedSampleGuard ----
+// ---- TypedSample ----
 
 /// Typed zero-copy reference to a `T: Pod` value in shared memory.
 ///
 /// Implements `Deref<Target=T>` -- safe to read without `unsafe`.
 /// The underlying pool block is held alive by an atomic refcount and freed
 /// back to the pool when this guard is dropped.
-pub struct TypedSampleGuard<'a, T: crate::Pod> {
+pub struct TypedSample<'a, T: crate::Pod> {
     region: &'a Region,
     block_idx: u32,
     _marker: core::marker::PhantomData<&'a T>,
 }
 
-impl<T: crate::Pod> core::ops::Deref for TypedSampleGuard<'_, T> {
+impl<T: crate::Pod> core::ops::Deref for TypedSample<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {
         unsafe {
@@ -568,21 +564,21 @@ impl<T: crate::Pod> core::ops::Deref for TypedSampleGuard<'_, T> {
     }
 }
 
-impl<T: crate::Pod> Drop for TypedSampleGuard<'_, T> {
+impl<T: crate::Pod> Drop for TypedSample<'_, T> {
     fn drop(&mut self) {
         release_block(self.region, self.block_idx);
     }
 }
 
-impl<T: crate::Pod> core::fmt::Debug for TypedSampleGuard<'_, T> {
+impl<T: crate::Pod> core::fmt::Debug for TypedSample<'_, T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("TypedSampleGuard")
+        f.debug_struct("TypedSample")
             .field("size", &core::mem::size_of::<T>())
             .finish()
     }
 }
 
-// ---- PinnedGuard ----
+// ---- PinnedSample ----
 
 /// Near-zero-overhead read reference to a pinned block in shared memory.
 ///
@@ -590,13 +586,13 @@ impl<T: crate::Pod> core::fmt::Debug for TypedSampleGuard<'_, T> {
 /// On drop, decrements it. The publisher checks this count before writing
 /// and returns an error if any readers exist -- preventing data races at
 /// runtime without requiring `unsafe`.
-pub struct PinnedGuard<'a> {
+pub struct PinnedSample<'a> {
     data_ptr: *const u8,
     len: usize,
     readers: &'a AtomicU32,
 }
 
-impl PinnedGuard<'_> {
+impl PinnedSample<'_> {
     /// Returns the data length.
     pub fn len(&self) -> usize {
         self.len
@@ -608,28 +604,28 @@ impl PinnedGuard<'_> {
     }
 }
 
-impl Deref for PinnedGuard<'_> {
+impl Deref for PinnedSample<'_> {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
         unsafe { core::slice::from_raw_parts(self.data_ptr, self.len) }
     }
 }
 
-impl AsRef<[u8]> for PinnedGuard<'_> {
+impl AsRef<[u8]> for PinnedSample<'_> {
     fn as_ref(&self) -> &[u8] {
         self.deref()
     }
 }
 
-impl Drop for PinnedGuard<'_> {
+impl Drop for PinnedSample<'_> {
     fn drop(&mut self) {
         self.readers.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
-impl core::fmt::Debug for PinnedGuard<'_> {
+impl core::fmt::Debug for PinnedSample<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("PinnedGuard")
+        f.debug_struct("PinnedSample")
             .field("len", &self.len)
             .finish()
     }

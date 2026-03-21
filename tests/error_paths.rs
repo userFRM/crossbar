@@ -19,27 +19,27 @@ fn err_msg<T>(result: Result<T, impl std::fmt::Display>) -> String {
 fn pool_exhausted_when_all_blocks_loaned() {
     // Create with block_count=1, loan the only block, then try to loan again.
     let name = unique_name("pool-exhaust");
-    let cfg = PubSubConfig {
+    let cfg = Config {
         block_count: 1,
-        ..PubSubConfig::default()
+        ..Config::default()
     };
-    let mut pub_ = ShmPublisher::create(&name, cfg).unwrap();
+    let mut pub_ = Publisher::create(&name, cfg).unwrap();
     let _topic = pub_.register("/test").unwrap();
 
     // With block_count=1 and ring_depth=1, publish once.
     // The block stays in the ring (refcount=1). Then have a subscriber
-    // hold the SampleGuard so the block can't be recycled.
-    let cfg_small = PubSubConfig {
+    // hold the Sample so the block can't be recycled.
+    let cfg_small = Config {
         block_count: 1,
         ring_depth: 1,
-        ..PubSubConfig::default()
+        ..Config::default()
     };
     // Recreate with the updated config to ensure ring_depth=1
     drop(pub_);
-    let mut pub_ = ShmPublisher::create(&name, cfg_small).unwrap();
+    let mut pub_ = Publisher::create(&name, cfg_small).unwrap();
     let topic = pub_.register("/test").unwrap();
 
-    let sub = ShmSubscriber::connect(&name).unwrap();
+    let sub = Subscriber::connect(&name).unwrap();
     let stream = sub.subscribe("/test").unwrap();
 
     // Publish once — block goes to ring with refcount=1
@@ -67,11 +67,11 @@ fn pool_exhausted_when_all_blocks_loaned() {
 fn data_too_large_via_set_data() {
     let name = unique_name("data-too-large");
     // block_size=16 means data capacity = 16 - 8 = 8 bytes
-    let cfg = PubSubConfig {
+    let cfg = Config {
         block_size: 16,
-        ..PubSubConfig::default()
+        ..Config::default()
     };
-    let mut pub_ = ShmPublisher::create(&name, cfg).unwrap();
+    let mut pub_ = Publisher::create(&name, cfg).unwrap();
     let topic = pub_.register("/test").unwrap();
 
     let mut loan = pub_.loan(&topic).unwrap();
@@ -88,11 +88,11 @@ fn data_too_large_via_set_data() {
 #[test]
 fn data_too_large_via_set_len() {
     let name = unique_name("set-len-too-large");
-    let cfg = PubSubConfig {
+    let cfg = Config {
         block_size: 16,
-        ..PubSubConfig::default()
+        ..Config::default()
     };
-    let mut pub_ = ShmPublisher::create(&name, cfg).unwrap();
+    let mut pub_ = Publisher::create(&name, cfg).unwrap();
     let topic = pub_.register("/test").unwrap();
 
     let mut loan = pub_.loan(&topic).unwrap();
@@ -108,7 +108,7 @@ fn data_too_large_via_set_len() {
 
 #[test]
 fn segment_name_invalid_dotdot() {
-    let msg = err_msg(ShmPublisher::create("../evil", PubSubConfig::default()));
+    let msg = err_msg(Publisher::create("../evil", Config::default()));
     assert!(
         msg.contains("invalid segment name"),
         "expected invalid segment name error, got: {msg}"
@@ -117,7 +117,7 @@ fn segment_name_invalid_dotdot() {
 
 #[test]
 fn segment_name_invalid_slash() {
-    let msg = err_msg(ShmPublisher::create("a/b", PubSubConfig::default()));
+    let msg = err_msg(Publisher::create("a/b", Config::default()));
     assert!(
         msg.contains("invalid segment name"),
         "expected invalid segment name error, got: {msg}"
@@ -126,7 +126,7 @@ fn segment_name_invalid_slash() {
 
 #[test]
 fn segment_name_invalid_empty() {
-    let msg = err_msg(ShmPublisher::create("", PubSubConfig::default()));
+    let msg = err_msg(Publisher::create("", Config::default()));
     assert!(
         msg.contains("invalid segment name"),
         "expected invalid segment name error, got: {msg}"
@@ -138,11 +138,11 @@ fn segment_name_invalid_empty() {
 #[test]
 fn max_topics_reached() {
     let name = unique_name("max-topics");
-    let cfg = PubSubConfig {
+    let cfg = Config {
         max_topics: 1,
-        ..PubSubConfig::default()
+        ..Config::default()
     };
-    let mut pub_ = ShmPublisher::create(&name, cfg).unwrap();
+    let mut pub_ = Publisher::create(&name, cfg).unwrap();
 
     // First topic succeeds
     pub_.register("/first").unwrap();
@@ -160,7 +160,7 @@ fn max_topics_reached() {
 #[test]
 fn uri_too_long() {
     let name = unique_name("uri-long");
-    let mut pub_ = ShmPublisher::create(&name, PubSubConfig::default()).unwrap();
+    let mut pub_ = Publisher::create(&name, Config::default()).unwrap();
 
     // TE_URI_MAX is 64 bytes; create a 65-byte URI
     let long_uri: String = "/".to_owned() + &"x".repeat(64);
@@ -178,10 +178,10 @@ fn uri_too_long() {
 #[test]
 fn topic_not_found() {
     let name = unique_name("topic-not-found");
-    let mut pub_ = ShmPublisher::create(&name, PubSubConfig::default()).unwrap();
+    let mut pub_ = Publisher::create(&name, Config::default()).unwrap();
     pub_.register("/exists").unwrap();
 
-    let sub = ShmSubscriber::connect(&name).unwrap();
+    let sub = Subscriber::connect(&name).unwrap();
     let msg = err_msg(sub.subscribe("/does-not-exist"));
     assert!(
         msg.contains("not found"),
@@ -196,16 +196,16 @@ fn handle_mismatch_rejected() {
     let name_a = unique_name("mismatch-a");
     let name_b = unique_name("mismatch-b");
 
-    let mut pub_a = ShmPublisher::create(&name_a, PubSubConfig::default()).unwrap();
+    let mut pub_a = Publisher::create(&name_a, Config::default()).unwrap();
     let topic_a = pub_a.register("/data").unwrap();
 
-    let mut pub_b = ShmPublisher::create(&name_b, PubSubConfig::default()).unwrap();
+    let mut pub_b = Publisher::create(&name_b, Config::default()).unwrap();
     let _topic_b = pub_b.register("/data").unwrap();
 
     // Use handle from pub_a with pub_b
     let msg = err_msg(pub_b.loan(&topic_a));
     assert!(
-        msg.contains("different ShmPublisher"),
+        msg.contains("different Publisher"),
         "expected handle mismatch error, got: {msg}"
     );
 }
@@ -215,11 +215,11 @@ fn handle_mismatch_rejected() {
 #[test]
 fn pinned_readers_active_blocks_loan() {
     let name = unique_name("pinned-readers");
-    let mut pub_ = ShmPublisher::create(&name, PubSubConfig::default()).unwrap();
+    let mut pub_ = Publisher::create(&name, Config::default()).unwrap();
     let topic = pub_.register("/data").unwrap();
 
     // Subscribe BEFORE publishing so the subscriber's last_seq is 0
-    let sub = ShmSubscriber::connect(&name).unwrap();
+    let sub = Subscriber::connect(&name).unwrap();
     let stream = sub.subscribe("/data").unwrap();
 
     // Do an initial pinned publish so subscribers have something to read
@@ -227,13 +227,13 @@ fn pinned_readers_active_blocks_loan() {
     loan.set_data(b"initial").unwrap();
     loan.publish();
 
-    // Hold a PinnedGuard
+    // Hold a PinnedSample
     let _guard = stream.try_recv_pinned().expect("should get pinned data");
 
     // Now try to loan_pinned — should fail because a reader is active
     let msg = err_msg(pub_.loan_pinned(&topic));
     assert!(
-        msg.contains("PinnedGuard"),
+        msg.contains("PinnedSample"),
         "expected PinnedReadersActive error, got: {msg}"
     );
 
@@ -258,7 +258,7 @@ fn alignment_error_register_typed() {
     unsafe impl Pod for Aligned16 {}
 
     let name = unique_name("align-err");
-    let mut pub_ = ShmPublisher::create(&name, PubSubConfig::default()).unwrap();
+    let mut pub_ = Publisher::create(&name, Config::default()).unwrap();
 
     let msg = err_msg(pub_.register_typed::<Aligned16>("/aligned"));
     assert!(
@@ -271,7 +271,7 @@ fn alignment_error_register_typed() {
 
 #[test]
 fn subscriber_connect_invalid_name() {
-    let msg = err_msg(ShmSubscriber::connect("../evil"));
+    let msg = err_msg(Subscriber::connect("../evil"));
     assert!(
         msg.contains("invalid segment name"),
         "expected invalid segment name error, got: {msg}"
@@ -282,7 +282,7 @@ fn subscriber_connect_invalid_name() {
 
 #[test]
 fn subscriber_connect_nonexistent_region() {
-    let result = ShmSubscriber::connect("does-not-exist-at-all-42");
+    let result = Subscriber::connect("does-not-exist-at-all-42");
     assert!(result.is_err());
 }
 
@@ -291,7 +291,7 @@ fn subscriber_connect_nonexistent_region() {
 #[test]
 fn pinned_loan_dropped_without_publish_clears_sentinel() {
     let name = unique_name("pinned-drop-sentinel");
-    let mut pub_ = ShmPublisher::create(&name, PubSubConfig::default()).unwrap();
+    let mut pub_ = Publisher::create(&name, Config::default()).unwrap();
     let topic = pub_.register("/data").unwrap();
 
     // Take a pinned loan and drop it without publishing
@@ -311,15 +311,15 @@ fn handle_mismatch_on_loan_pinned() {
     let name_a = unique_name("pin-mismatch-a");
     let name_b = unique_name("pin-mismatch-b");
 
-    let mut pub_a = ShmPublisher::create(&name_a, PubSubConfig::default()).unwrap();
+    let mut pub_a = Publisher::create(&name_a, Config::default()).unwrap();
     let topic_a = pub_a.register("/data").unwrap();
 
-    let mut pub_b = ShmPublisher::create(&name_b, PubSubConfig::default()).unwrap();
+    let mut pub_b = Publisher::create(&name_b, Config::default()).unwrap();
     let _topic_b = pub_b.register("/data").unwrap();
 
     let msg = err_msg(pub_b.loan_pinned(&topic_a));
     assert!(
-        msg.contains("different ShmPublisher"),
+        msg.contains("different Publisher"),
         "expected handle mismatch error, got: {msg}"
     );
 }
@@ -331,10 +331,10 @@ fn handle_mismatch_on_subscriber_count() {
     let name_a = unique_name("subcount-mismatch-a");
     let name_b = unique_name("subcount-mismatch-b");
 
-    let mut pub_a = ShmPublisher::create(&name_a, PubSubConfig::default()).unwrap();
+    let mut pub_a = Publisher::create(&name_a, Config::default()).unwrap();
     let topic_a = pub_a.register("/data").unwrap();
 
-    let pub_b = ShmPublisher::create(&name_b, PubSubConfig::default()).unwrap();
+    let pub_b = Publisher::create(&name_b, Config::default()).unwrap();
 
     let result = pub_b.subscriber_count(&topic_a);
     assert!(result.is_err());
@@ -345,7 +345,7 @@ fn handle_mismatch_on_subscriber_count() {
 #[test]
 fn duplicate_topic_register_returns_same_handle() {
     let name = unique_name("dup-topic");
-    let mut pub_ = ShmPublisher::create(&name, PubSubConfig::default()).unwrap();
+    let mut pub_ = Publisher::create(&name, Config::default()).unwrap();
 
     let h1 = pub_.register("/data").unwrap();
     let h2 = pub_.register("/data").unwrap();
@@ -361,11 +361,11 @@ fn duplicate_topic_register_returns_same_handle() {
 #[test]
 fn config_block_size_too_small() {
     let name = unique_name("block-size-small");
-    let cfg = PubSubConfig {
+    let cfg = Config {
         block_size: 8, // minimum is BLOCK_DATA_OFFSET + 1 = 9
-        ..PubSubConfig::default()
+        ..Config::default()
     };
-    let msg = err_msg(ShmPublisher::create(&name, cfg));
+    let msg = err_msg(Publisher::create(&name, cfg));
     assert!(
         msg.contains("block_size"),
         "expected block_size error, got: {msg}"
@@ -377,11 +377,11 @@ fn config_block_size_too_small() {
 #[test]
 fn config_ring_depth_not_power_of_two() {
     let name = unique_name("ring-depth-bad");
-    let cfg = PubSubConfig {
+    let cfg = Config {
         ring_depth: 3,
-        ..PubSubConfig::default()
+        ..Config::default()
     };
-    let msg = err_msg(ShmPublisher::create(&name, cfg));
+    let msg = err_msg(Publisher::create(&name, cfg));
     assert!(
         msg.contains("ring_depth"),
         "expected ring_depth error, got: {msg}"
@@ -393,11 +393,11 @@ fn config_ring_depth_not_power_of_two() {
 #[test]
 fn config_block_count_zero() {
     let name = unique_name("block-count-zero");
-    let cfg = PubSubConfig {
+    let cfg = Config {
         block_count: 0,
-        ..PubSubConfig::default()
+        ..Config::default()
     };
-    let msg = err_msg(ShmPublisher::create(&name, cfg));
+    let msg = err_msg(Publisher::create(&name, cfg));
     assert!(
         msg.contains("block_count"),
         "expected block_count error, got: {msg}"
@@ -409,11 +409,11 @@ fn config_block_count_zero() {
 #[test]
 fn config_max_topics_zero() {
     let name = unique_name("max-topics-zero");
-    let cfg = PubSubConfig {
+    let cfg = Config {
         max_topics: 0,
-        ..PubSubConfig::default()
+        ..Config::default()
     };
-    let msg = err_msg(ShmPublisher::create(&name, cfg));
+    let msg = err_msg(Publisher::create(&name, cfg));
     assert!(
         msg.contains("max_topics"),
         "expected max_topics error, got: {msg}"

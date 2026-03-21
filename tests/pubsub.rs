@@ -5,16 +5,16 @@ use crossbar::*;
 #[test]
 fn subscriber_count_tracks_subscriptions() {
     let name = &format!("test-sub-count-{}", std::process::id());
-    let mut pub_ = ShmPublisher::create(name, PubSubConfig::default()).unwrap();
+    let mut pub_ = Publisher::create(name, Config::default()).unwrap();
     let topic = pub_.register("/data").unwrap();
 
     assert_eq!(pub_.subscriber_count(&topic).unwrap(), 0);
 
-    let sub1 = ShmSubscriber::connect(name).unwrap();
+    let sub1 = Subscriber::connect(name).unwrap();
     let _s1 = sub1.subscribe("/data").unwrap();
     assert_eq!(pub_.subscriber_count(&topic).unwrap(), 1);
 
-    let sub2 = ShmSubscriber::connect(name).unwrap();
+    let sub2 = Subscriber::connect(name).unwrap();
     let _s2 = sub2.subscribe("/data").unwrap();
     assert_eq!(pub_.subscriber_count(&topic).unwrap(), 2);
 
@@ -30,10 +30,10 @@ fn subscriber_count_tracks_subscriptions() {
 #[test]
 fn pubsub_basic_publish_subscribe() {
     let name = &format!("test-ps-basic-{}", std::process::id());
-    let mut pub_ = ShmPublisher::create(name, PubSubConfig::default()).unwrap();
+    let mut pub_ = Publisher::create(name, Config::default()).unwrap();
     let topic = pub_.register("/test").unwrap();
 
-    let sub = ShmSubscriber::connect(name).unwrap();
+    let sub = Subscriber::connect(name).unwrap();
     let stream = sub.subscribe("/test").unwrap();
 
     // Publish a sample
@@ -49,12 +49,12 @@ fn pubsub_basic_publish_subscribe() {
 
 #[test]
 fn pubsub_safe_deref() {
-    // Verify that SampleGuard implements safe Deref (no unsafe needed by caller).
+    // Verify that Sample implements safe Deref (no unsafe needed by caller).
     let name = &format!("test-ps-deref-{}", std::process::id());
-    let mut pub_ = ShmPublisher::create(name, PubSubConfig::default()).unwrap();
+    let mut pub_ = Publisher::create(name, Config::default()).unwrap();
     let topic = pub_.register("/tick").unwrap();
 
-    let sub = ShmSubscriber::connect(name).unwrap();
+    let sub = Subscriber::connect(name).unwrap();
     let stream = sub.subscribe("/tick").unwrap();
 
     let mut loan = pub_.loan(&topic).unwrap();
@@ -72,15 +72,15 @@ fn pubsub_safe_deref() {
 fn pubsub_guard_survives_ring_overwrite() {
     // The key advantage over ring pub/sub: guard holds block alive via refcount
     let name = &format!("test-ps-survive-{}", std::process::id());
-    let cfg = PubSubConfig {
+    let cfg = Config {
         ring_depth: 4,
         block_count: 32,
-        ..PubSubConfig::default()
+        ..Config::default()
     };
-    let mut pub_ = ShmPublisher::create(name, cfg).unwrap();
+    let mut pub_ = Publisher::create(name, cfg).unwrap();
     let topic = pub_.register("/data").unwrap();
 
-    let sub = ShmSubscriber::connect(name).unwrap();
+    let sub = Subscriber::connect(name).unwrap();
     let stream = sub.subscribe("/data").unwrap();
 
     // Publish first sample
@@ -107,11 +107,11 @@ fn pubsub_guard_survives_ring_overwrite() {
 #[test]
 fn pubsub_multiple_topics() {
     let name = &format!("test-ps-topics-{}", std::process::id());
-    let mut pub_ = ShmPublisher::create(name, PubSubConfig::default()).unwrap();
+    let mut pub_ = Publisher::create(name, Config::default()).unwrap();
     let t1 = pub_.register("/a").unwrap();
     let t2 = pub_.register("/b").unwrap();
 
-    let sub = ShmSubscriber::connect(name).unwrap();
+    let sub = Subscriber::connect(name).unwrap();
     let s1 = sub.subscribe("/a").unwrap();
     let s2 = sub.subscribe("/b").unwrap();
 
@@ -133,11 +133,11 @@ fn pubsub_multiple_topics() {
 fn pubsub_loan_dropped_without_publish() {
     // Loan dropped without publish should free the block (no leak)
     let name = &format!("test-ps-drop-{}", std::process::id());
-    let cfg = PubSubConfig {
+    let cfg = Config {
         block_count: 8,
-        ..PubSubConfig::default()
+        ..Config::default()
     };
-    let mut pub_ = ShmPublisher::create(name, cfg).unwrap();
+    let mut pub_ = Publisher::create(name, cfg).unwrap();
     let topic = pub_.register("/test").unwrap();
 
     // Allocate and drop 20 loans without publishing — if blocks leak, we'd panic
@@ -157,10 +157,10 @@ fn pubsub_loan_dropped_without_publish() {
 fn pubsub_born_in_shm_pattern() {
     // iceoryx-style: write directly into the mmap block
     let name = &format!("test-ps-born-{}", std::process::id());
-    let mut pub_ = ShmPublisher::create(name, PubSubConfig::default()).unwrap();
+    let mut pub_ = Publisher::create(name, Config::default()).unwrap();
     let topic = pub_.register("/sensor").unwrap();
 
-    let sub = ShmSubscriber::connect(name).unwrap();
+    let sub = Subscriber::connect(name).unwrap();
     let stream = sub.subscribe("/sensor").unwrap();
 
     // Write a struct directly into SHM (born-in-SHM)
@@ -183,10 +183,10 @@ fn pubsub_born_in_shm_pattern() {
 #[test]
 fn pubsub_sequential_consistency() {
     let name = &format!("test-ps-seq-{}", std::process::id());
-    let mut pub_ = ShmPublisher::create(name, PubSubConfig::default()).unwrap();
+    let mut pub_ = Publisher::create(name, Config::default()).unwrap();
     let topic = pub_.register("/seq").unwrap();
 
-    let sub = ShmSubscriber::connect(name).unwrap();
+    let sub = Subscriber::connect(name).unwrap();
     let stream = sub.subscribe("/seq").unwrap();
 
     // Publish 100 sequential values

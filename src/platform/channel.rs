@@ -9,13 +9,13 @@
 use alloc::format;
 use std::time::Duration;
 
-use crate::error::IpcError;
-use crate::protocol::PubSubConfig;
+use crate::error::Error;
+use crate::protocol::Config;
 use crate::wait::WaitStrategy;
 
-use super::loan::{ShmLoan, TopicHandle};
-use super::shm::{ShmPublisher, ShmSubscriber};
-use super::subscription::{SampleGuard, Subscription};
+use super::loan::{Loan, Topic};
+use super::shm::{Publisher, Subscriber};
+use super::subscription::{Sample, Stream};
 
 /// Bidirectional shared-memory channel.
 ///
@@ -30,11 +30,11 @@ use super::subscription::{SampleGuard, Subscription};
 /// use std::time::Duration;
 ///
 /// // Process A (server -- start first)
-/// let mut srv = ShmChannel::listen("rpc", PubSubConfig::default(),
+/// let mut srv = Channel::listen("rpc", Config::default(),
 ///     Duration::from_secs(30)).unwrap();
 ///
 /// // Process B (client)
-/// let mut cli = ShmChannel::connect("rpc", PubSubConfig::default(),
+/// let mut cli = Channel::connect("rpc", Config::default(),
 ///     Duration::from_secs(5)).unwrap();
 ///
 /// cli.send(b"request").unwrap();
@@ -46,20 +46,20 @@ use super::subscription::{SampleGuard, Subscription};
 /// let reply = cli.recv().unwrap();
 /// assert_eq!(&*reply, b"response");
 /// ```
-pub struct ShmChannel {
-    tx_pub: ShmPublisher,
-    tx_topic: TopicHandle,
-    pub(crate) rx: Subscription, // must drop before _rx_sub to avoid use-after-unmap
-    _rx_sub: ShmSubscriber,      // keeps mmap alive
+pub struct Channel {
+    tx_pub: Publisher,
+    tx_topic: Topic,
+    pub(crate) rx: Stream, // must drop before _rx_sub to avoid use-after-unmap
+    _rx_sub: Subscriber,   // keeps mmap alive
 }
 
-impl core::fmt::Debug for ShmChannel {
+impl core::fmt::Debug for Channel {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("ShmChannel").field("rx", &self.rx).finish()
+        f.debug_struct("Channel").field("rx", &self.rx).finish()
     }
 }
 
-impl ShmChannel {
+impl Channel {
     /// Creates the server side of a bidirectional channel.
     ///
     /// Creates the `"{name}-srv"` region immediately, then waits up to
@@ -69,8 +69,8 @@ impl ShmChannel {
     ///
     /// Returns an error if the server region cannot be created or the
     /// client does not appear before `timeout`.
-    pub fn listen(name: &str, config: PubSubConfig, timeout: Duration) -> Result<Self, IpcError> {
-        let mut tx_pub = ShmPublisher::create(&format!("{name}-srv"), config)?;
+    pub fn listen(name: &str, config: Config, timeout: Duration) -> Result<Self, Error> {
+        let mut tx_pub = Publisher::create(&format!("{name}-srv"), config)?;
         let tx_topic = tx_pub.register("/ch")?;
 
         let (rx_sub, rx) = wait_for_peer(&format!("{name}-cli"), timeout)?;
@@ -93,8 +93,8 @@ impl ShmChannel {
     ///
     /// Returns an error if the client region cannot be created or the
     /// server region does not appear before `timeout`.
-    pub fn connect(name: &str, config: PubSubConfig, timeout: Duration) -> Result<Self, IpcError> {
-        let mut tx_pub = ShmPublisher::create(&format!("{name}-cli"), config)?;
+    pub fn connect(name: &str, config: Config, timeout: Duration) -> Result<Self, Error> {
+        let mut tx_pub = Publisher::create(&format!("{name}-cli"), config)?;
         let tx_topic = tx_pub.register("/ch")?;
 
         let (rx_sub, rx) = wait_for_peer(&format!("{name}-srv"), timeout)?;
@@ -111,9 +111,9 @@ impl ShmChannel {
     ///
     /// # Errors
     ///
-    /// Returns [`IpcError::PoolExhausted`] if all blocks are in use, or
-    /// [`IpcError::DataTooLarge`] if `data` exceeds block capacity.
-    pub fn send(&mut self, data: &[u8]) -> Result<(), IpcError> {
+    /// Returns [`Error::PoolExhausted`] if all blocks are in use, or
+    /// [`Error::DataTooLarge`] if `data` exceeds block capacity.
+    pub fn send(&mut self, data: &[u8]) -> Result<(), Error> {
         let mut loan = self.tx_pub.loan(&self.tx_topic)?;
         loan.set_data(data)?;
         loan.publish();
@@ -122,18 +122,18 @@ impl ShmChannel {
 
     /// Returns a mutable loan for born-in-SHM writes.
     ///
-    /// Write directly into the loan, then call [`ShmLoan::publish`].
+    /// Write directly into the loan, then call [`Loan::publish`].
     ///
     /// # Errors
     ///
-    /// Returns [`IpcError::PoolExhausted`] if all blocks are in use.
-    pub fn loan(&mut self) -> Result<ShmLoan<'_>, IpcError> {
+    /// Returns [`Error::PoolExhausted`] if all blocks are in use.
+    pub fn loan(&mut self) -> Result<Loan<'_>, Error> {
         self.tx_pub.loan(&self.tx_topic)
     }
 
     /// Non-blocking receive. Returns `None` if no new message.
     #[inline]
-    pub fn try_recv(&self) -> Option<SampleGuard<'_>> {
+    pub fn try_recv(&self) -> Option<Sample<'_>> {
         self.rx.try_recv()
     }
 
@@ -141,9 +141,9 @@ impl ShmChannel {
     ///
     /// # Errors
     ///
-    /// Returns [`IpcError::PublisherDead`] if the other endpoint's
+    /// Returns [`Error::PublisherDead`] if the other endpoint's
     /// heartbeat goes stale.
-    pub fn recv(&self) -> Result<SampleGuard<'_>, IpcError> {
+    pub fn recv(&self) -> Result<Sample<'_>, Error> {
         self.rx.recv()
     }
 
@@ -151,9 +151,9 @@ impl ShmChannel {
     ///
     /// # Errors
     ///
-    /// Returns [`IpcError::PublisherDead`] if the other endpoint's
+    /// Returns [`Error::PublisherDead`] if the other endpoint's
     /// heartbeat goes stale.
-    pub fn recv_with(&self, strategy: WaitStrategy) -> Result<SampleGuard<'_>, IpcError> {
+    pub fn recv_with(&self, strategy: WaitStrategy) -> Result<Sample<'_>, Error> {
         self.rx.recv_with(strategy)
     }
 
@@ -162,8 +162,8 @@ impl ShmChannel {
     ///
     /// # Errors
     ///
-    /// Returns [`IpcError::ClockError`] if the system clock is before UNIX epoch.
-    pub fn heartbeat(&mut self) -> Result<(), IpcError> {
+    /// Returns [`Error::ClockError`] if the system clock is before UNIX epoch.
+    pub fn heartbeat(&mut self) -> Result<(), Error> {
         self.tx_pub.heartbeat()
     }
 }
@@ -172,10 +172,7 @@ impl ShmChannel {
 ///
 /// The subscription starts from seq 0 (not the latest) so that messages
 /// published between topic registration and subscription are not missed.
-fn wait_for_peer(
-    region_name: &str,
-    timeout: Duration,
-) -> Result<(ShmSubscriber, Subscription), IpcError> {
+fn wait_for_peer(region_name: &str, timeout: Duration) -> Result<(Subscriber, Stream), Error> {
     let deadline = if timeout.is_zero() {
         None
     } else {
@@ -183,7 +180,7 @@ fn wait_for_peer(
     };
 
     loop {
-        match ShmSubscriber::connect(region_name) {
+        match Subscriber::connect(region_name) {
             Ok(sub) => match sub.subscribe("/ch") {
                 Ok(rx) => {
                     // Start from beginning -- channel must not miss early messages.

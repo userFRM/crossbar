@@ -1,4 +1,4 @@
-use crossbar::{Pod, PodBus, PodBusSubscriber};
+use crossbar::{BusSubscriber, Pod, PodBus};
 
 /// Generate a unique test name to avoid SHM file collisions between tests.
 fn test_name(base: &str) -> String {
@@ -103,7 +103,7 @@ fn connect_by_name() {
     bus.publish(20);
 
     // Connect by name (simulates cross-process subscriber)
-    let mut sub = PodBusSubscriber::<u64>::connect(&name).unwrap();
+    let mut sub = BusSubscriber::<u64>::connect(&name).unwrap();
 
     // Subscriber starts at current write position, so it only sees new values
     bus.publish(30);
@@ -117,7 +117,7 @@ fn type_mismatch_rejected() {
     let _bus = PodBus::<u64>::create(&name, 8).unwrap();
 
     // Try connecting with wrong type
-    let result = PodBusSubscriber::<u32>::connect(&name);
+    let result = BusSubscriber::<u32>::connect(&name);
     assert!(result.is_err());
 }
 

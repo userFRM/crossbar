@@ -9,11 +9,11 @@ fn unique_name(suffix: &str) -> String {
 #[test]
 fn pinned_basic() {
     let name = unique_name("basic");
-    let mut pub_ = ShmPublisher::create(&name, PubSubConfig::default()).unwrap();
+    let mut pub_ = Publisher::create(&name, Config::default()).unwrap();
     let topic = pub_.register("/data").unwrap();
 
     // Subscribe BEFORE publishing so last_seq=0
-    let sub = ShmSubscriber::connect(&name).unwrap();
+    let sub = Subscriber::connect(&name).unwrap();
     let stream = sub.subscribe("/data").unwrap();
 
     // Loan pinned, write data, publish
@@ -35,10 +35,10 @@ fn pinned_basic() {
 #[test]
 fn pinned_multiple_publishes() {
     let name = unique_name("multi-pub");
-    let mut pub_ = ShmPublisher::create(&name, PubSubConfig::default()).unwrap();
+    let mut pub_ = Publisher::create(&name, Config::default()).unwrap();
     let topic = pub_.register("/data").unwrap();
 
-    let sub = ShmSubscriber::connect(&name).unwrap();
+    let sub = Subscriber::connect(&name).unwrap();
     let stream = sub.subscribe("/data").unwrap();
 
     // Publish 10 times using pinned path
@@ -59,11 +59,11 @@ fn pinned_multiple_publishes() {
 #[test]
 fn pinned_guard_blocks_publisher() {
     let name = unique_name("guard-blocks");
-    let mut pub_ = ShmPublisher::create(&name, PubSubConfig::default()).unwrap();
+    let mut pub_ = Publisher::create(&name, Config::default()).unwrap();
     let topic = pub_.register("/data").unwrap();
 
     // Subscribe BEFORE publishing
-    let sub = ShmSubscriber::connect(&name).unwrap();
+    let sub = Subscriber::connect(&name).unwrap();
     let stream = sub.subscribe("/data").unwrap();
 
     // Initial pinned publish
@@ -71,7 +71,7 @@ fn pinned_guard_blocks_publisher() {
     loan.set_data(b"first").unwrap();
     loan.publish();
 
-    // Subscriber gets a PinnedGuard
+    // Subscriber gets a PinnedSample
     let guard = stream.try_recv_pinned().expect("should receive");
     assert_eq!(&*guard, b"first");
 
@@ -81,13 +81,13 @@ fn pinned_guard_blocks_publisher() {
         let result = pub_.loan_pinned(&topic);
         assert!(
             result.is_err(),
-            "loan_pinned should fail while PinnedGuard is held"
+            "loan_pinned should fail while PinnedSample is held"
         );
         let msg = match result {
             Err(e) => format!("{e}"),
             Ok(_) => panic!("expected Err"),
         };
-        assert!(msg.contains("PinnedGuard"));
+        assert!(msg.contains("PinnedSample"));
     }
 
     // Drop the guard — publisher should succeed now
@@ -107,11 +107,11 @@ fn pinned_guard_blocks_publisher() {
 #[test]
 fn pinned_drop_clears_sentinel() {
     let name = unique_name("drop-sentinel");
-    let mut pub_ = ShmPublisher::create(&name, PubSubConfig::default()).unwrap();
+    let mut pub_ = Publisher::create(&name, Config::default()).unwrap();
     let topic = pub_.register("/data").unwrap();
 
     // Subscribe BEFORE any publishes
-    let sub = ShmSubscriber::connect(&name).unwrap();
+    let sub = Subscriber::connect(&name).unwrap();
     let stream = sub.subscribe("/data").unwrap();
 
     // Take a pinned loan and drop without publishing
@@ -132,10 +132,10 @@ fn pinned_drop_clears_sentinel() {
 #[test]
 fn pinned_as_mut_slice() {
     let name = unique_name("mut-slice");
-    let mut pub_ = ShmPublisher::create(&name, PubSubConfig::default()).unwrap();
+    let mut pub_ = Publisher::create(&name, Config::default()).unwrap();
     let topic = pub_.register("/data").unwrap();
 
-    let sub = ShmSubscriber::connect(&name).unwrap();
+    let sub = Subscriber::connect(&name).unwrap();
     let stream = sub.subscribe("/data").unwrap();
 
     let mut loan = pub_.loan_pinned(&topic).unwrap();
@@ -153,11 +153,11 @@ fn pinned_as_mut_slice() {
 #[test]
 fn pinned_capacity_matches_config() {
     let name = unique_name("capacity");
-    let cfg = PubSubConfig {
+    let cfg = Config {
         block_size: 256,
-        ..PubSubConfig::default()
+        ..Config::default()
     };
-    let mut pub_ = ShmPublisher::create(&name, cfg).unwrap();
+    let mut pub_ = Publisher::create(&name, cfg).unwrap();
     let topic = pub_.register("/data").unwrap();
 
     let loan = pub_.loan_pinned(&topic).unwrap();
@@ -170,11 +170,11 @@ fn pinned_capacity_matches_config() {
 #[test]
 fn pinned_data_too_large() {
     let name = unique_name("data-too-large");
-    let cfg = PubSubConfig {
+    let cfg = Config {
         block_size: 16,
-        ..PubSubConfig::default()
+        ..Config::default()
     };
-    let mut pub_ = ShmPublisher::create(&name, cfg).unwrap();
+    let mut pub_ = Publisher::create(&name, cfg).unwrap();
     let topic = pub_.register("/data").unwrap();
 
     let mut loan = pub_.loan_pinned(&topic).unwrap();
@@ -190,11 +190,11 @@ fn pinned_data_too_large() {
 #[test]
 fn pinned_set_len_too_large() {
     let name = unique_name("set-len-too-large");
-    let cfg = PubSubConfig {
+    let cfg = Config {
         block_size: 16,
-        ..PubSubConfig::default()
+        ..Config::default()
     };
-    let mut pub_ = ShmPublisher::create(&name, cfg).unwrap();
+    let mut pub_ = Publisher::create(&name, cfg).unwrap();
     let topic = pub_.register("/data").unwrap();
 
     let mut loan = pub_.loan_pinned(&topic).unwrap();
@@ -209,10 +209,10 @@ fn pinned_set_len_too_large() {
 #[test]
 fn pinned_try_recv_returns_none_when_empty() {
     let name = unique_name("no-data");
-    let mut pub_ = ShmPublisher::create(&name, PubSubConfig::default()).unwrap();
+    let mut pub_ = Publisher::create(&name, Config::default()).unwrap();
     pub_.register("/data").unwrap();
 
-    let sub = ShmSubscriber::connect(&name).unwrap();
+    let sub = Subscriber::connect(&name).unwrap();
     let stream = sub.subscribe("/data").unwrap();
 
     assert!(
@@ -226,15 +226,15 @@ fn pinned_try_recv_returns_none_when_empty() {
 #[test]
 fn pinned_reuses_same_block() {
     let name = unique_name("reuse-block");
-    let cfg = PubSubConfig {
+    let cfg = Config {
         block_count: 2,
-        ..PubSubConfig::default()
+        ..Config::default()
     };
-    let mut pub_ = ShmPublisher::create(&name, cfg).unwrap();
+    let mut pub_ = Publisher::create(&name, cfg).unwrap();
     let topic = pub_.register("/data").unwrap();
 
     // Subscribe BEFORE publishing
-    let sub = ShmSubscriber::connect(&name).unwrap();
+    let sub = Subscriber::connect(&name).unwrap();
     let stream = sub.subscribe("/data").unwrap();
 
     // Publish pinned many times — should never exhaust the pool
@@ -250,16 +250,16 @@ fn pinned_reuses_same_block() {
     assert_eq!(val, 99);
 }
 
-// ─── PinnedGuard: AsRef and Debug ───────────────────────────────────────
+// ─── PinnedSample: AsRef and Debug ───────────────────────────────────────
 
 #[test]
 fn pinned_guard_traits() {
     let name = unique_name("guard-traits");
-    let mut pub_ = ShmPublisher::create(&name, PubSubConfig::default()).unwrap();
+    let mut pub_ = Publisher::create(&name, Config::default()).unwrap();
     let topic = pub_.register("/data").unwrap();
 
     // Subscribe BEFORE publishing
-    let sub = ShmSubscriber::connect(&name).unwrap();
+    let sub = Subscriber::connect(&name).unwrap();
     let stream = sub.subscribe("/data").unwrap();
 
     let mut loan = pub_.loan_pinned(&topic).unwrap();
@@ -274,5 +274,5 @@ fn pinned_guard_traits() {
 
     // Test Debug
     let dbg = format!("{guard:?}");
-    assert!(dbg.contains("PinnedGuard"));
+    assert!(dbg.contains("PinnedSample"));
 }

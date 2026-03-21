@@ -19,11 +19,11 @@ extern "C" {
 
 /* ---- Opaque types ---- */
 
-typedef struct ShmPublisher crossbar_publisher_t;
-typedef struct ShmSubscriber crossbar_subscriber_t;
-typedef struct Subscription crossbar_subscription_t;
+typedef struct Publisher crossbar_publisher_t;
+typedef struct Subscriber crossbar_subscriber_t;
+typedef struct Stream crossbar_subscription_t;
 typedef struct CrossbarSample crossbar_sample_t;
-typedef struct ShmChannel crossbar_channel_t;
+typedef struct Channel crossbar_channel_t;
 
 /* ---- Value types ---- */
 

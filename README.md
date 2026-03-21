@@ -44,7 +44,7 @@ crossbar = "0.4"
 ```rust
 use crossbar::*;
 
-let mut pub_ = ShmPublisher::create("market", PubSubConfig::default())?;
+let mut pub_ = Publisher::create("market", Config::default())?;
 let topic = pub_.register("/prices/AAPL")?;
 
 let mut loan = pub_.loan(&topic).unwrap();
@@ -57,7 +57,7 @@ loan.publish(); // O(1) — writes 8 bytes to ring
 ```rust
 use crossbar::*;
 
-let sub = ShmSubscriber::connect("market")?;
+let sub = Subscriber::connect("market")?;
 let stream = sub.subscribe("/prices/AAPL")?;
 
 if let Some(guard) = stream.try_recv() {
@@ -79,14 +79,14 @@ struct Tick { price: f64, volume: u64 }
 unsafe impl Pod for Tick {}
 
 // Publisher
-let mut pub_ = ShmPublisher::create("market", PubSubConfig::default())?;
+let mut pub_ = Publisher::create("market", Config::default())?;
 let topic = pub_.register_typed::<Tick>("/prices/AAPL")?;
 let mut loan = pub_.loan_typed::<Tick>(&topic).unwrap();
 *loan.as_mut() = Tick { price: 42.50, volume: 1000 };
 loan.publish();
 
 // Subscriber
-let sub = ShmSubscriber::connect("market")?;
+let sub = Subscriber::connect("market")?;
 let stream = sub.subscribe("/prices/AAPL")?;
 
 if let Some(guard) = stream.try_recv_typed::<Tick>() {
@@ -112,11 +112,11 @@ Multiple publishers can share the same region — one creates, others join:
 use crossbar::*;
 
 // Process A — creates the region
-let mut pub_a = ShmPublisher::create("market", PubSubConfig::default())?;
+let mut pub_a = Publisher::create("market", Config::default())?;
 let topic_a = pub_a.register("/prices/AAPL")?;
 
 // Process B — joins the existing region
-let mut pub_b = ShmPublisher::open("market")?;
+let mut pub_b = Publisher::open("market")?;
 let topic_b = pub_b.register("/prices/GOOG")?;
 // Or publish to the same topic as pub_a:
 let topic_b2 = pub_b.register("/prices/AAPL")?;
@@ -126,18 +126,18 @@ Sequence numbers are claimed atomically via `fetch_add`. CAS-based ring slot loc
 
 ### Bidirectional channel
 
-`ShmChannel` wraps two pub/sub regions into a TCP-like pair — one side listens, the other connects:
+`Channel` wraps two pub/sub regions into a TCP-like pair — one side listens, the other connects:
 
 ```rust
 use crossbar::*;
 use std::time::Duration;
 
 // Process A (server)
-let mut srv = ShmChannel::listen("rpc", PubSubConfig::default(),
+let mut srv = Channel::listen("rpc", Config::default(),
     Duration::from_secs(30))?;
 
 // Process B (client)
-let mut cli = ShmChannel::connect("rpc", PubSubConfig::default(),
+let mut cli = Channel::connect("rpc", Config::default(),
     Duration::from_secs(5))?;
 
 cli.send(b"request")?;
@@ -252,7 +252,7 @@ crossbar_sample_t* reply = crossbar_channel_recv(ch);
 ## Configuration
 
 ```rust
-PubSubConfig {
+Config {
     max_topics:          16,    // concurrent topics
     block_count:        256,    // pool blocks
     block_size:       65536,    // bytes per block (usable: block_size - 8)
@@ -262,7 +262,7 @@ PubSubConfig {
 }
 ```
 
-The pool is a Treiber stack — lock-free allocation at any payload size. Blocks are refcounted; a subscriber holding a `SampleGuard` keeps the block alive.
+The pool is a Treiber stack — lock-free allocation at any payload size. Blocks are refcounted; a subscriber holding a `Sample` keeps the block alive.
 
 ---
 
@@ -272,22 +272,22 @@ The pool is a Treiber stack — lock-free allocation at any payload size. Blocks
 src/
   lib.rs                 Crate root (#![no_std], feature gates)
   pod.rs                 Pod trait — marker for safe zero-copy SHM reads
-  error.rs               IpcError
+  error.rs               Error
   wait.rs                WaitStrategy (BusySpin / YieldSpin / BackoffSpin / Adaptive)
   ffi.rs                 C FFI bindings (behind "ffi" feature)
 
   protocol/              no_std core — pure atomics, no OS calls
     layout.rs            SHM layout constants and offset helpers
-    config.rs            PubSubConfig
+    config.rs            Config
     region.rs            Region — Treiber stack, seqlock, refcount
 
   platform/              std only — mmap, futex, file I/O
     mmap.rs              RawMmap (MADV_HUGEPAGE on Linux)
     notify.rs            futex (Linux) / WaitOnAddress (Windows) / WFE (aarch64)
-    shm.rs               ShmPublisher, ShmSubscriber
-    subscription.rs      Subscription, SampleGuard, TypedSampleGuard
-    loan.rs              ShmLoan, TypedShmLoan, TopicHandle
-    channel.rs           ShmChannel — bidirectional channel
+    shm.rs               Publisher, Subscriber
+    subscription.rs      Stream, Sample, TypedSample
+    loan.rs              Loan, TypedLoan, Topic
+    channel.rs           Channel — bidirectional channel
 
 include/
   crossbar.h             C/C++ header for FFI consumers
@@ -311,7 +311,7 @@ The protocol core (`src/protocol/`, `src/pod.rs`, `src/wait.rs`, `src/error.rs`)
 Requirement: `target_has_atomic = "64"` — the ABA-safe Treiber stack uses 64-bit CAS.
 
 ```toml
-# no_std + alloc only (protocol core, no ShmPublisher/ShmSubscriber)
+# no_std + alloc only (protocol core, no Publisher/Subscriber)
 crossbar = { version = "0.4", default-features = false }
 
 # std (default — includes everything)

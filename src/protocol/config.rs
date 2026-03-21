@@ -10,7 +10,7 @@ use core::time::Duration;
 
 /// Configuration for pool-backed O(1) pub/sub.
 #[derive(Debug, Clone, Copy)]
-pub struct PubSubConfig {
+pub struct Config {
     /// Maximum number of topics (default: 16).
     pub max_topics: u32,
     /// Number of blocks in the shared pool (default: 256).
@@ -27,7 +27,7 @@ pub struct PubSubConfig {
     pub stale_timeout: Duration,
 }
 
-impl Default for PubSubConfig {
+impl Default for Config {
     fn default() -> Self {
         Self {
             max_topics: 16,

@@ -4,13 +4,13 @@
 
 // SPDX-License-Identifier: Apache-2.0
 
-//! ShmLoan, TypedShmLoan, TopicHandle.
+//! Loan, TypedLoan, Topic.
 
 use std::io;
 use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::Arc;
 
-use crate::error::IpcError;
+use crate::error::Error;
 use crate::protocol::layout::BLOCK_DATA_OFFSET;
 use crate::protocol::Region;
 
@@ -53,17 +53,17 @@ unsafe fn nontemporal_copy(src: *const u8, dst: *mut u8, len: usize) {
     _mm_sfence();
 }
 
-// ---- TopicHandle ----
+// ---- Topic ----
 
-/// Handle returned by [`super::shm::ShmPublisher::register`]. Identifies a topic
-/// for use with [`super::shm::ShmPublisher::loan`].
+/// Handle returned by [`super::shm::Publisher::register`]. Identifies a topic
+/// for use with [`super::shm::Publisher::loan`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TopicHandle {
+pub struct Topic {
     pub(crate) topic_idx: u32,
     pub(crate) publisher_id: u64,
 }
 
-// ---- ShmLoan ----
+// ---- Loan ----
 
 /// A mutable view into a pool block in shared memory.
 ///
@@ -73,7 +73,7 @@ pub struct TopicHandle {
 /// much data you wrote into the block.
 ///
 /// If dropped without publishing, the block is freed back to the pool.
-pub struct ShmLoan<'a> {
+pub struct Loan<'a> {
     pub(crate) region: &'a Arc<Region>,
     pub(crate) data_ptr: *mut u8,
     pub(crate) capacity: usize,
@@ -85,7 +85,7 @@ pub struct ShmLoan<'a> {
     pub(crate) single_publisher: bool,
 }
 
-impl<'a> ShmLoan<'a> {
+impl<'a> Loan<'a> {
     /// Returns the writable data region as a mutable slice.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { core::slice::from_raw_parts_mut(self.data_ptr, self.capacity) }
@@ -95,10 +95,10 @@ impl<'a> ShmLoan<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`IpcError::DataTooLarge`] if `data` exceeds block data capacity.
-    pub fn set_data(&mut self, data: &[u8]) -> Result<(), IpcError> {
+    /// Returns [`Error::DataTooLarge`] if `data` exceeds block data capacity.
+    pub fn set_data(&mut self, data: &[u8]) -> Result<(), Error> {
         if data.len() > self.capacity {
-            return Err(IpcError::DataTooLarge {
+            return Err(Error::DataTooLarge {
                 size: data.len(),
                 capacity: self.capacity,
             });
@@ -125,10 +125,10 @@ impl<'a> ShmLoan<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`IpcError::DataTooLarge`] if `len` exceeds block data capacity.
-    pub fn set_len(&mut self, len: usize) -> Result<(), IpcError> {
+    /// Returns [`Error::DataTooLarge`] if `len` exceeds block data capacity.
+    pub fn set_len(&mut self, len: usize) -> Result<(), Error> {
         if len > self.capacity {
-            return Err(IpcError::DataTooLarge {
+            return Err(Error::DataTooLarge {
                 size: len,
                 capacity: self.capacity,
             });
@@ -175,14 +175,14 @@ impl<'a> ShmLoan<'a> {
     }
 }
 
-impl<'a> Drop for ShmLoan<'a> {
+impl<'a> Drop for Loan<'a> {
     fn drop(&mut self) {
         // Loan dropped without publish -- return block to pool
         self.region.free_block(self.block_idx);
     }
 }
 
-impl<'a> io::Write for ShmLoan<'a> {
+impl<'a> io::Write for Loan<'a> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let remaining = self.capacity - self.len;
         if remaining == 0 && !buf.is_empty() {
@@ -201,7 +201,7 @@ impl<'a> io::Write for ShmLoan<'a> {
     }
 }
 
-// ---- TypedShmLoan ----
+// ---- TypedLoan ----
 
 /// Typed mutable loan of a `T: Pod` value in shared memory.
 ///
@@ -210,7 +210,7 @@ impl<'a> io::Write for ShmLoan<'a> {
 /// fields individually (born-in-SHM pattern).
 ///
 /// If dropped without publishing, the block is freed back to the pool.
-pub struct TypedShmLoan<'a, T: crate::Pod> {
+pub struct TypedLoan<'a, T: crate::Pod> {
     pub(crate) region: &'a Arc<Region>,
     pub(crate) block_idx: u32,
     pub(crate) topic_idx: u32,
@@ -220,7 +220,7 @@ pub struct TypedShmLoan<'a, T: crate::Pod> {
     pub(crate) _marker: core::marker::PhantomData<&'a mut T>,
 }
 
-impl<'a, T: crate::Pod> TypedShmLoan<'a, T> {
+impl<'a, T: crate::Pod> TypedLoan<'a, T> {
     /// Returns a mutable reference to the `T` value in shared memory.
     ///
     /// Use this for the born-in-SHM pattern: fill fields individually,
@@ -274,7 +274,7 @@ impl<'a, T: crate::Pod> TypedShmLoan<'a, T> {
     }
 }
 
-impl<T: crate::Pod> Drop for TypedShmLoan<'_, T> {
+impl<T: crate::Pod> Drop for TypedLoan<'_, T> {
     fn drop(&mut self) {
         // Loan dropped without publish -- return block to pool
         self.region.free_block(self.block_idx);
@@ -290,7 +290,7 @@ impl<T: crate::Pod> Drop for TypedShmLoan<'_, T> {
 ///
 /// # Panics
 ///
-/// `loan_pinned` returns an error if subscribers hold a `PinnedGuard`.
+/// `loan_pinned` returns an error if subscribers hold a `PinnedSample`.
 /// Overlapping reads and writes are prevented at runtime.
 pub struct PinnedLoan<'a> {
     pub(crate) region: &'a Arc<Region>,
@@ -313,10 +313,10 @@ impl<'a> PinnedLoan<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`IpcError::DataTooLarge`] if `data` exceeds block data capacity.
-    pub fn set_data(&mut self, data: &[u8]) -> Result<(), IpcError> {
+    /// Returns [`Error::DataTooLarge`] if `data` exceeds block data capacity.
+    pub fn set_data(&mut self, data: &[u8]) -> Result<(), Error> {
         if data.len() > self.capacity {
-            return Err(IpcError::DataTooLarge {
+            return Err(Error::DataTooLarge {
                 size: data.len(),
                 capacity: self.capacity,
             });
@@ -332,10 +332,10 @@ impl<'a> PinnedLoan<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`IpcError::DataTooLarge`] if `len` exceeds block data capacity.
-    pub fn set_len(&mut self, len: usize) -> Result<(), IpcError> {
+    /// Returns [`Error::DataTooLarge`] if `len` exceeds block data capacity.
+    pub fn set_len(&mut self, len: usize) -> Result<(), Error> {
         if len > self.capacity {
-            return Err(IpcError::DataTooLarge {
+            return Err(Error::DataTooLarge {
                 size: len,
                 capacity: self.capacity,
             });

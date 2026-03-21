@@ -16,10 +16,10 @@ use std::os::raw::c_char;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::platform::subscription::Subscription;
-use crate::platform::{ShmChannel, ShmPublisher, ShmSubscriber};
+use crate::platform::subscription::Stream;
+use crate::platform::{Channel, Publisher, Subscriber};
 use crate::protocol::layout::BLOCK_DATA_OFFSET;
-use crate::protocol::PubSubConfig;
+use crate::protocol::Config;
 use crate::protocol::{release_block, Region};
 
 // ---- Config ----
@@ -41,9 +41,9 @@ pub struct CrossbarConfig {
     pub stale_timeout_ms: u64,
 }
 
-impl From<&CrossbarConfig> for PubSubConfig {
+impl From<&CrossbarConfig> for Config {
     fn from(c: &CrossbarConfig) -> Self {
-        PubSubConfig {
+        Config {
             max_topics: c.max_topics,
             block_count: c.block_count,
             block_size: c.block_size,
@@ -57,7 +57,7 @@ impl From<&CrossbarConfig> for PubSubConfig {
 /// Returns a default configuration.
 #[no_mangle]
 pub extern "C" fn crossbar_config_default() -> CrossbarConfig {
-    let d = PubSubConfig::default();
+    let d = Config::default();
     CrossbarConfig {
         max_topics: d.max_topics,
         block_count: d.block_count,
@@ -68,11 +68,11 @@ pub extern "C" fn crossbar_config_default() -> CrossbarConfig {
     }
 }
 
-fn config_from_ptr(ptr: *const CrossbarConfig) -> PubSubConfig {
+fn config_from_ptr(ptr: *const CrossbarConfig) -> Config {
     if ptr.is_null() {
-        PubSubConfig::default()
+        Config::default()
     } else {
-        PubSubConfig::from(unsafe { &*ptr })
+        Config::from(unsafe { &*ptr })
     }
 }
 
@@ -113,7 +113,7 @@ impl Drop for CrossbarSample {
 pub unsafe extern "C" fn crossbar_publisher_create(
     name: *const c_char,
     config: *const CrossbarConfig,
-) -> *mut ShmPublisher {
+) -> *mut Publisher {
     if name.is_null() {
         return std::ptr::null_mut();
     }
@@ -121,7 +121,7 @@ pub unsafe extern "C" fn crossbar_publisher_create(
         Ok(s) => s,
         Err(_) => return std::ptr::null_mut(),
     };
-    match ShmPublisher::create(name, config_from_ptr(config)) {
+    match Publisher::create(name, config_from_ptr(config)) {
         Ok(p) => Box::into_raw(Box::new(p)),
         Err(_) => std::ptr::null_mut(),
     }
@@ -133,7 +133,7 @@ pub unsafe extern "C" fn crossbar_publisher_create(
 ///
 /// `pub_` must be a pointer returned by `crossbar_publisher_create`, or `NULL`.
 #[no_mangle]
-pub unsafe extern "C" fn crossbar_publisher_free(pub_: *mut ShmPublisher) {
+pub unsafe extern "C" fn crossbar_publisher_free(pub_: *mut Publisher) {
     if !pub_.is_null() {
         drop(Box::from_raw(pub_));
     }
@@ -147,7 +147,7 @@ pub unsafe extern "C" fn crossbar_publisher_free(pub_: *mut ShmPublisher) {
 /// `pub_` must be a valid publisher pointer. `uri` must be null-terminated.
 #[no_mangle]
 pub unsafe extern "C" fn crossbar_publisher_register(
-    pub_: *mut ShmPublisher,
+    pub_: *mut Publisher,
     uri: *const c_char,
 ) -> CrossbarTopic {
     let err_topic = CrossbarTopic {
@@ -177,7 +177,7 @@ pub unsafe extern "C" fn crossbar_publisher_register(
 ///
 /// `pub_` must be a valid publisher pointer.
 #[no_mangle]
-pub unsafe extern "C" fn crossbar_publisher_heartbeat(pub_: *mut ShmPublisher) -> i32 {
+pub unsafe extern "C" fn crossbar_publisher_heartbeat(pub_: *mut Publisher) -> i32 {
     if pub_.is_null() {
         return -1;
     }
@@ -196,7 +196,7 @@ pub unsafe extern "C" fn crossbar_publisher_heartbeat(pub_: *mut ShmPublisher) -
 /// `crossbar_publisher_register` on this publisher.
 #[no_mangle]
 pub unsafe extern "C" fn crossbar_publish(
-    pub_: *mut ShmPublisher,
+    pub_: *mut Publisher,
     topic: CrossbarTopic,
     data: *const u8,
     len: usize,
@@ -205,7 +205,7 @@ pub unsafe extern "C" fn crossbar_publish(
         return -1;
     }
     let pub_ = &mut *pub_;
-    let handle = crate::platform::loan::TopicHandle {
+    let handle = crate::platform::loan::Topic {
         topic_idx: topic.topic_idx,
         publisher_id: topic.publisher_id,
     };
@@ -237,14 +237,14 @@ pub unsafe extern "C" fn crossbar_publish(
 /// `pub_` must be a valid publisher pointer.
 #[no_mangle]
 pub unsafe extern "C" fn crossbar_topic_subscriber_count(
-    pub_: *mut ShmPublisher,
+    pub_: *mut Publisher,
     topic: CrossbarTopic,
 ) -> u32 {
     if pub_.is_null() {
         return 0;
     }
     let pub_ = &*pub_;
-    let handle = crate::platform::loan::TopicHandle {
+    let handle = crate::platform::loan::Topic {
         topic_idx: topic.topic_idx,
         publisher_id: topic.publisher_id,
     };
@@ -259,7 +259,7 @@ pub unsafe extern "C" fn crossbar_topic_subscriber_count(
 ///
 /// `name` must be a valid null-terminated C string.
 #[no_mangle]
-pub unsafe extern "C" fn crossbar_subscriber_connect(name: *const c_char) -> *mut ShmSubscriber {
+pub unsafe extern "C" fn crossbar_subscriber_connect(name: *const c_char) -> *mut Subscriber {
     if name.is_null() {
         return std::ptr::null_mut();
     }
@@ -267,7 +267,7 @@ pub unsafe extern "C" fn crossbar_subscriber_connect(name: *const c_char) -> *mu
         Ok(s) => s,
         Err(_) => return std::ptr::null_mut(),
     };
-    match ShmSubscriber::connect(name) {
+    match Subscriber::connect(name) {
         Ok(s) => Box::into_raw(Box::new(s)),
         Err(_) => std::ptr::null_mut(),
     }
@@ -279,7 +279,7 @@ pub unsafe extern "C" fn crossbar_subscriber_connect(name: *const c_char) -> *mu
 ///
 /// `sub` must be a pointer returned by `crossbar_subscriber_connect`, or `NULL`.
 #[no_mangle]
-pub unsafe extern "C" fn crossbar_subscriber_free(sub: *mut ShmSubscriber) {
+pub unsafe extern "C" fn crossbar_subscriber_free(sub: *mut Subscriber) {
     if !sub.is_null() {
         drop(Box::from_raw(sub));
     }
@@ -293,9 +293,9 @@ pub unsafe extern "C" fn crossbar_subscriber_free(sub: *mut ShmSubscriber) {
 /// The returned subscription must not outlive the subscriber.
 #[no_mangle]
 pub unsafe extern "C" fn crossbar_subscriber_subscribe(
-    sub: *mut ShmSubscriber,
+    sub: *mut Subscriber,
     uri: *const c_char,
-) -> *mut Subscription {
+) -> *mut Stream {
     if sub.is_null() || uri.is_null() {
         return std::ptr::null_mut();
     }
@@ -317,7 +317,7 @@ pub unsafe extern "C" fn crossbar_subscriber_subscribe(
 /// `stream` must be a pointer returned by `crossbar_subscriber_subscribe`,
 /// or `NULL`.
 #[no_mangle]
-pub unsafe extern "C" fn crossbar_subscription_free(stream: *mut Subscription) {
+pub unsafe extern "C" fn crossbar_subscription_free(stream: *mut Stream) {
     if !stream.is_null() {
         drop(Box::from_raw(stream));
     }
@@ -325,10 +325,10 @@ pub unsafe extern "C" fn crossbar_subscription_free(stream: *mut Subscription) {
 
 // ---- Sample receive ----
 
-/// Converts a `SampleGuard` to a self-owned `CrossbarSample`.
+/// Converts a `Sample` to a self-owned `CrossbarSample`.
 fn guard_to_sample(
     region: &Arc<Region>,
-    guard: crate::platform::SampleGuard<'_>,
+    guard: crate::platform::Sample<'_>,
 ) -> *mut CrossbarSample {
     let sample = CrossbarSample {
         region: Arc::clone(region),
@@ -347,7 +347,7 @@ fn guard_to_sample(
 /// `stream` must be a valid subscription pointer. The returned sample
 /// must be freed with `crossbar_sample_free`.
 #[no_mangle]
-pub unsafe extern "C" fn crossbar_try_recv(stream: *mut Subscription) -> *mut CrossbarSample {
+pub unsafe extern "C" fn crossbar_try_recv(stream: *mut Stream) -> *mut CrossbarSample {
     if stream.is_null() {
         return std::ptr::null_mut();
     }
@@ -372,7 +372,7 @@ pub unsafe extern "C" fn crossbar_try_recv(stream: *mut Subscription) -> *mut Cr
 /// valid `CrossbarSample` struct (may be uninitialized on first call).
 #[no_mangle]
 pub unsafe extern "C" fn crossbar_try_recv_into(
-    stream: *mut Subscription,
+    stream: *mut Stream,
     out: *mut CrossbarSample,
 ) -> i32 {
     if stream.is_null() || out.is_null() {
@@ -399,7 +399,7 @@ pub unsafe extern "C" fn crossbar_try_recv_into(
 ///
 /// `stream` must be a valid subscription pointer.
 #[no_mangle]
-pub unsafe extern "C" fn crossbar_recv(stream: *mut Subscription) -> *mut CrossbarSample {
+pub unsafe extern "C" fn crossbar_recv(stream: *mut Stream) -> *mut CrossbarSample {
     if stream.is_null() {
         return std::ptr::null_mut();
     }
@@ -467,7 +467,7 @@ pub unsafe extern "C" fn crossbar_channel_listen(
     name: *const c_char,
     config: *const CrossbarConfig,
     timeout_ms: u64,
-) -> *mut ShmChannel {
+) -> *mut Channel {
     if name.is_null() {
         return std::ptr::null_mut();
     }
@@ -475,7 +475,7 @@ pub unsafe extern "C" fn crossbar_channel_listen(
         Ok(s) => s,
         Err(_) => return std::ptr::null_mut(),
     };
-    match ShmChannel::listen(
+    match Channel::listen(
         name,
         config_from_ptr(config),
         Duration::from_millis(timeout_ms),
@@ -496,7 +496,7 @@ pub unsafe extern "C" fn crossbar_channel_connect(
     name: *const c_char,
     config: *const CrossbarConfig,
     timeout_ms: u64,
-) -> *mut ShmChannel {
+) -> *mut Channel {
     if name.is_null() {
         return std::ptr::null_mut();
     }
@@ -504,7 +504,7 @@ pub unsafe extern "C" fn crossbar_channel_connect(
         Ok(s) => s,
         Err(_) => return std::ptr::null_mut(),
     };
-    match ShmChannel::connect(
+    match Channel::connect(
         name,
         config_from_ptr(config),
         Duration::from_millis(timeout_ms),
@@ -521,7 +521,7 @@ pub unsafe extern "C" fn crossbar_channel_connect(
 /// `ch` must be a pointer returned by `crossbar_channel_listen` or
 /// `crossbar_channel_connect`, or `NULL`.
 #[no_mangle]
-pub unsafe extern "C" fn crossbar_channel_free(ch: *mut ShmChannel) {
+pub unsafe extern "C" fn crossbar_channel_free(ch: *mut Channel) {
     if !ch.is_null() {
         drop(Box::from_raw(ch));
     }
@@ -534,7 +534,7 @@ pub unsafe extern "C" fn crossbar_channel_free(ch: *mut ShmChannel) {
 /// `ch` must be a valid channel pointer. `data` must point to `len` bytes.
 #[no_mangle]
 pub unsafe extern "C" fn crossbar_channel_send(
-    ch: *mut ShmChannel,
+    ch: *mut Channel,
     data: *const u8,
     len: usize,
 ) -> i32 {
@@ -562,7 +562,7 @@ pub unsafe extern "C" fn crossbar_channel_send(
 ///
 /// `ch` must be a valid channel pointer.
 #[no_mangle]
-pub unsafe extern "C" fn crossbar_channel_try_recv(ch: *mut ShmChannel) -> *mut CrossbarSample {
+pub unsafe extern "C" fn crossbar_channel_try_recv(ch: *mut Channel) -> *mut CrossbarSample {
     if ch.is_null() {
         return std::ptr::null_mut();
     }
@@ -587,7 +587,7 @@ pub unsafe extern "C" fn crossbar_channel_try_recv(ch: *mut ShmChannel) -> *mut 
 ///
 /// `ch` must be a valid channel pointer.
 #[no_mangle]
-pub unsafe extern "C" fn crossbar_channel_recv(ch: *mut ShmChannel) -> *mut CrossbarSample {
+pub unsafe extern "C" fn crossbar_channel_recv(ch: *mut Channel) -> *mut CrossbarSample {
     if ch.is_null() {
         return std::ptr::null_mut();
     }

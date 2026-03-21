@@ -9,22 +9,22 @@
 //! Works on raw pointers -- no OS dependency. The platform layer constructs
 //! a `Region` from an mmap'd pointer.
 
-use super::config::PubSubConfig;
+use super::config::Config;
 
 /// Shared state for the mmap region -- held by both publisher/subscriber
-/// and by `SampleGuard` (via `Arc`) to keep the mmap alive.
+/// and by `Sample` (via `Arc`) to keep the mmap alive.
 pub struct Region {
     #[cfg(feature = "std")]
     base: *mut u8,
     #[cfg(feature = "std")]
-    pub(crate) config: PubSubConfig,
+    pub(crate) config: Config,
     #[cfg(feature = "std")]
     pub(crate) pool_offset: usize,
     #[cfg(feature = "std")]
     pub(crate) last_freed: core::sync::atomic::AtomicU32,
     // In no_std mode, Region is a zero-sized type placeholder.
     #[cfg(not(feature = "std"))]
-    _phantom: core::marker::PhantomData<PubSubConfig>,
+    _phantom: core::marker::PhantomData<Config>,
 }
 
 // SAFETY: The mmap region is process-shared memory backed by a named file in
@@ -48,7 +48,7 @@ impl Region {
     ///
     /// `base` must point to a valid, mmap'd region of at least `len` bytes
     /// that remains valid for the lifetime of this Region.
-    pub(crate) unsafe fn from_raw(base: *mut u8, _len: usize, config: PubSubConfig) -> Self {
+    pub(crate) unsafe fn from_raw(base: *mut u8, _len: usize, config: Config) -> Self {
         let pool_offset = block_pool_offset(&config);
         Self {
             base,
@@ -227,15 +227,15 @@ impl Region {
     /// Returns microseconds since UNIX epoch, or error if clock is behind epoch.
     #[cfg(feature = "std")]
     #[allow(clippy::cast_possible_truncation)]
-    fn now_micros() -> Result<u64, crate::error::IpcError> {
+    fn now_micros() -> Result<u64, crate::error::Error> {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_micros() as u64)
-            .map_err(|_| crate::error::IpcError::ClockError)
+            .map_err(|_| crate::error::Error::ClockError)
     }
 
     #[cfg(feature = "std")]
-    pub(crate) fn update_heartbeat(&self) -> Result<(), crate::error::IpcError> {
+    pub(crate) fn update_heartbeat(&self) -> Result<(), crate::error::Error> {
         let now = Self::now_micros()?;
         self.heartbeat_atom().fetch_max(now, Ordering::Release);
         Ok(())
@@ -243,11 +243,11 @@ impl Region {
 
     #[cfg(feature = "std")]
     #[allow(clippy::cast_possible_truncation)]
-    pub(crate) fn check_heartbeat(&self) -> Result<(), crate::error::IpcError> {
+    pub(crate) fn check_heartbeat(&self) -> Result<(), crate::error::Error> {
         let hb = self.heartbeat_atom().load(Ordering::Acquire);
         let now = Self::now_micros()?;
         if now.saturating_sub(hb) > self.config.stale_timeout.as_micros() as u64 {
-            return Err(crate::error::IpcError::PublisherDead);
+            return Err(crate::error::Error::PublisherDead);
         }
         Ok(())
     }
@@ -303,7 +303,7 @@ impl Region {
         unsafe { &*(self.base.add(off + TE_PINNED_READERS) as *const AtomicU32) }
     }
 
-    /// Shared commit logic for both `ShmLoan` and `TypedShmLoan`.
+    /// Shared commit logic for both `Loan` and `TypedLoan`.
     ///
     /// Atomically claims the next sequence number via `fetch_add` on
     /// `write_seq_atom`, then uses CAS-based seqlock to prevent two
@@ -431,7 +431,7 @@ impl Region {
 
 #[cfg(feature = "std")]
 /// Release a block's refcount. If this is the last reference, free it to the pool.
-/// Shared by `SampleGuard::drop`, `TypedSampleGuard::drop`, and `CrossbarSample::drop`.
+/// Shared by `Sample::drop`, `TypedSample::drop`, and `CrossbarSample::drop`.
 pub(crate) fn release_block(region: &Region, block_idx: u32) {
     // Runtime bounds check (Codex/Security: must not use debug_assert in Drop paths)
     let refcount = match region.block_refcount_checked(block_idx) {

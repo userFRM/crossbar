@@ -16,8 +16,8 @@ mod pod_bus;
 mod shm;
 pub(crate) mod subscription;
 
-pub use channel::ShmChannel;
-pub use loan::{PinnedLoan, ShmLoan, TopicHandle, TypedShmLoan};
-pub use pod_bus::{PodBus, PodBusSubscriber};
-pub use shm::{ShmPublisher, ShmSubscriber};
-pub use subscription::{PinnedGuard, SampleGuard, Subscription, TypedSampleGuard};
+pub use channel::Channel;
+pub use loan::{Loan, PinnedLoan, Topic, TypedLoan};
+pub use pod_bus::{BusSubscriber, PodBus};
+pub use shm::{Publisher, Subscriber};
+pub use subscription::{PinnedSample, Sample, Stream, TypedSample};

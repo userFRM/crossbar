@@ -10,22 +10,22 @@ Crossbar is a single Rust crate. It moves data between processes at O(1) cost by
 src/
   lib.rs          #![no_std] crate root, feature gates, public re-exports
   pod.rs          Pod trait
-  error.rs        IpcError
+  error.rs        Error
   wait.rs         WaitStrategy
   ffi.rs          C FFI bindings (#[cfg(feature = "ffi")])
 
   protocol/       no_std — pure atomics, raw pointer math, no OS calls
     layout.rs     All SHM offset constants and layout helper functions
-    config.rs     PubSubConfig
+    config.rs     Config
     region.rs     Region — Treiber stack, seqlock ring, refcount, commit_to_ring
 
   platform/       #[cfg(feature = "std")] — every OS call lives here
     mmap.rs       RawMmap
     notify.rs     futex / WaitOnAddress / WFE
-    shm.rs        ShmPublisher, ShmSubscriber
-    subscription.rs  Subscription, SampleGuard, TypedSampleGuard
-    loan.rs       ShmLoan, TypedShmLoan, TopicHandle
-    channel.rs    ShmChannel — bidirectional channel
+    shm.rs        Publisher, Subscriber
+    subscription.rs  Stream, Sample, TypedSample
+    loan.rs       Loan, TypedLoan, Topic
+    channel.rs    Channel — bidirectional channel
     pod_bus.rs    PodBus, PodSubscriber — SPMC broadcast ring
 
 include/
@@ -68,7 +68,7 @@ One mmap region — three logical areas:
 |   0x64 PINNED_BLOCK (u32) |  block index for pinned publish; NO_BLOCK = none
 |   0x68 PINNED_READERS     |  AtomicU32 — active pinned-read guard count
 |   0x70 PINNED_SEQ  (u64)  |  AtomicU64 — packed (seq:32 | data_len:32) seqlock
-|   0x78 SUBSCRIBER_COUNT   |  AtomicU32 — live Subscription count for this topic
+|   0x78 SUBSCRIBER_COUNT   |  AtomicU32 — live Stream count for this topic
 +---------------------------+
 | Topic Entry 1 …           |
 +---------------------------+
@@ -121,7 +121,7 @@ The per-publisher block cache (step 1) eliminates the Treiber stack CAS for ~87%
    c. Read `block_idx` and `data_len` (Relaxed) — safe inside seqlock bracket
    d. CAS-increment block refcount (AcqRel) — acquire a reference
    e. Seqlock check 2: verify slot `seq` again — undo refcount if overwritten
-4. Advance `last_seq`, return `SampleGuard`
+4. Advance `last_seq`, return `Sample`
 5. On guard drop: decrement refcount (Release); if last reference, acquire fence then free block
 
 In single-publisher mode, the scan window is always 1 slot — the loop executes once. Under multi-publisher, at most `ring_depth` slots are scanned (default: 8, each check is ~9 ns).
@@ -189,13 +189,13 @@ The spin phase uses `PAUSE` on x86 and `SEVL + WFE` on aarch64. WFE puts the cor
 
 Publishers store a microsecond-resolution timestamp in the global header every `heartbeat_interval` (default 100 ms), amortized over 1024 loan calls to avoid `Instant::now()` overhead on the hot path. With multiple publishers, `fetch_max` ensures the heartbeat only advances — any live publisher keeps the region alive.
 
-Subscribers check the heartbeat when blocking in `recv()`. If the timestamp is older than `stale_timeout` (default 5 s), `recv()` returns `Err(IpcError::PublisherDead)`.
+Subscribers check the heartbeat when blocking in `recv()`. If the timestamp is older than `stale_timeout` (default 5 s), `recv()` returns `Err(Error::PublisherDead)`.
 
 ---
 
 ## Multi-publisher
 
-Multiple publishers can share the same SHM region via `ShmPublisher::open()`. The protocol supports this through:
+Multiple publishers can share the same SHM region via `Publisher::open()`. The protocol supports this through:
 
 - **Atomic seq claiming**: `fetch_add(1)` on `WRITE_SEQ` gives each publisher a unique, monotonically increasing sequence number at commit time
 - **CAS-based ring slot locking**: `compare_exchange(current, SEQ_WRITING)` serializes writes to the same ring slot when two publishers' seqs differ by exactly `ring_depth`
@@ -209,17 +209,17 @@ The block pool (Treiber stack) is already lock-free and handles concurrent alloc
 
 ## Bidirectional channel
 
-`ShmChannel` composes two pub/sub regions into a bidirectional pair. Each side publishes on its own region and subscribes to the other's:
+`Channel` composes two pub/sub regions into a bidirectional pair. Each side publishes on its own region and subscribes to the other's:
 
 ```
 Server                                  Client
-  ShmPublisher("rpc-srv")  ──────────>  Subscription("rpc-srv")
-  Subscription("rpc-cli")  <──────────  ShmPublisher("rpc-cli")
+  Publisher("rpc-srv")  ──────────>  Stream("rpc-srv")
+  Stream("rpc-cli")  <──────────  Publisher("rpc-cli")
 ```
 
 - `listen()` creates `{name}-srv`, polls for `{name}-cli`
 - `connect()` creates `{name}-cli`, connects to `{name}-srv`
-- Both sides get an `ShmChannel` with `send()` / `recv()` / `loan()`
+- Both sides get an `Channel` with `send()` / `recv()` / `loan()`
 - Subscriptions start from seq 0 (not latest) so early messages are not missed
 
 This is built entirely on the existing pub/sub transport — no new protocol machinery. The channel adds ~0 ns overhead vs raw pub/sub.
@@ -232,7 +232,7 @@ The `ffi` feature (`src/ffi.rs`) exposes `extern "C"` functions with opaque poin
 
 Key design decisions:
 - **No exposed loans in FFI** — `crossbar_publish()` copies data and publishes in one call. The "born-in-SHM" pattern requires Rust lifetimes that don't translate to C.
-- **Self-owned samples** — `CrossbarSample` holds an `Arc<Region>` to keep the mmap alive, replacing the borrowed `SampleGuard<'a>`. Refcount semantics are identical.
+- **Self-owned samples** — `CrossbarSample` holds an `Arc<Region>` to keep the mmap alive, replacing the borrowed `Sample<'a>`. Refcount semantics are identical.
 - **Value-type topic handle** — `crossbar_topic_t` is a small `#[repr(C)]` struct, safe to copy.
 
 Build: `cargo rustc --release --features ffi --crate-type cdylib`
@@ -304,10 +304,10 @@ On CPUs without WAITPKG, `monitor_wait_on_address` falls back to `PAUSE`. The ge
 
 ## Subscriber count
 
-Each topic entry contains an `AtomicU32` counter at offset `0x78` (`TE_SUBSCRIBER_COUNT`) that tracks the number of live `Subscription` objects for that topic.
+Each topic entry contains an `AtomicU32` counter at offset `0x78` (`TE_SUBSCRIBER_COUNT`) that tracks the number of live `Stream` objects for that topic.
 
-- **Increment**: When `ShmSubscriber::subscribe()` creates a new `Subscription`, the counter is incremented via `fetch_add(1, Relaxed)`.
-- **Decrement**: `Subscription` implements `Drop`, which decrements the counter via `fetch_sub(1, Relaxed)`.
-- **Query**: `ShmPublisher::subscriber_count(&self, handle) -> Result<u32, IpcError>` reads the counter. The FFI equivalent is `crossbar_topic_subscriber_count()`.
+- **Increment**: When `Subscriber::subscribe()` creates a new `Stream`, the counter is incremented via `fetch_add(1, Relaxed)`.
+- **Decrement**: `Stream` implements `Drop`, which decrements the counter via `fetch_sub(1, Relaxed)`.
+- **Query**: `Publisher::subscriber_count(&self, handle) -> Result<u32, Error>` reads the counter. The FFI equivalent is `crossbar_topic_subscriber_count()`.
 
-The counter uses `Relaxed` ordering because it is advisory — publishers use it for monitoring and graceful shutdown, not for correctness-critical synchronization. The `ShmChannel` field order ensures `rx: Subscription` is declared before `_rx_sub: ShmSubscriber`, so the subscription drops (and decrements the counter) before the subscriber unmaps the region.
+The counter uses `Relaxed` ordering because it is advisory — publishers use it for monitoring and graceful shutdown, not for correctness-critical synchronization. The `Channel` field order ensures `rx: Stream` is declared before `_rx_sub: Subscriber`, so the subscription drops (and decrements the counter) before the subscriber unmaps the region.
