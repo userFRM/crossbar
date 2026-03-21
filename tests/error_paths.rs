@@ -227,13 +227,13 @@ fn pinned_readers_active_blocks_loan() {
     loan.set_data(b"initial").unwrap();
     loan.publish();
 
-    // Hold a PinnedSample
+    // Hold a PinnedGuard
     let _guard = stream.try_recv_pinned().expect("should get pinned data");
 
     // Now try to loan_pinned — should fail because a reader is active
     let msg = err_msg(pub_.loan_pinned(&topic));
     assert!(
-        msg.contains("PinnedSample"),
+        msg.contains("PinnedGuard"),
         "expected PinnedReadersActive error, got: {msg}"
     );
 

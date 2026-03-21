@@ -80,7 +80,7 @@
 - Combined `SEVL` + `WFE` into single `asm!` block for robustness on aarch64.
 
 ### Changed
-- **Safe pinned API**: `loan_pinned` and `try_recv_pinned` no longer require `unsafe`. A shared reader count in the topic entry prevents data races at runtime — `loan_pinned` panics if any `PinnedSample` is held. Cost: ~10 ns (26 ns total vs 16 ns unsafe), still 8.7× faster than iceoryx2.
+- **Safe pinned API**: `loan_pinned` and `try_recv_pinned` no longer require `unsafe`. A shared reader count in the topic entry prevents data races at runtime — `loan_pinned` panics if any `PinnedGuard` is held. Cost: ~10 ns (26 ns total vs 16 ns unsafe), still 8.7× faster than iceoryx2.
 - **Blocking pinned receive**: `recv_pinned()` and `recv_pinned_with(strategy)` — three-phase adaptive wait (spin → yield → futex), same as the safe API.
 
 ### Fixed

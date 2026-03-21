@@ -10,7 +10,6 @@
 //! `libcrossbar.so` / `libcrossbar.dylib` / `crossbar.dll`.
 //! Include `include/crossbar.h` in your C/C++ project.
 
-use alloc::boxed::Box;
 use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::sync::Arc;

@@ -78,44 +78,6 @@ pub fn wait_until_not(
     }
 }
 
-/// Waits until `addr` no longer holds `current`, using UMONITOR/UMWAIT
-/// for cache-line-aware low-power waiting on Intel CPUs with WAITPKG.
-///
-/// Falls back to the standard three-phase strategy if WAITPKG is not
-/// supported.
-///
-/// Returns the new value on success, or `Err(())` on timeout.
-///
-/// # Errors
-///
-/// Returns `Err(())` if `timeout` elapses before the value changes.
-#[cfg(target_arch = "x86_64")]
-pub fn wait_until_not_monitored(
-    addr: &AtomicU32,
-    current: u32,
-    timeout: Duration,
-) -> Result<u32, ()> {
-    // Check for value change before entering the monitor loop
-    let val = addr.load(Ordering::Acquire);
-    if val != current {
-        return Ok(val);
-    }
-
-    let deadline = std::time::Instant::now() + timeout;
-    let addr_ptr = addr as *const AtomicU32 as *const u8;
-
-    loop {
-        let val = addr.load(Ordering::Acquire);
-        if val != current {
-            return Ok(val);
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err(());
-        }
-        crate::wait::monitor_wait_on_address(addr_ptr);
-    }
-}
-
 /// Wake all threads waiting on `addr`.
 pub fn wake_all(addr: &AtomicU32) {
     os_platform::futex_wake(addr, i32::MAX);

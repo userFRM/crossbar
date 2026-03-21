@@ -10,21 +10,17 @@
 //! a `Region` from an mmap'd pointer.
 
 use super::config::Config;
+use super::layout::*;
+use crate::platform::notify;
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Shared state for the mmap region -- held by both publisher/subscriber
 /// and by `Sample` (via `Arc`) to keep the mmap alive.
 pub struct Region {
-    #[cfg(feature = "std")]
     base: *mut u8,
-    #[cfg(feature = "std")]
     pub(crate) config: Config,
-    #[cfg(feature = "std")]
     pub(crate) pool_offset: usize,
-    #[cfg(feature = "std")]
-    pub(crate) last_freed: core::sync::atomic::AtomicU32,
-    // In no_std mode, Region is a zero-sized type placeholder.
-    #[cfg(not(feature = "std"))]
-    _phantom: core::marker::PhantomData<Config>,
+    pub(crate) last_freed: AtomicU32,
 }
 
 // SAFETY: The mmap region is process-shared memory backed by a named file in
@@ -33,14 +29,6 @@ pub struct Region {
 unsafe impl Send for Region {}
 unsafe impl Sync for Region {}
 
-#[cfg(feature = "std")]
-use super::layout::*;
-#[cfg(feature = "std")]
-use crate::platform::notify;
-#[cfg(feature = "std")]
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-
-#[cfg(feature = "std")]
 impl Region {
     /// Construct a Region from a raw pointer and length.
     ///
@@ -225,7 +213,6 @@ impl Region {
     }
 
     /// Returns microseconds since UNIX epoch, or error if clock is behind epoch.
-    #[cfg(feature = "std")]
     #[allow(clippy::cast_possible_truncation)]
     fn now_micros() -> Result<u64, crate::error::Error> {
         std::time::SystemTime::now()
@@ -234,14 +221,12 @@ impl Region {
             .map_err(|_| crate::error::Error::ClockError)
     }
 
-    #[cfg(feature = "std")]
     pub(crate) fn update_heartbeat(&self) -> Result<(), crate::error::Error> {
         let now = Self::now_micros()?;
         self.heartbeat_atom().fetch_max(now, Ordering::Release);
         Ok(())
     }
 
-    #[cfg(feature = "std")]
     #[allow(clippy::cast_possible_truncation)]
     pub(crate) fn check_heartbeat(&self) -> Result<(), crate::error::Error> {
         let hb = self.heartbeat_atom().load(Ordering::Acquire);
@@ -254,7 +239,6 @@ impl Region {
 
     /// Pinned publish: store (seq, data_len) atomically. The block is permanently
     /// assigned -- no alloc, no free, no refcount. 1 atomic Release store.
-    #[cfg(feature = "std")]
     #[inline]
     pub(crate) fn commit_pinned(
         &self,
@@ -308,7 +292,6 @@ impl Region {
     /// Atomically claims the next sequence number via `fetch_add` on
     /// `write_seq_atom`, then uses CAS-based seqlock to prevent two
     /// publishers from writing the same ring slot simultaneously.
-    #[cfg(feature = "std")]
     #[inline]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit_to_ring(
@@ -438,7 +421,6 @@ impl Region {
     }
 }
 
-#[cfg(feature = "std")]
 /// Release a block's refcount. If this is the last reference, free it to the pool.
 /// Shared by `Sample::drop`, `TypedSample::drop`, and `CrossbarSample::drop`.
 pub(crate) fn release_block(region: &Region, block_idx: u32) {

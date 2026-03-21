@@ -6,7 +6,6 @@
 
 //! Stream, Sample, TypedSample.
 
-use alloc::vec::Vec;
 use std::cell::Cell;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -287,7 +286,7 @@ impl Stream {
     /// readers exist, `loan_pinned` returns an error instead of causing UB.
     ///
     /// Returns `None` if no new data has been published since the last recv.
-    pub fn try_recv_pinned(&self) -> Option<PinnedSample<'_>> {
+    pub fn try_recv_pinned(&self) -> Option<PinnedGuard<'_>> {
         // Load the pinned seqlock: packed (seq:32 | data_len:32)
         let off = topic_entry_off(self.topic_idx);
         let pinned_seq =
@@ -351,7 +350,7 @@ impl Stream {
 
         let data_ptr = unsafe { self.region.block_ptr(block_idx).add(BLOCK_DATA_OFFSET) };
 
-        Some(PinnedSample {
+        Some(PinnedGuard {
             data_ptr,
             len: data_len as usize,
             readers,
@@ -365,7 +364,7 @@ impl Stream {
     /// # Errors
     ///
     /// Returns [`Error::PublisherDead`] if the publisher heartbeat goes stale.
-    pub fn recv_pinned(&self) -> Result<PinnedSample<'_>, Error> {
+    pub fn recv_pinned(&self) -> Result<PinnedGuard<'_>, Error> {
         self.recv_pinned_with(WaitStrategy::default())
     }
 
@@ -374,7 +373,7 @@ impl Stream {
     /// # Errors
     ///
     /// Returns [`Error::PublisherDead`] if the publisher heartbeat goes stale.
-    pub fn recv_pinned_with(&self, strategy: WaitStrategy) -> Result<PinnedSample<'_>, Error> {
+    pub fn recv_pinned_with(&self, strategy: WaitStrategy) -> Result<PinnedGuard<'_>, Error> {
         self.blocking_recv(strategy, || self.try_recv_pinned())
     }
 
@@ -419,29 +418,6 @@ impl Stream {
                         true,
                     );
                     self.waiters_atom().fetch_sub(1, Ordering::Release);
-
-                    // Check heartbeat on timeout
-                    if result.is_err() {
-                        self.region.check_heartbeat()?;
-                    }
-                }
-                #[cfg(target_arch = "x86_64")]
-                WaitStrategy::MonitorWait => {
-                    // UMONITOR/UMWAIT: monitor the write_seq futex address
-                    // for cache-line writes. On CPUs without WAITPKG, this
-                    // falls back to PAUSE inside monitor_wait_on_address.
-                    let seq_futex = unsafe {
-                        &*(self.write_seq_atom() as *const AtomicU64 as *const AtomicU32)
-                    };
-                    let cur = seq_futex.load(Ordering::Acquire);
-                    if let Some(g) = try_fn() {
-                        return Ok(g);
-                    }
-                    let result = notify::wait_until_not_monitored(
-                        seq_futex,
-                        cur,
-                        Duration::from_millis(poll_ms),
-                    );
 
                     // Check heartbeat on timeout
                     if result.is_err() {
@@ -635,7 +611,7 @@ impl<T: crate::Pod> core::fmt::Debug for TypedSample<'_, T> {
     }
 }
 
-// ---- PinnedSample ----
+// ---- PinnedGuard ----
 
 /// Near-zero-overhead read reference to a pinned block in shared memory.
 ///
@@ -643,13 +619,13 @@ impl<T: crate::Pod> core::fmt::Debug for TypedSample<'_, T> {
 /// On drop, decrements it. The publisher checks this count before writing
 /// and returns an error if any readers exist -- preventing data races at
 /// runtime without requiring `unsafe`.
-pub struct PinnedSample<'a> {
+pub struct PinnedGuard<'a> {
     data_ptr: *const u8,
     len: usize,
     readers: &'a AtomicU32,
 }
 
-impl PinnedSample<'_> {
+impl PinnedGuard<'_> {
     /// Returns the data length.
     pub fn len(&self) -> usize {
         self.len
@@ -661,28 +637,28 @@ impl PinnedSample<'_> {
     }
 }
 
-impl Deref for PinnedSample<'_> {
+impl Deref for PinnedGuard<'_> {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
         unsafe { core::slice::from_raw_parts(self.data_ptr, self.len) }
     }
 }
 
-impl AsRef<[u8]> for PinnedSample<'_> {
+impl AsRef<[u8]> for PinnedGuard<'_> {
     fn as_ref(&self) -> &[u8] {
         self.deref()
     }
 }
 
-impl Drop for PinnedSample<'_> {
+impl Drop for PinnedGuard<'_> {
     fn drop(&mut self) {
         self.readers.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
-impl core::fmt::Debug for PinnedSample<'_> {
+impl core::fmt::Debug for PinnedGuard<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("PinnedSample")
+        f.debug_struct("PinnedGuard")
             .field("len", &self.len)
             .finish()
     }

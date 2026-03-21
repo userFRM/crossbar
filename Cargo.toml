@@ -1,6 +1,6 @@
 [package]
 name = "crossbar"
-version = "0.8.0"
+version = "1.0.0"
 edition = "2021"
 description = "Zero-copy pub/sub over shared memory. URI-addressed. O(1) transfer at any payload size."
 license = "Apache-2.0"
@@ -10,15 +10,13 @@ categories = ["network-programming", "concurrency"]
 rust-version = "1.87"
 
 [features]
-default = ["std"]
-std = ["libc", "windows-sys"]
-ffi = ["std"]
+ffi = []
 
 [target.'cfg(unix)'.dependencies]
-libc = { version = "0.2.183", optional = true }
+libc = "0.2.183"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", optional = true, features = [
+windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_System_IO",
@@ -51,3 +49,6 @@ harness = false
 name = "spmc_contention"
 harness = false
 
+[[test]]
+name = "ffi_smoke"
+required-features = ["ffi"]

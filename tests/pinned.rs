@@ -71,7 +71,7 @@ fn pinned_guard_blocks_publisher() {
     loan.set_data(b"first").unwrap();
     loan.publish();
 
-    // Subscriber gets a PinnedSample
+    // Subscriber gets a PinnedGuard
     let guard = stream.try_recv_pinned().expect("should receive");
     assert_eq!(&*guard, b"first");
 
@@ -81,13 +81,13 @@ fn pinned_guard_blocks_publisher() {
         let result = pub_.loan_pinned(&topic);
         assert!(
             result.is_err(),
-            "loan_pinned should fail while PinnedSample is held"
+            "loan_pinned should fail while PinnedGuard is held"
         );
         let msg = match result {
             Err(e) => format!("{e}"),
             Ok(_) => panic!("expected Err"),
         };
-        assert!(msg.contains("PinnedSample"));
+        assert!(msg.contains("PinnedGuard"));
     }
 
     // Drop the guard — publisher should succeed now
@@ -250,7 +250,7 @@ fn pinned_reuses_same_block() {
     assert_eq!(val, 99);
 }
 
-// ─── PinnedSample: AsRef and Debug ───────────────────────────────────────
+// ─── PinnedGuard: AsRef and Debug ───────────────────────────────────────
 
 #[test]
 fn pinned_guard_traits() {
@@ -274,5 +274,5 @@ fn pinned_guard_traits() {
 
     // Test Debug
     let dbg = format!("{guard:?}");
-    assert!(dbg.contains("PinnedSample"));
+    assert!(dbg.contains("PinnedGuard"));
 }

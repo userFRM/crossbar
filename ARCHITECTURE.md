@@ -277,31 +277,6 @@ The publisher writes the data between the odd and even stamp transitions. Subscr
 
 ---
 
-## MonitorWait — UMONITOR/UMWAIT
-
-`WaitStrategy::MonitorWait` is an x86_64-only wait strategy that uses Intel's WAITPKG instructions (available on Tremont, Alder Lake, and newer microarchitectures) for cache-line-aware low-power waiting.
-
-**CPUID detection:**
-
-WAITPKG support is detected via `CPUID leaf 7, sub-leaf 0, ECX bit 5`. The result is cached in a static `AtomicU8` with racy initialization (benign — worst case is redundant `CPUID` calls on first access).
-
-**Instruction encoding:**
-
-`UMONITOR` and `UMWAIT` are not available as stable Rust intrinsics, so they are encoded as raw `.byte` sequences in inline assembly:
-
-- `UMONITOR rax` — `F3 0F AE F0` — sets up monitoring on the cache line containing the address in `rax`
-- `UMWAIT ecx` — `F2 0F AE F1` — waits until a store hits the monitored cache line, or a TSC deadline expires
-
-**Usage in blocking_recv:**
-
-In `blocking_recv`, when `MonitorWait` is the active strategy, the subscriber monitors the `WRITE_SEQ` futex address via `UMONITOR`, then enters C0.1 low-power state via `UMWAIT` with a ~100 us TSC deadline (~300,000 cycles at 3 GHz). A publisher's store to `WRITE_SEQ` invalidates the monitored cache line and wakes the subscriber with ~30 ns latency.
-
-**Fallback:**
-
-On CPUs without WAITPKG, `monitor_wait_on_address` falls back to `PAUSE`. The generic `WaitStrategy::wait()` method (which has no address to monitor) also falls back to `PAUSE`.
-
----
-
 ## Subscriber count
 
 Each topic entry contains an `AtomicU32` counter at offset `0x78` (`TE_SUBSCRIBER_COUNT`) that tracks the number of live `Stream` objects for that topic.

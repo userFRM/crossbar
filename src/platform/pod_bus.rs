@@ -44,13 +44,13 @@
 //!   the one recorded at creation before deleting, preventing removal of
 //!   a successor publisher's file.
 //!
-//! ## SHM region layout (version 2, bounded)
+//! ## SHM region layout (version 3, bounded)
 //!
 //! ```text
 //! +----------------------------------------------------------+
 //! | Header (64 bytes)                                        |
 //! |   [0..8)   magic: "XPOD_ZC\0"                           |
-//! |   [8..12)  version: u32 (1 = unbounded, 2 = bounded)    |
+//! |   [8..12)  version: u32 (1 = unbounded, 3 = bounded)    |
 //! |   [12..16) ring_size: u32                                |
 //! |   [16..20) value_size: u32 (size_of::<T>())              |
 //! |   [20..24) value_align: u32 (align_of::<T>())            |
@@ -60,12 +60,16 @@
 //! |   [48..52) watermark: u32 (0 for v1 unbounded)           |
 //! |   [52..64) reserved                                      |
 //! +----------------------------------------------------------+
-//! | Subscriber slots (v2 only): 64 x SubscriberSlot          |
+//! | Subscriber slots (v3 only): 64 x SubscriberSlot          |
 //! |   Each slot (16 bytes, naturally aligned):                |
-//! |     [+0..+4)  active: AtomicU32  (0=free, 2=claiming,    |
-//! |               1=active)                                  |
-//! |     [+4..+8)  pid: AtomicU32     (subscriber PID)        |
-//! |     [+8..+16) cursor: AtomicU64  (subscriber read pos)   |
+//! |     [+0..+4)  pid: AtomicU32     (subscriber PID, 0=free)|
+//! |     [+4..+8)  _padding: u32                              |
+//! |     [+8..+16) state_cursor: AtomicU64 (packed:           |
+//! |               high 2 bits = state, low 62 bits = value)  |
+//! |               States: 0b00=FREE, 0b01=ACTIVE,            |
+//! |               0b10=CLAIMING                              |
+//! |               ACTIVE value  = cursor position            |
+//! |               CLAIMING value = claim timestamp (micros)  |
 //! +----------------------------------------------------------+
 //! | Ring: ring_size x Slot<T>                                |
 //! |   Each slot: stamp (AtomicU64, 8 bytes) + T data         |
@@ -94,8 +98,10 @@ use super::shm::{exclusive_lock, file_identity, shared_lock};
 const POD_BUS_MAGIC: &[u8; 8] = b"XPOD_ZC\0";
 /// Version 1: unbounded (lossy) ring, no subscriber tracking.
 const POD_BUS_VERSION_V1: u32 = 1;
-/// Version 2: bounded (lossless) ring with subscriber cursor slots.
+/// Version 2: bounded (lossless) ring with subscriber cursor slots (DEPRECATED, rejected on connect).
 const POD_BUS_VERSION_V2: u32 = 2;
+/// Version 3: bounded (lossless) ring with packed state+cursor subscriber slots.
+const POD_BUS_VERSION_V3: u32 = 3;
 
 /// Header size for both v1 and v2 (the base header).
 const POD_BUS_HEADER_SIZE: usize = 64;
@@ -103,7 +109,7 @@ const POD_BUS_HEADER_SIZE: usize = 64;
 /// Maximum number of concurrent subscribers tracked for backpressure.
 pub const MAX_SUBSCRIBER_SLOTS: usize = 64;
 
-/// Size of each subscriber slot in the SHM header (active: u32, pid: u32, cursor: u64).
+/// Size of each subscriber slot in the SHM header (pid: u32, _pad: u32, state_cursor: u64).
 const SUBSCRIBER_SLOT_SIZE: usize = 16;
 
 /// Total size of the subscriber slots section.
@@ -130,11 +136,11 @@ const MAX_POD_ALIGN: usize = 8;
 
 fn pod_bus_shm_path(name: &str) -> PathBuf {
     if cfg!(target_os = "linux") {
-        PathBuf::from(alloc::format!("/dev/shm/crossbar-pod-{name}"))
+        PathBuf::from(format!("/dev/shm/crossbar-pod-{name}"))
     } else if cfg!(windows) {
-        std::env::temp_dir().join(alloc::format!("crossbar-pod-{name}"))
+        std::env::temp_dir().join(format!("crossbar-pod-{name}"))
     } else {
-        PathBuf::from(alloc::format!("/tmp/crossbar-pod-shm-{name}"))
+        PathBuf::from(format!("/tmp/crossbar-pod-shm-{name}"))
     }
 }
 
@@ -200,7 +206,7 @@ fn slot_size<T: Pod>() -> usize {
 
 /// Compute total SHM region size for a given ring_size, type T, and version.
 fn region_size_for_version<T: Pod>(ring_size: usize, version: u32) -> usize {
-    let header_total = if version >= POD_BUS_VERSION_V2 {
+    let header_total = if version >= POD_BUS_VERSION_V3 {
         POD_BUS_HEADER_SIZE + SUBSCRIBER_SLOTS_SECTION_SIZE
     } else {
         POD_BUS_HEADER_SIZE
@@ -209,9 +215,8 @@ fn region_size_for_version<T: Pod>(ring_size: usize, version: u32) -> usize {
 }
 
 // ---- Subscriber slot field offsets (relative to slot start) ----
-const SS_ACTIVE: usize = 0;
-const SS_PID: usize = 4;
-const SS_CURSOR: usize = 8;
+const SS_PID: usize = 0;
+const SS_STATE_CURSOR: usize = 8;
 
 // ---- PodBus (publisher) ----
 
@@ -243,7 +248,7 @@ pub struct PodBus<T: Pod> {
     ring_size: usize,
     heartbeat_ptr: *const AtomicU64,
     write_seq_ptr: *const AtomicU64,
-    name: alloc::string::String,
+    name: String,
     path: PathBuf,
     lock_path: PathBuf,
     created_ino: Option<u64>,
@@ -359,7 +364,7 @@ impl<T: Pod> PodBus<T> {
 
         let bounded = watermark.is_some();
         let version = if bounded {
-            POD_BUS_VERSION_V2
+            POD_BUS_VERSION_V3
         } else {
             POD_BUS_VERSION_V1
         };
@@ -412,16 +417,16 @@ impl<T: Pod> PodBus<T> {
             (base.add(PH_WATERMARK) as *mut u32).write(watermark.unwrap_or(0) as u32);
         }
 
-        // Initialize subscriber slots (v2 only) -- already zeroed from truncate,
-        // but be explicit about the active flags.
+        // Initialize subscriber slots (v3 only) -- already zeroed from truncate,
+        // but be explicit about the packed state_cursor and pid fields.
         let sub_slots_base = if bounded {
             let slots_base = unsafe { base.add(POD_BUS_HEADER_SIZE) };
             for i in 0..MAX_SUBSCRIBER_SLOTS {
                 unsafe {
                     let slot_ptr = slots_base.add(i * SUBSCRIBER_SLOT_SIZE);
-                    (slot_ptr.add(SS_ACTIVE) as *mut u32).write(0);
                     (slot_ptr.add(SS_PID) as *mut u32).write(0);
-                    (slot_ptr.add(SS_CURSOR) as *mut u64).write(0);
+                    // state_cursor = STATE_FREE (0) -- high 2 bits 0b00, value 0
+                    (slot_ptr.add(SS_STATE_CURSOR) as *mut u64).write(STATE_FREE);
                 }
             }
             slots_base
@@ -595,51 +600,55 @@ impl<T: Pod> PodBus<T> {
         for i in 0..MAX_SUBSCRIBER_SLOTS {
             let slot_base = unsafe { self.sub_slots_base.add(i * SUBSCRIBER_SLOT_SIZE) };
 
-            let active_atomic = unsafe { &*(slot_base.add(SS_ACTIVE) as *const AtomicU32) };
-            let state = active_atomic.load(Ordering::Acquire);
+            let sc_atomic = unsafe { &*(slot_base.add(SS_STATE_CURSOR) as *const AtomicU64) };
+            let packed = sc_atomic.load(Ordering::Acquire);
+            let state = packed & !VALUE_MASK;
+            let value = packed & VALUE_MASK;
 
-            // Only consider fully-initialized (ACTIVE) slots for backpressure.
-            // CLAIMING slots are still being initialized and are not yet visible.
-            if state == SS_STATE_CLAIMING {
-                // CLAIMING = mid-initialization. The claimant writes PID after
-                // CAS, then cursor, then transitions to ACTIVE. During CLAIMING,
-                // the cursor field holds a timestamp (micros since epoch) set at
-                // claim time. If CLAIMING persists for >5 seconds, the claimant
-                // is dead — prune it. This avoids racing with the nanosecond
-                // PID-write window while still recovering stuck slots.
-                let cursor_atomic = unsafe { &*(slot_base.add(SS_CURSOR) as *const AtomicU64) };
-                let claim_ts = cursor_atomic.load(Ordering::Relaxed);
-                if let Ok(now) = now_micros() {
-                    if now.saturating_sub(claim_ts) > 5_000_000 {
-                        // CLAIMING for >5s — claimant is dead. Prune.
-                        let pid_atomic = unsafe { &*(slot_base.add(SS_PID) as *const AtomicU32) };
-                        pid_atomic.store(0, Ordering::Relaxed);
-                        active_atomic.store(SS_STATE_FREE, Ordering::Release);
+            match state {
+                STATE_CLAIMING => {
+                    // CLAIMING = mid-initialization. The low 62 bits hold the
+                    // claim timestamp (micros since epoch). If CLAIMING persists
+                    // for >5 seconds, the claimant is dead — prune it via CAS
+                    // (CAS fails if the claimant already transitioned to ACTIVE,
+                    // preventing live-claim pruning).
+                    if let Ok(now) = now_micros() {
+                        let claim_ts = value;
+                        if now.saturating_sub(claim_ts) > 5_000_000 {
+                            // CAS CLAIMING|old_ts -> FREE — atomic prune.
+                            if sc_atomic
+                                .compare_exchange(
+                                    packed,
+                                    STATE_FREE,
+                                    Ordering::AcqRel,
+                                    Ordering::Relaxed,
+                                )
+                                .is_ok()
+                            {
+                                let pid_atomic =
+                                    unsafe { &*(slot_base.add(SS_PID) as *const AtomicU32) };
+                                pid_atomic.store(0, Ordering::Release);
+                            }
+                        }
                     }
                 }
-                continue;
-            }
-            if state != SS_STATE_ACTIVE {
-                continue;
-            }
+                STATE_ACTIVE => {
+                    // Check if subscriber PID is still alive.
+                    let pid_atomic = unsafe { &*(slot_base.add(SS_PID) as *const AtomicU32) };
+                    let pid = pid_atomic.load(Ordering::Relaxed);
+                    if pid != 0 && !is_pid_alive(pid) {
+                        // Subscriber crashed — prune the slot.
+                        sc_atomic.store(STATE_FREE, Ordering::Release);
+                        pid_atomic.store(0, Ordering::Release);
+                        continue;
+                    }
 
-            // Check if subscriber PID is still alive.
-            let pid_atomic = unsafe { &*(slot_base.add(SS_PID) as *const AtomicU32) };
-            let pid = pid_atomic.load(Ordering::Relaxed);
-            if pid != 0 && !is_pid_alive(pid) {
-                // Subscriber crashed -- prune the slot. Clear PID so a new
-                // claimant doesn't inherit a stale dead PID.
-                pid_atomic.store(0, Ordering::Relaxed);
-                active_atomic.store(SS_STATE_FREE, Ordering::Release);
-                continue;
-            }
-
-            let cursor_atomic = unsafe { &*(slot_base.add(SS_CURSOR) as *const AtomicU64) };
-            let cursor = cursor_atomic.load(Ordering::Acquire);
-
-            has_active = true;
-            if cursor < min_cursor {
-                min_cursor = cursor;
+                    has_active = true;
+                    if value < min_cursor {
+                        min_cursor = value;
+                    }
+                }
+                _ => {} // FREE, skip
             }
         }
 
@@ -794,15 +803,24 @@ impl<T: Pod> BusSubscriber<T> {
             }
         }
 
-        // Validate version (accept both v1 and v2)
+        // Validate version (accept v1 unbounded and v3 bounded).
+        // v2 is deprecated: its separate active/cursor atomics had nanosecond
+        // race windows. Reject it with a clear upgrade message.
         let version = unsafe { (base.add(PH_VERSION) as *const u32).read() };
-        if version != POD_BUS_VERSION_V1 && version != POD_BUS_VERSION_V2 {
-            return Err(Error::InvalidRegion(alloc::format!(
-                "unsupported PodBus version {version}, expected {POD_BUS_VERSION_V1} or {POD_BUS_VERSION_V2}"
+        if version == POD_BUS_VERSION_V2 {
+            return Err(Error::InvalidRegion(
+                "PodBus v2 is no longer supported (split-atomic race window); \
+                 publisher must be upgraded to v3"
+                    .into(),
+            ));
+        }
+        if version != POD_BUS_VERSION_V1 && version != POD_BUS_VERSION_V3 {
+            return Err(Error::InvalidRegion(format!(
+                "unsupported PodBus version {version}, expected {POD_BUS_VERSION_V1} or {POD_BUS_VERSION_V3}"
             )));
         }
 
-        let bounded = version == POD_BUS_VERSION_V2;
+        let bounded = version == POD_BUS_VERSION_V3;
 
         // Read ring parameters
         let ring_size = unsafe { (base.add(PH_RING_SIZE) as *const u32).read() } as usize;
@@ -811,20 +829,20 @@ impl<T: Pod> BusSubscriber<T> {
 
         // Validate ring_size
         if ring_size == 0 || !ring_size.is_power_of_two() {
-            return Err(Error::InvalidRegion(alloc::format!(
+            return Err(Error::InvalidRegion(format!(
                 "PodBus ring_size {ring_size} is not a power of two"
             )));
         }
 
         // Validate type compatibility
         if value_size != core::mem::size_of::<T>() {
-            return Err(Error::InvalidRegion(alloc::format!(
+            return Err(Error::InvalidRegion(format!(
                 "PodBus value_size mismatch: file has {value_size}, type needs {}",
                 core::mem::size_of::<T>()
             )));
         }
         if value_align != core::mem::align_of::<T>() {
-            return Err(Error::InvalidRegion(alloc::format!(
+            return Err(Error::InvalidRegion(format!(
                 "PodBus value_align mismatch: file has {value_align}, type needs {}",
                 core::mem::align_of::<T>()
             )));
@@ -833,7 +851,7 @@ impl<T: Pod> BusSubscriber<T> {
         // Validate total region size
         let expected_size = region_size_for_version::<T>(ring_size, version);
         if mmap.len() < expected_size {
-            return Err(Error::InvalidRegion(alloc::format!(
+            return Err(Error::InvalidRegion(format!(
                 "PodBus region size {} < expected {expected_size}",
                 mmap.len()
             )));
@@ -972,13 +990,17 @@ impl<T: Pod> BusSubscriber<T> {
         self.ring_size
     }
 
-    /// Update this subscriber's cursor in SHM (v2 only).
+    /// Update this subscriber's cursor in SHM (v3 only).
+    ///
+    /// Writes the packed ACTIVE|cursor value atomically. State and cursor
+    /// are always consistent in a single store.
     #[inline]
     fn update_shm_cursor(&self, new_cursor: u64) {
         if let Some(idx) = self.slot_index {
             let slot_base = unsafe { self.sub_slots_base.add(idx * SUBSCRIBER_SLOT_SIZE) };
-            let cursor_atomic = unsafe { &*(slot_base.add(SS_CURSOR) as *const AtomicU64) };
-            cursor_atomic.store(new_cursor, Ordering::Release);
+            let sc_atomic = unsafe { &*(slot_base.add(SS_STATE_CURSOR) as *const AtomicU64) };
+            let active = STATE_ACTIVE | (new_cursor & VALUE_MASK);
+            sc_atomic.store(active, Ordering::Release);
         }
     }
 
@@ -999,14 +1021,14 @@ impl<T: Pod> BusSubscriber<T> {
 
 impl<T: Pod> Drop for BusSubscriber<T> {
     fn drop(&mut self) {
-        // Release subscriber slot in SHM (v2 only).
+        // Release subscriber slot in SHM (v3 only).
         if let Some(idx) = self.slot_index {
             if !self.sub_slots_base.is_null() {
                 let slot_base = unsafe { self.sub_slots_base.add(idx * SUBSCRIBER_SLOT_SIZE) };
+                let sc_atomic = unsafe { &*(slot_base.add(SS_STATE_CURSOR) as *const AtomicU64) };
                 let pid_atomic = unsafe { &*(slot_base.add(SS_PID) as *const AtomicU32) };
-                let active_atomic = unsafe { &*(slot_base.add(SS_ACTIVE) as *const AtomicU32) };
-                pid_atomic.store(0, Ordering::Relaxed);
-                active_atomic.store(SS_STATE_FREE, Ordering::Release);
+                sc_atomic.store(STATE_FREE, Ordering::Release);
+                pid_atomic.store(0, Ordering::Release);
             }
         }
     }
@@ -1014,25 +1036,31 @@ impl<T: Pod> Drop for BusSubscriber<T> {
 
 // ---- Subscriber slot helpers ----
 
-/// Subscriber slot states (3-state machine):
-/// - `SS_STATE_FREE (0)`: slot is available for claiming
-/// - `SS_STATE_CLAIMING (2)`: slot is being initialized (pid/cursor being written)
-/// - `SS_STATE_ACTIVE (1)`: slot is fully initialized and in use
-const SS_STATE_FREE: u32 = 0;
-const SS_STATE_ACTIVE: u32 = 1;
-const SS_STATE_CLAIMING: u32 = 2;
+/// Packed state+value encoding in a single AtomicU64 (`state_cursor`).
+///
+/// The high 2 bits encode the slot state:
+/// - `0b00` = FREE  (pid must be 0)
+/// - `0b01` = ACTIVE  (low 62 bits = cursor position)
+/// - `0b10` = CLAIMING  (low 62 bits = claim timestamp in micros, mod 2^62)
+///
+/// This eliminates the nanosecond race window between separate `active` and
+/// `cursor` atomics: state and value are always updated in a single CAS/store.
+const STATE_FREE: u64 = 0;
+const STATE_ACTIVE: u64 = 1 << 62;
+const STATE_CLAIMING: u64 = 2 << 62;
+const VALUE_MASK: u64 = (1 << 62) - 1;
 
 /// Claim a free subscriber slot via CAS. Returns the slot index on success.
 ///
-/// Uses a 3-state machine to prevent partial initialization from being visible
-/// to the publisher's subscriber scan:
-/// 1. CAS `FREE(0) -> CLAIMING(2)` to reserve the slot
-/// 2. Write pid and cursor
-/// 3. Store `ACTIVE(1)` with Release to make the slot visible
+/// Uses a packed AtomicU64 (`state_cursor`) so state + value are always
+/// atomically consistent:
+/// 1. CAS `state_cursor` from FREE(0) to CLAIMING|timestamp — ATOMIC
+/// 2. Write PID (owner-only, gated by state_cursor CAS)
+/// 3. Store `state_cursor` to ACTIVE|initial_cursor — ATOMIC
 ///
-/// The publisher only considers `active == ACTIVE(1)`, never `CLAIMING(2)`.
-/// If a subscriber dies during CLAIMING, the publisher can prune it (any
-/// CLAIMING slot older than a few seconds is dead).
+/// The publisher only considers ACTIVE slots. The pruner CAS-prunes stale
+/// CLAIMING slots (>5s), but the CAS fails if the claimant already
+/// transitioned to ACTIVE, preventing live-claim pruning.
 fn claim_subscriber_slot(
     slots_base: *mut u8,
     initial_cursor: u64,
@@ -1040,52 +1068,25 @@ fn claim_subscriber_slot(
 ) -> Result<usize, Error> {
     for i in 0..MAX_SUBSCRIBER_SLOTS {
         let slot_base = unsafe { slots_base.add(i * SUBSCRIBER_SLOT_SIZE) };
-        let active_atomic = unsafe { &*(slot_base.add(SS_ACTIVE) as *const AtomicU32) };
+        let sc_atomic = unsafe { &*(slot_base.add(SS_STATE_CURSOR) as *const AtomicU64) };
 
-        // CAS FREE(0) -> CLAIMING(2) to claim ownership.
-        // All writes happen AFTER the CAS — only the winner writes.
-        if active_atomic
-            .compare_exchange(
-                SS_STATE_FREE,
-                SS_STATE_CLAIMING,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            )
+        // 1. CAS state_cursor from FREE(0) to CLAIMING|timestamp — ATOMIC.
+        //    State and claim timestamp are set in a single CAS. No window
+        //    where state is CLAIMING but timestamp is stale.
+        let ts = now_micros().unwrap_or(0) & VALUE_MASK;
+        let claiming = STATE_CLAIMING | ts;
+        if sc_atomic
+            .compare_exchange(STATE_FREE, claiming, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
         {
-            // We own this slot. Write claim timestamp into cursor field
-            // as the FIRST post-CAS operation. The pruner uses this to
-            // detect stuck CLAIMING slots (>5s old). u64::MAX is NOT used
-            // as sentinel because the pruner checks `now - cursor > 5s`.
-            let cursor_atomic = unsafe { &*(slot_base.add(SS_CURSOR) as *const AtomicU64) };
-            let ts = now_micros().unwrap_or(0);
-            cursor_atomic.store(ts, Ordering::Release);
-
-            // Write PID (only CAS winner writes here).
+            // 2. Write PID (owner-only write, gated by state_cursor CAS).
             let pid_atomic = unsafe { &*(slot_base.add(SS_PID) as *const AtomicU32) };
             pid_atomic.store(pid, Ordering::Release);
 
-            // Transition CLAIMING(2) -> ACTIVE(1) via CAS. The cursor still
-            // holds the claim timestamp at this point — the pruner's contract
-            // "CLAIMING + cursor = timestamp" is preserved throughout CLAIMING.
-            // If the pruner freed our slot (stale cursor from CAS→timestamp
-            // window), this CAS fails and we retry.
-            if active_atomic
-                .compare_exchange(
-                    SS_STATE_CLAIMING,
-                    SS_STATE_ACTIVE,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                )
-                .is_err()
-            {
-                // Pruner freed our slot — retry on next free slot.
-                continue;
-            }
-
-            // NOW write the real cursor (slot is ACTIVE, pruner uses PID
-            // not cursor for ACTIVE slots).
-            cursor_atomic.store(initial_cursor, Ordering::Release);
+            // 3. Transition to ACTIVE|initial_cursor — ATOMIC.
+            //    State and cursor are set in a single store.
+            let active = STATE_ACTIVE | (initial_cursor & VALUE_MASK);
+            sc_atomic.store(active, Ordering::Release);
 
             return Ok(i);
         }
@@ -1130,11 +1131,11 @@ mod tests {
     use super::*;
 
     /// Generate a unique test name to avoid SHM file collisions between tests.
-    fn test_name(base: &str) -> alloc::string::String {
+    fn test_name(base: &str) -> String {
         use core::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        alloc::format!("test-{base}-{}-{id}", std::process::id())
+        format!("test-{base}-{}-{id}", std::process::id())
     }
 
     #[test]
@@ -1183,7 +1184,7 @@ mod tests {
         }
 
         // Subscriber should skip ahead and still be able to read.
-        let mut received = alloc::vec::Vec::new();
+        let mut received = Vec::new();
         while let Some(v) = sub.try_recv() {
             received.push(v);
         }
@@ -1254,11 +1255,11 @@ mod tests {
             // bus drops here -- subscriber has its own mmap
         }
         // subscriber can still read what was published before drop
-        let mut received = alloc::vec::Vec::new();
+        let mut received = Vec::new();
         while let Some(v) = sub.try_recv() {
             received.push(v);
         }
-        assert_eq!(received, alloc::vec![44]);
+        assert_eq!(received, vec![44]);
     }
 
     #[test]
@@ -1344,11 +1345,11 @@ mod tests {
         assert!(matches!(bus.try_publish(99), Err(Error::Full)));
 
         // Subscriber reads all values.
-        let mut received = alloc::vec::Vec::new();
+        let mut received = Vec::new();
         while let Some(v) = sub.try_recv() {
             received.push(v);
         }
-        assert_eq!(received, alloc::vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(received, vec![0, 1, 2, 3, 4, 5, 6, 7]);
 
         // Now we can publish again (subscriber advanced cursor).
         for i in 100..108u64 {

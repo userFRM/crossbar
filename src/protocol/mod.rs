@@ -6,14 +6,13 @@
 
 //! Core protocol types and layout constants for crossbar pub/sub.
 //!
-//! Everything in this module is `no_std`-compatible: pure atomics, raw pointer
-//! math, and lock-free data structures (Treiber stack, seqlock, ring).
+//! Pure atomics, raw pointer math, and lock-free data structures
+//! (Treiber stack, seqlock, ring).
 
 mod config;
 pub(crate) mod layout;
 mod region;
 
 pub use config::Config;
-#[cfg(feature = "std")]
 pub(crate) use region::release_block;
 pub use region::Region;

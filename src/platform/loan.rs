@@ -342,7 +342,7 @@ impl<T: crate::Pod> Drop for TypedLoan<'_, T> {
 ///
 /// # Panics
 ///
-/// `loan_pinned` returns an error if subscribers hold a `PinnedSample`.
+/// `loan_pinned` returns an error if subscribers hold a `PinnedGuard`.
 /// Overlapping reads and writes are prevented at runtime.
 pub struct PinnedLoan<'a> {
     pub(crate) region: &'a Arc<Region>,

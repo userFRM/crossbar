@@ -6,27 +6,26 @@
 
 //! Error types for shared-memory pub/sub operations.
 
-use core::fmt;
+use std::fmt;
 
 /// Error type for shared-memory pub/sub operations.
 #[derive(Debug)]
 pub enum Error {
     /// An I/O error occurred on the underlying file or mmap.
-    #[cfg(feature = "std")]
     Io(std::io::Error),
 
     /// The shared-memory publisher has stopped updating its heartbeat.
     PublisherDead,
 
     /// The shared-memory region has invalid magic, version, or metadata.
-    InvalidRegion(alloc::string::String),
+    InvalidRegion(String),
 
     /// The block pool is exhausted (all blocks are in use by subscribers).
     PoolExhausted,
 
     /// The bounded PodBus ring is full (backpressure).
     ///
-    /// Returned by [`PodBus::try_publish`] when the slowest subscriber is
+    /// Returned by [`crate::PodBus::try_publish`] when the slowest subscriber is
     /// too far behind the publisher. The caller should wait or drop the value.
     Full,
 
@@ -38,7 +37,7 @@ pub enum Error {
         capacity: usize,
     },
 
-    /// A subscriber holds a `PinnedSample`, preventing the publisher from writing.
+    /// A subscriber holds a `PinnedGuard`, preventing the publisher from writing.
     PinnedReadersActive {
         /// Number of active readers.
         count: u32,
@@ -50,7 +49,7 @@ pub enum Error {
     ClockError,
 
     /// A subscribe() call could not find the requested URI in the topic table.
-    TopicNotFound(alloc::string::String),
+    TopicNotFound(String),
 
     /// A register() call ran out of topic slots.
     MaxTopicsReached,
@@ -64,7 +63,7 @@ pub enum Error {
     },
 
     /// An exclusive lock is already held on the region (another publisher is active).
-    LockContention(alloc::string::String),
+    LockContention(String),
 
     /// A `Pod` type's alignment exceeds the block data alignment.
     AlignmentError {
@@ -75,7 +74,7 @@ pub enum Error {
     },
 
     /// The segment name is invalid (empty, contains path separators, null bytes, or `..`).
-    SegmentNameInvalid(alloc::string::String),
+    SegmentNameInvalid(String),
 
     /// A `Topic` was used with a different `Publisher` than the one that created it.
     HandleMismatch,
@@ -84,13 +83,12 @@ pub enum Error {
     RegionSizeOverflow,
 
     /// The shared-memory region's free-list is corrupted (out-of-bounds block index).
-    RegionCorrupted(alloc::string::String),
+    RegionCorrupted(String),
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            #[cfg(feature = "std")]
             Error::Io(e) => write!(f, "I/O error: {e}"),
             Error::PublisherDead => {
                 write!(f, "shared-memory publisher is dead (heartbeat stale)")
@@ -113,7 +111,7 @@ impl fmt::Display for Error {
             Error::PinnedReadersActive { count, topic_idx } => {
                 write!(
                     f,
-                    "{count} active PinnedSample(s) on topic {topic_idx} -- \
+                    "{count} active PinnedGuard(s) on topic {topic_idx} -- \
                      drop all guards before calling loan_pinned"
                 )
             }
@@ -158,7 +156,6 @@ impl fmt::Display for Error {
     }
 }
 
-#[cfg(feature = "std")]
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -168,7 +165,6 @@ impl std::error::Error for Error {
     }
 }
 
-#[cfg(feature = "std")]
 impl From<std::io::Error> for Error {
     #[inline]
     fn from(e: std::io::Error) -> Self {

@@ -6,9 +6,6 @@
 
 //! SHM publisher and subscriber.
 
-use alloc::format;
-use alloc::string::ToString;
-use alloc::vec;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -169,7 +166,7 @@ fn generate_publisher_id() -> u64 {
     let thread_hash = {
         let id = std::thread::current().id();
         // Thread IDs are opaque, hash via Debug formatting
-        let s = alloc::format!("{id:?}");
+        let s = format!("{id:?}");
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         for b in s.as_bytes() {
             h ^= u64::from(*b);
@@ -321,7 +318,7 @@ pub struct Publisher {
     _mmap: RawMmap,
     region: Arc<Region>,
     path: PathBuf,
-    name: alloc::string::String,
+    name: String,
     _lock_file: Option<std::fs::File>,
     created_ino: Option<u64>,
     is_owner: bool,
@@ -330,7 +327,7 @@ pub struct Publisher {
     loan_count: u32,
     block_cache: [u32; 8],
     cache_len: u8,
-    pinned_blocks: alloc::vec::Vec<u32>,
+    pinned_blocks: Vec<u32>,
 }
 
 impl Publisher {
@@ -790,12 +787,12 @@ impl Publisher {
     /// dedicated block. Subsequent calls return the same block -- no alloc.
     ///
     /// The publisher uses a CAS-based writer sentinel to prevent data races:
-    /// if any subscriber holds a [`PinnedSample`](super::subscription::PinnedSample) for this topic, this method
+    /// if any subscriber holds a [`PinnedGuard`](super::subscription::PinnedGuard) for this topic, this method
     /// returns an error.
     ///
     /// # Errors
     ///
-    /// - [`Error::PinnedReadersActive`] if a subscriber holds a `PinnedSample`.
+    /// - [`Error::PinnedReadersActive`] if a subscriber holds a `PinnedGuard`.
     /// - [`Error::PoolExhausted`] if the pool is exhausted (first call only).
     pub fn loan_pinned(&mut self, handle: &Topic) -> Result<PinnedLoan<'_>, Error> {
         if handle.publisher_id != self.id {

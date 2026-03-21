@@ -11,6 +11,7 @@
 //!
 //! The registry is a fixed-size shared memory file at `/dev/shm/crossbar-registry`
 //! (Linux), `$TMPDIR/crossbar-registry` (macOS/Windows) with atomic access.
+//! The path can be overridden via the `CROSSBAR_REGISTRY` environment variable.
 //!
 //! ## Layout
 //!
@@ -30,8 +31,6 @@
 //!   topic_uri: [u8; 64]     // null-terminated
 //! ```
 
-use alloc::string::String;
-use alloc::vec::Vec;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -75,6 +74,8 @@ pub struct DiscoveredTopic {
     pub uri: String,
     /// The publisher's PID.
     pub pid: u32,
+    /// Registration/heartbeat timestamp (microseconds since UNIX epoch).
+    pub timestamp_us: u64,
 }
 
 /// Global topic registry for service discovery.
@@ -87,6 +88,10 @@ pub struct Registry {
 }
 
 fn registry_path() -> PathBuf {
+    // Allow override via environment variable for custom deployments.
+    if let Ok(p) = std::env::var("CROSSBAR_REGISTRY") {
+        return PathBuf::from(p);
+    }
     if cfg!(target_os = "linux") {
         PathBuf::from("/dev/shm/crossbar-registry")
     } else if cfg!(windows) {
@@ -141,6 +146,10 @@ unsafe fn write_fixed_str(ptr: *mut u8, s: &str, max_len: usize) {
 impl Registry {
     /// Open or create the global registry.
     ///
+    /// The registry path is resolved in this order:
+    /// 1. `CROSSBAR_REGISTRY` environment variable (if set)
+    /// 2. Platform default (`/dev/shm/crossbar-registry` on Linux)
+    ///
     /// If the registry file does not exist, it is created and initialized.
     /// If it exists but has invalid magic/version, it is re-created.
     pub fn open() -> Result<Self, crate::error::Error> {
@@ -155,7 +164,9 @@ impl Registry {
         Self::create_new(&path)
     }
 
-    /// Open or create a registry at a custom path (for testing).
+    /// Open or create a registry at a custom path.
+    ///
+    /// Useful for testing or when multiple isolated registries are needed.
     pub fn open_at(path: PathBuf) -> Result<Self, crate::error::Error> {
         if let Ok(existing) = Self::try_open_existing(&path) {
             return Ok(existing);
@@ -211,7 +222,7 @@ impl Registry {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(0o666); // World-readable for cross-process discovery
+                opts.mode(0o600); // Owner-only; cross-user discovery is opt-in
             }
             opts.open(path).map_err(crate::error::Error::Io)?
         };
@@ -365,7 +376,11 @@ impl Registry {
                 )
                 .is_ok()
             {
-                self.entry_count_atom().fetch_sub(1, Ordering::Relaxed);
+                let prev = self.entry_count_atom().fetch_sub(1, Ordering::Relaxed);
+                if prev == 0 {
+                    // Counter wrapped due to double-decrement bug — clamp to zero.
+                    self.entry_count_atom().store(0, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -402,7 +417,67 @@ impl Registry {
                 let region =
                     unsafe { read_fixed_str(entry.add(RE_REGION_NAME), RE_REGION_NAME_MAX) };
                 let pid = unsafe { (entry.add(RE_PID) as *const u32).read() };
-                results.push(DiscoveredTopic { region, uri, pid });
+                let timestamp_us = unsafe { (entry.add(RE_TIMESTAMP) as *const u64).read() };
+                results.push(DiscoveredTopic {
+                    region,
+                    uri,
+                    pid,
+                    timestamp_us,
+                });
+            }
+        }
+
+        results
+    }
+
+    /// Discover topics matching a URI pattern that were registered after `since_us`.
+    ///
+    /// Returns topics whose URI matches `pattern` **and** whose heartbeat
+    /// timestamp is strictly greater than `since_us` (microseconds since UNIX
+    /// epoch). This enables reactive, polling-based discovery: callers store
+    /// the latest `timestamp_us` from the previous batch and pass it as
+    /// `since_us` on the next call.
+    ///
+    /// Pattern supports trailing `*` wildcard (same as [`discover`]).
+    pub fn discover_since(&self, pattern: &str, since_us: u64) -> Vec<DiscoveredTopic> {
+        let mut results = Vec::new();
+        let (prefix, is_wildcard) = if let Some(prefix) = pattern.strip_suffix('*') {
+            (prefix, true)
+        } else {
+            (pattern, false)
+        };
+
+        for i in 0..REG_MAX_ENTRIES {
+            let entry = self.entry_ptr(i);
+            let active = unsafe { &*(entry.add(RE_ACTIVE) as *const AtomicU32) };
+
+            if active.load(Ordering::Acquire) != RE_STATE_ACTIVE {
+                continue;
+            }
+
+            let timestamp_us = unsafe { (entry.add(RE_TIMESTAMP) as *const u64).read() };
+            if timestamp_us <= since_us {
+                continue;
+            }
+
+            let uri = unsafe { read_fixed_str(entry.add(RE_TOPIC_URI), RE_TOPIC_URI_MAX) };
+
+            let matches = if is_wildcard {
+                uri.starts_with(prefix)
+            } else {
+                uri == pattern
+            };
+
+            if matches {
+                let region =
+                    unsafe { read_fixed_str(entry.add(RE_REGION_NAME), RE_REGION_NAME_MAX) };
+                let pid = unsafe { (entry.add(RE_PID) as *const u32).read() };
+                results.push(DiscoveredTopic {
+                    region,
+                    uri,
+                    pid,
+                    timestamp_us,
+                });
             }
         }
 
@@ -442,7 +517,11 @@ impl Registry {
                     )
                     .is_ok()
                 {
-                    self.entry_count_atom().fetch_sub(1, Ordering::Relaxed);
+                    let prev = self.entry_count_atom().fetch_sub(1, Ordering::Relaxed);
+                    if prev == 0 {
+                        // Counter wrapped due to double-decrement bug — clamp to zero.
+                        self.entry_count_atom().store(0, Ordering::Relaxed);
+                    }
                 }
             }
         }

@@ -22,4 +22,4 @@ pub use loan::{Loan, PinnedLoan, Topic, TypedLoan};
 pub use pod_bus::{BusSubscriber, PodBus};
 pub use registry::{DiscoveredTopic, Registry};
 pub use shm::{Publisher, Subscriber};
-pub use subscription::{PinnedSample, Sample, Stream, TypedSample};
+pub use subscription::{PinnedGuard, Sample, Stream, TypedSample};

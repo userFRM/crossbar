@@ -4,8 +4,6 @@
 //! to verify that the null-defense branches return safely (no crash,
 //! no UB). Requires the `ffi` feature.
 
-#![cfg(feature = "ffi")]
-
 use crossbar::ffi::*;
 use std::ffi::CString;
 

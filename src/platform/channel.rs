@@ -6,7 +6,6 @@
 
 //! Bidirectional shared-memory channel.
 
-use alloc::format;
 use std::time::Duration;
 
 use crate::error::Error;
