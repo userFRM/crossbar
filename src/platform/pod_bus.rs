@@ -601,11 +601,14 @@ impl<T: Pod> PodBus<T> {
             // Only consider fully-initialized (ACTIVE) slots for backpressure.
             // CLAIMING slots are still being initialized and are not yet visible.
             if state == SS_STATE_CLAIMING {
-                // A CLAIMING slot with a dead PID means the subscriber crashed
-                // during initialization -- prune it back to FREE.
+                // A CLAIMING slot means the subscriber is mid-initialization
+                // or crashed during init. Prune if: pid==0 (died before writing
+                // PID) or pid is dead. Clear PID on prune so the next claimant
+                // doesn't inherit a stale dead PID.
                 let pid_atomic = unsafe { &*(slot_base.add(SS_PID) as *const AtomicU32) };
                 let pid = pid_atomic.load(Ordering::Relaxed);
-                if pid != 0 && !is_pid_alive(pid) {
+                if pid == 0 || !is_pid_alive(pid) {
+                    pid_atomic.store(0, Ordering::Relaxed);
                     active_atomic.store(SS_STATE_FREE, Ordering::Release);
                 }
                 continue;
@@ -618,7 +621,9 @@ impl<T: Pod> PodBus<T> {
             let pid_atomic = unsafe { &*(slot_base.add(SS_PID) as *const AtomicU32) };
             let pid = pid_atomic.load(Ordering::Relaxed);
             if pid != 0 && !is_pid_alive(pid) {
-                // Subscriber crashed -- prune the slot.
+                // Subscriber crashed -- prune the slot. Clear PID so a new
+                // claimant doesn't inherit a stale dead PID.
+                pid_atomic.store(0, Ordering::Relaxed);
                 active_atomic.store(SS_STATE_FREE, Ordering::Release);
                 continue;
             }
@@ -992,7 +997,9 @@ impl<T: Pod> Drop for BusSubscriber<T> {
         if let Some(idx) = self.slot_index {
             if !self.sub_slots_base.is_null() {
                 let slot_base = unsafe { self.sub_slots_base.add(idx * SUBSCRIBER_SLOT_SIZE) };
+                let pid_atomic = unsafe { &*(slot_base.add(SS_PID) as *const AtomicU32) };
                 let active_atomic = unsafe { &*(slot_base.add(SS_ACTIVE) as *const AtomicU32) };
+                pid_atomic.store(0, Ordering::Relaxed);
                 active_atomic.store(SS_STATE_FREE, Ordering::Release);
             }
         }
