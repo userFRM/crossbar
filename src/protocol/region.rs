@@ -359,22 +359,37 @@ impl Region {
         if single_publisher {
             entry_seq.store(SEQ_WRITING, Ordering::Release);
         } else {
+            // CAS loop: atomically claim the slot. Two publishers CAN target
+            // the same slot when their seqs differ by exactly ring_depth.
+            // The CAS ensures only one wins; the other retries after yield.
+            // If the slot is stuck in SEQ_WRITING (crashed publisher), force-
+            // claim after 1024 iterations (~1µs) to prevent livelock.
             let mut spins = 0u32;
             loop {
                 let current = entry_seq.load(Ordering::Acquire);
-                if current != SEQ_WRITING {
-                    break; // Slot is not being written — safe to proceed
+                if current == SEQ_WRITING {
+                    spins += 1;
+                    if spins > 1024 {
+                        // Crashed publisher — force-claim via unconditional store.
+                        entry_seq.store(SEQ_WRITING, Ordering::Release);
+                        break;
+                    }
+                    crate::wait::yield_hint();
+                    continue;
                 }
-                spins += 1;
-                if spins > 1024 {
-                    // Stuck in WRITING state — crashed publisher. Force overwrite.
-                    // This is safe because our fetch_add already claimed this seq,
-                    // so no other live publisher is targeting this slot.
+                if entry_seq
+                    .compare_exchange_weak(
+                        current,
+                        SEQ_WRITING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
                     break;
                 }
                 crate::wait::yield_hint();
             }
-            entry_seq.store(SEQ_WRITING, Ordering::Release);
         }
 
         // 3. Read old block_idx from the slot we're overwriting
