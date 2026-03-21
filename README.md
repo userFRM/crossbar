@@ -162,18 +162,19 @@ loan.publish();
 
 ---
 
-## Performance
+## Performance (v0.6.0)
 
 All measurements: Criterion, same-process publisher + subscriber, `try_recv` (no futex).
+Same-process benchmarks; cross-process latency is typically 2-5x higher.
 
 ### Intel i7-10700KF · Linux 6.8 · rustc 1.87
 
 | | crossbar | iceoryx2 | speedup |
 |---|---|---|---|
-| 8 B (transport overhead) | **54 ns** | 232 ns | **4.3×** |
-| 1 KB | **66 ns** | 243 ns | **3.7×** |
-| 64 KB | 1.35 µs | 1.38 µs | ~1× |
-| 1 MB | **31 µs** | 30 µs | ~1× |
+| 8 B (transport overhead) | **55 ns** | 230 ns | **4.2×** |
+| 1 KB | **67 ns** | 239 ns | **3.6×** |
+| 64 KB | 1.47 µs | 1.32 µs | 0.9× |
+| 1 MB | 30.7 µs | 29.8 µs | ~1× |
 
 ### Apple M1 Pro · macOS · rustc 1.92 (v0.3.0, pre-optimization)
 
@@ -184,20 +185,22 @@ All measurements: Criterion, same-process publisher + subscriber, `try_recv` (no
 | 64 KB | 1.27 µs | 1.35 µs | 1.1× |
 | 1 MB | 23.9 µs | 23.5 µs | ~1× |
 
-**The win is in the overhead.** At small payloads crossbar's lighter path (no service discovery, no POSIX config layer) is 4× faster. At 64 KB+ both frameworks are memcpy-bound and converge. The 8-byte descriptor is always O(1) — payload latency scales with how long you take to write into the block.
+**The win is in the overhead.** At small payloads crossbar's lighter path (no service discovery, no POSIX config layer) is 4.2x faster. At 64 KB+ both frameworks are memcpy-bound and converge — iceoryx2 is slightly faster at large payloads. The 8-byte descriptor is always O(1) — payload latency scales with how long you take to write into the block.
 
 ### Pinned mode (latest-value, same buffer every iteration)
 
 | | crossbar | iceoryx2 | speedup |
 |---|---|---|---|
 | 8 B | **35 ns** | 229 ns | **6.5×** |
-| 1 KB | **45 ns** | 238 ns | **5.3×** |
-| 64 KB | **1.07 µs** | 1.30 µs | **1.2×** |
-| 1 MB | 18.1 µs | 18.4 µs | ~1× |
+| 1 KB | **45 ns** | 237 ns | **5.3×** |
+| 64 KB | **1.10 µs** | 1.32 µs | **1.2×** |
+| 1 MB | 18.4 µs | 18.3 µs | ~1× |
 
-Pinned mode (`loan_pinned` / `try_recv_pinned`) reuses the same block every iteration — no allocation, no refcount, no ring. Safe API with CAS-based reader/writer exclusion. Best for market data, sensors, telemetry, game state. The 8B cost increased from 26 ns to 35 ns in v0.3.1 due to the CAS sentinel added for safety (prevents data races between publisher writes and subscriber reads).
+Pinned mode (`loan_pinned` / `try_recv_pinned`) reuses the same block every iteration — no allocation, no refcount, no ring. Safe API with CAS-based reader/writer exclusion. Best for market data, sensors, telemetry, game state.
 
 Reproduce: `cargo bench -- head_to_head` (requires `iceoryx2` dev-dep, Unix only).
+
+See [BENCHMARKS.md](BENCHMARKS.md) for full numbers, PodBus results, and methodology caveats.
 
 ---
 
