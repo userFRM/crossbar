@@ -1042,7 +1042,17 @@ fn claim_subscriber_slot(
         let slot_base = unsafe { slots_base.add(i * SUBSCRIBER_SLOT_SIZE) };
         let active_atomic = unsafe { &*(slot_base.add(SS_ACTIVE) as *const AtomicU32) };
 
-        // CAS FREE(0) -> CLAIMING(2) to claim ownership of this slot.
+        // Write claim timestamp into cursor BEFORE the CAS. Multiple
+        // claimants may write here concurrently on FREE slots, but all
+        // timestamps are "recent" — the pruner only acts on timestamps
+        // >5s old, so a loser's timestamp is harmless (also recent).
+        // This ensures CLAIMING is never visible with a stale cursor
+        // from a previous (long-dead) occupant.
+        let cursor_atomic = unsafe { &*(slot_base.add(SS_CURSOR) as *const AtomicU64) };
+        let ts = now_micros().unwrap_or(0);
+        cursor_atomic.store(ts, Ordering::Relaxed);
+
+        // CAS FREE(0) -> CLAIMING(2) to claim ownership.
         if active_atomic
             .compare_exchange(
                 SS_STATE_FREE,
@@ -1052,13 +1062,7 @@ fn claim_subscriber_slot(
             )
             .is_ok()
         {
-            // We own this slot. Write claim timestamp into cursor field
-            // FIRST — the pruner uses this to detect stuck CLAIMING slots.
-            let cursor_atomic = unsafe { &*(slot_base.add(SS_CURSOR) as *const AtomicU64) };
-            let ts = now_micros().unwrap_or(0);
-            cursor_atomic.store(ts, Ordering::Release);
-
-            // Write PID (authoritative — only the CAS winner writes here).
+            // We own this slot. Write PID (only CAS winner writes here).
             let pid_atomic = unsafe { &*(slot_base.add(SS_PID) as *const AtomicU32) };
             pid_atomic.store(pid, Ordering::Release);
 
