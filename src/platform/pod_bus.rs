@@ -1042,12 +1042,16 @@ fn claim_subscriber_slot(
         let slot_base = unsafe { slots_base.add(i * SUBSCRIBER_SLOT_SIZE) };
         let active_atomic = unsafe { &*(slot_base.add(SS_ACTIVE) as *const AtomicU32) };
 
-        // Write claim timestamp into cursor BEFORE the CAS. Multiple
-        // claimants may write here concurrently on FREE slots, but all
-        // timestamps are "recent" — the pruner only acts on timestamps
-        // >5s old, so a loser's timestamp is harmless (also recent).
-        // This ensures CLAIMING is never visible with a stale cursor
-        // from a previous (long-dead) occupant.
+        // Only attempt slots that appear FREE. Skip ACTIVE/CLAIMING.
+        if active_atomic.load(Ordering::Relaxed) != SS_STATE_FREE {
+            continue;
+        }
+
+        // Write claim timestamp into cursor BEFORE the CAS. This only
+        // runs on slots that appeared FREE (non-owner writes to ACTIVE
+        // slots are avoided by the check above). Multiple claimants
+        // racing on the same FREE slot all write recent timestamps —
+        // the pruner's 5s threshold is never triggered by a live claim.
         let cursor_atomic = unsafe { &*(slot_base.add(SS_CURSOR) as *const AtomicU64) };
         let ts = now_micros().unwrap_or(0);
         cursor_atomic.store(ts, Ordering::Relaxed);
