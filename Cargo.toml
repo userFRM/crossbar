@@ -47,3 +47,7 @@ harness = false
 name = "pod_bus"
 harness = false
 
+[[bench]]
+name = "spmc_contention"
+harness = false
+
