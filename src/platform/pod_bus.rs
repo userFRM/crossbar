@@ -1065,13 +1065,11 @@ fn claim_subscriber_slot(
             let pid_atomic = unsafe { &*(slot_base.add(SS_PID) as *const AtomicU32) };
             pid_atomic.store(pid, Ordering::Release);
 
-            // Overwrite cursor with real initial value.
-            cursor_atomic.store(initial_cursor, Ordering::Release);
-
-            // Transition CLAIMING(2) -> ACTIVE(1). Use CAS so that if the
-            // pruner freed this slot (rare race: pruner saw stale cursor in the
-            // nanosecond window between CAS and timestamp write), we detect it
-            // and retry instead of corrupting the state machine.
+            // Transition CLAIMING(2) -> ACTIVE(1) via CAS. The cursor still
+            // holds the claim timestamp at this point — the pruner's contract
+            // "CLAIMING + cursor = timestamp" is preserved throughout CLAIMING.
+            // If the pruner freed our slot (stale cursor from CAS→timestamp
+            // window), this CAS fails and we retry.
             if active_atomic
                 .compare_exchange(
                     SS_STATE_CLAIMING,
@@ -1084,6 +1082,10 @@ fn claim_subscriber_slot(
                 // Pruner freed our slot — retry on next free slot.
                 continue;
             }
+
+            // NOW write the real cursor (slot is ACTIVE, pruner uses PID
+            // not cursor for ACTIVE slots).
+            cursor_atomic.store(initial_cursor, Ordering::Release);
 
             return Ok(i);
         }
