@@ -34,8 +34,8 @@ fn pod_bus_latency(c: &mut Criterion) {
     {
         group.throughput(Throughput::Bytes(8));
         let name = bench_name("u64");
-        let bus = PodBus::<u64>::create(&name, 1024).unwrap();
-        let mut sub = bus.subscriber();
+        let mut bus = PodBus::<u64>::create(&name, 1024).unwrap();
+        let mut sub = bus.subscriber().unwrap();
         group.bench_function("8B", |b| {
             b.iter(|| {
                 bus.publish(black_box(42u64));
@@ -48,8 +48,8 @@ fn pod_bus_latency(c: &mut Criterion) {
     {
         group.throughput(Throughput::Bytes(64));
         let name = bench_name("64b");
-        let bus = PodBus::<Bytes64>::create(&name, 1024).unwrap();
-        let mut sub = bus.subscriber();
+        let mut bus = PodBus::<Bytes64>::create(&name, 1024).unwrap();
+        let mut sub = bus.subscriber().unwrap();
         let val = Bytes64([0xAB; 64]);
         group.bench_function("64B", |b| {
             b.iter(|| {
@@ -63,8 +63,8 @@ fn pod_bus_latency(c: &mut Criterion) {
     {
         group.throughput(Throughput::Bytes(256));
         let name = bench_name("256b");
-        let bus = PodBus::<Bytes256>::create(&name, 1024).unwrap();
-        let mut sub = bus.subscriber();
+        let mut bus = PodBus::<Bytes256>::create(&name, 1024).unwrap();
+        let mut sub = bus.subscriber().unwrap();
         let val = Bytes256([0xCD; 256]);
         group.bench_function("256B", |b| {
             b.iter(|| {
@@ -78,8 +78,8 @@ fn pod_bus_latency(c: &mut Criterion) {
     {
         group.throughput(Throughput::Bytes(1024));
         let name = bench_name("1kb");
-        let bus = PodBus::<Bytes1024>::create(&name, 1024).unwrap();
-        let mut sub = bus.subscriber();
+        let mut bus = PodBus::<Bytes1024>::create(&name, 1024).unwrap();
+        let mut sub = bus.subscriber().unwrap();
         let val = Bytes1024([0xEF; 1024]);
         group.bench_function("1KB", |b| {
             b.iter(|| {
@@ -98,8 +98,8 @@ fn pod_bus_fanout(c: &mut Criterion) {
     group.throughput(Throughput::Elements(1));
 
     let name = bench_name("fanout");
-    let bus = PodBus::<u64>::create(&name, 1024).unwrap();
-    let mut subs: Vec<_> = (0..10).map(|_| bus.subscriber()).collect();
+    let mut bus = PodBus::<u64>::create(&name, 1024).unwrap();
+    let mut subs: Vec<_> = (0..10).map(|_| bus.subscriber().unwrap()).collect();
 
     group.bench_function("10_subs_u64", |b| {
         b.iter(|| {

@@ -50,7 +50,7 @@ fn validate_name(name: &str) -> Result<(), IpcError> {
 
 /// Acquire an exclusive, non-blocking lock on `file`.
 #[cfg(unix)]
-fn exclusive_lock(file: &std::fs::File, name: &str) -> Result<(), IpcError> {
+pub(crate) fn exclusive_lock(file: &std::fs::File, name: &str) -> Result<(), IpcError> {
     use std::os::unix::io::AsRawFd;
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc != 0 {
@@ -61,7 +61,7 @@ fn exclusive_lock(file: &std::fs::File, name: &str) -> Result<(), IpcError> {
 
 /// Acquire an exclusive, non-blocking lock on `file`.
 #[cfg(windows)]
-fn exclusive_lock(file: &std::fs::File, name: &str) -> Result<(), IpcError> {
+pub(crate) fn exclusive_lock(file: &std::fs::File, name: &str) -> Result<(), IpcError> {
     use std::os::windows::io::AsRawHandle;
     let handle = file.as_raw_handle();
     let mut overlapped: windows_sys::Win32::System::IO::OVERLAPPED = unsafe { std::mem::zeroed() };
@@ -86,7 +86,7 @@ fn exclusive_lock(file: &std::fs::File, name: &str) -> Result<(), IpcError> {
 /// On Unix, this atomically downgrades an exclusive lock to shared.
 /// Multiple shared locks can coexist, but shared locks prevent new exclusive locks.
 #[cfg(unix)]
-fn shared_lock(file: &std::fs::File, name: &str) -> Result<(), IpcError> {
+pub(crate) fn shared_lock(file: &std::fs::File, name: &str) -> Result<(), IpcError> {
     use std::os::unix::io::AsRawFd;
     // LOCK_SH without LOCK_NB: blocks until shared lock is available.
     // If this fd already holds LOCK_EX, atomically downgrades to shared.
@@ -101,7 +101,7 @@ fn shared_lock(file: &std::fs::File, name: &str) -> Result<(), IpcError> {
 /// Note: Windows has no atomic downgrade. There is a brief unlock window
 /// between releasing the exclusive lock and acquiring the shared lock.
 #[cfg(windows)]
-fn shared_lock(file: &std::fs::File, name: &str) -> Result<(), IpcError> {
+pub(crate) fn shared_lock(file: &std::fs::File, name: &str) -> Result<(), IpcError> {
     use std::os::windows::io::AsRawHandle;
     let handle = file.as_raw_handle();
     // Unlock first (no atomic downgrade on Windows), then reacquire as shared.
@@ -137,14 +137,14 @@ fn shared_lock(file: &std::fs::File, name: &str) -> Result<(), IpcError> {
 /// Uses inode on Unix, file index on Windows.
 /// Returns `None` on error (prevents accidental deletion of wrong file).
 #[cfg(unix)]
-fn file_identity(path: &std::path::Path) -> Option<u64> {
+pub(crate) fn file_identity(path: &std::path::Path) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata(path).map(|m| m.ino()).ok()
 }
 
 /// Returns a stable numeric identity for the file at `path`.
 #[cfg(windows)]
-fn file_identity(path: &std::path::Path) -> Option<u64> {
+pub(crate) fn file_identity(path: &std::path::Path) -> Option<u64> {
     use std::os::windows::io::AsRawHandle;
     let file = std::fs::File::open(path).ok()?;
     let handle = file.as_raw_handle();
