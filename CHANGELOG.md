@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.0.0 — 2026-03-21
+
+### Breaking Changes
+- Removed `no_std` support — crossbar requires `std`
+- Removed `MonitorWait` / `MonitorWaitFallback` wait strategy variants
+- Removed all 13 deprecated type aliases (ShmPublisher, etc.)
+- Reverted `PinnedSample` back to `PinnedGuard`
+- `libc` and `windows-sys` are now unconditional dependencies
+- PodBus SHM version bumped to V3 (packed AtomicU64 subscriber slots)
+
+### Changed
+- All `alloc::` references replaced with `std` equivalents
+- All `#[cfg(feature = "std")]` gates removed
+- Layout constants flattened (no inner module wrapper)
+- Registry permissions changed from 0o666 to 0o600
+- Registry path configurable via `CROSSBAR_REGISTRY` environment variable
+- PodBus subscriber slots use packed AtomicU64 (2-bit state + 62-bit value)
+
+### Added
+- `Registry::discover_since()` for reactive service discovery
+- `DiscoveredTopic::timestamp_us` field
+- Entry count wrap-around guard in registry prune/unregister
+
 ## 0.5.0 — 2026-03-20
 
 ### Added
