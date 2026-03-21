@@ -62,7 +62,8 @@
 //! +----------------------------------------------------------+
 //! | Subscriber slots (v2 only): 64 x SubscriberSlot          |
 //! |   Each slot (16 bytes, naturally aligned):                |
-//! |     [+0..+4)  active: AtomicU32  (0=free, 1=active)      |
+//! |     [+0..+4)  active: AtomicU32  (0=free, 2=claiming,    |
+//! |               1=active)                                  |
 //! |     [+4..+8)  pid: AtomicU32     (subscriber PID)        |
 //! |     [+8..+16) cursor: AtomicU64  (subscriber read pos)   |
 //! +----------------------------------------------------------+
@@ -490,10 +491,21 @@ impl<T: Pod> PodBus<T> {
     pub fn publish(&mut self, value: T) {
         if self.watermark.is_some() {
             // Bounded: spin-wait until there is room.
+            let mut spins = 0u32;
             loop {
                 match self.try_publish(value) {
                     Ok(()) => return,
-                    Err(_) => core::hint::spin_loop(),
+                    Err(_) => {
+                        spins += 1;
+                        if spins & 0x3FF == 0 {
+                            // Refresh heartbeat every 1024 spins to prevent
+                            // subscribers from declaring us dead during backpressure.
+                            if let Ok(now) = now_micros() {
+                                self.heartbeat_atomic().store(now, Ordering::Release);
+                            }
+                        }
+                        core::hint::spin_loop();
+                    }
                 }
             }
         }
@@ -584,7 +596,21 @@ impl<T: Pod> PodBus<T> {
             let slot_base = unsafe { self.sub_slots_base.add(i * SUBSCRIBER_SLOT_SIZE) };
 
             let active_atomic = unsafe { &*(slot_base.add(SS_ACTIVE) as *const AtomicU32) };
-            if active_atomic.load(Ordering::Acquire) != 1 {
+            let state = active_atomic.load(Ordering::Acquire);
+
+            // Only consider fully-initialized (ACTIVE) slots for backpressure.
+            // CLAIMING slots are still being initialized and are not yet visible.
+            if state == SS_STATE_CLAIMING {
+                // A CLAIMING slot with a dead PID means the subscriber crashed
+                // during initialization -- prune it back to FREE.
+                let pid_atomic = unsafe { &*(slot_base.add(SS_PID) as *const AtomicU32) };
+                let pid = pid_atomic.load(Ordering::Relaxed);
+                if pid != 0 && !is_pid_alive(pid) {
+                    active_atomic.store(SS_STATE_FREE, Ordering::Release);
+                }
+                continue;
+            }
+            if state != SS_STATE_ACTIVE {
                 continue;
             }
 
@@ -593,7 +619,7 @@ impl<T: Pod> PodBus<T> {
             let pid = pid_atomic.load(Ordering::Relaxed);
             if pid != 0 && !is_pid_alive(pid) {
                 // Subscriber crashed -- prune the slot.
-                active_atomic.store(0, Ordering::Release);
+                active_atomic.store(SS_STATE_FREE, Ordering::Release);
                 continue;
             }
 
@@ -967,7 +993,7 @@ impl<T: Pod> Drop for BusSubscriber<T> {
             if !self.sub_slots_base.is_null() {
                 let slot_base = unsafe { self.sub_slots_base.add(idx * SUBSCRIBER_SLOT_SIZE) };
                 let active_atomic = unsafe { &*(slot_base.add(SS_ACTIVE) as *const AtomicU32) };
-                active_atomic.store(0, Ordering::Release);
+                active_atomic.store(SS_STATE_FREE, Ordering::Release);
             }
         }
     }
@@ -975,7 +1001,25 @@ impl<T: Pod> Drop for BusSubscriber<T> {
 
 // ---- Subscriber slot helpers ----
 
+/// Subscriber slot states (3-state machine):
+/// - `SS_STATE_FREE (0)`: slot is available for claiming
+/// - `SS_STATE_CLAIMING (2)`: slot is being initialized (pid/cursor being written)
+/// - `SS_STATE_ACTIVE (1)`: slot is fully initialized and in use
+const SS_STATE_FREE: u32 = 0;
+const SS_STATE_ACTIVE: u32 = 1;
+const SS_STATE_CLAIMING: u32 = 2;
+
 /// Claim a free subscriber slot via CAS. Returns the slot index on success.
+///
+/// Uses a 3-state machine to prevent partial initialization from being visible
+/// to the publisher's subscriber scan:
+/// 1. CAS `FREE(0) -> CLAIMING(2)` to reserve the slot
+/// 2. Write pid and cursor
+/// 3. Store `ACTIVE(1)` with Release to make the slot visible
+///
+/// The publisher only considers `active == ACTIVE(1)`, never `CLAIMING(2)`.
+/// If a subscriber dies during CLAIMING, the publisher can prune it (any
+/// CLAIMING slot older than a few seconds is dead).
 fn claim_subscriber_slot(
     slots_base: *mut u8,
     initial_cursor: u64,
@@ -985,17 +1029,25 @@ fn claim_subscriber_slot(
         let slot_base = unsafe { slots_base.add(i * SUBSCRIBER_SLOT_SIZE) };
         let active_atomic = unsafe { &*(slot_base.add(SS_ACTIVE) as *const AtomicU32) };
 
-        // Try to claim this slot: CAS 0 -> 1
+        // Try to claim this slot: CAS FREE(0) -> CLAIMING(2)
         if active_atomic
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
+            .compare_exchange(
+                SS_STATE_FREE,
+                SS_STATE_CLAIMING,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
             .is_ok()
         {
-            // Write PID and initial cursor.
+            // Write PID and initial cursor while in CLAIMING state.
             let pid_atomic = unsafe { &*(slot_base.add(SS_PID) as *const AtomicU32) };
             pid_atomic.store(pid, Ordering::Release);
 
             let cursor_atomic = unsafe { &*(slot_base.add(SS_CURSOR) as *const AtomicU64) };
             cursor_atomic.store(initial_cursor, Ordering::Release);
+
+            // Transition CLAIMING(2) -> ACTIVE(1) to make slot visible to publisher.
+            active_atomic.store(SS_STATE_ACTIVE, Ordering::Release);
 
             return Ok(i);
         }
@@ -1004,11 +1056,20 @@ fn claim_subscriber_slot(
 }
 
 /// Check if a process with the given PID is still alive.
+///
+/// `kill(pid, 0)` returns 0 if the process exists and we can signal it.
+/// On error, `EPERM` means the process exists but we lack permission to
+/// signal it (still alive). `ESRCH` means the process does not exist.
 #[cfg(unix)]
 fn is_pid_alive(pid: u32) -> bool {
-    // kill(pid, 0) checks if the process exists without sending a signal.
-    // Returns 0 on success, -1 on error. ESRCH means the process doesn't exist.
-    unsafe { libc::kill(pid as i32, 0) == 0 }
+    let ret = unsafe { libc::kill(pid as i32, 0) };
+    if ret == 0 {
+        return true; // Process exists and we can signal it
+    }
+    // errno == EPERM means process exists but we lack permission
+    // errno == ESRCH means process does not exist
+    let err = std::io::Error::last_os_error();
+    err.raw_os_error() == Some(libc::EPERM)
 }
 
 #[cfg(windows)]

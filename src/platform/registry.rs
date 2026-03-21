@@ -332,6 +332,9 @@ impl Registry {
     /// Unregister all topics for a given region and PID.
     ///
     /// Called automatically by `Publisher::Drop`.
+    ///
+    /// Uses `compare_exchange` to atomically transition the slot from ACTIVE
+    /// to FREE, preventing a double-decrement race with [`prune_stale`].
     pub fn unregister(&self, region: &str, pid: u32) {
         for i in 0..REG_MAX_ENTRIES {
             let entry = self.entry_ptr(i);
@@ -352,9 +355,18 @@ impl Registry {
                 continue;
             }
 
-            // Clear the slot
-            active.store(RE_STATE_FREE, Ordering::Release);
-            self.entry_count_atom().fetch_sub(1, Ordering::Relaxed);
+            // Atomically clear the slot -- only one thread wins the CAS and decrements.
+            if active
+                .compare_exchange(
+                    RE_STATE_ACTIVE,
+                    RE_STATE_FREE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                self.entry_count_atom().fetch_sub(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -400,6 +412,9 @@ impl Registry {
     /// Prune entries from dead publishers (stale heartbeat).
     ///
     /// Removes entries whose timestamp is older than `stale_timeout` from now.
+    ///
+    /// Uses `compare_exchange` to atomically transition the slot from ACTIVE
+    /// to FREE, preventing a double-decrement race with [`unregister`].
     pub fn prune_stale(&self, stale_timeout: Duration) {
         let now = match now_micros() {
             Some(t) => t,
@@ -417,8 +432,18 @@ impl Registry {
 
             let ts = unsafe { (entry.add(RE_TIMESTAMP) as *const u64).read() };
             if ts < cutoff {
-                active.store(RE_STATE_FREE, Ordering::Release);
-                self.entry_count_atom().fetch_sub(1, Ordering::Relaxed);
+                // Atomically clear the slot -- only one thread wins the CAS and decrements.
+                if active
+                    .compare_exchange(
+                        RE_STATE_ACTIVE,
+                        RE_STATE_FREE,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    self.entry_count_atom().fetch_sub(1, Ordering::Relaxed);
+                }
             }
         }
     }
