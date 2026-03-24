@@ -39,9 +39,7 @@ use crossbar::*;
 let mut pub_ = Publisher::create("prices", Config::default())?;
 let topic = pub_.register("/tick/AAPL")?;
 
-let mut loan = pub_.loan(&topic)?;
-loan.set_data(b"42.50")?;
-loan.publish();
+pub_.publish(&topic, b"42.50")?;  // one-liner for simple cases
 ```
 
 **Process B -- subscriber:**

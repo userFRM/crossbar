@@ -724,11 +724,40 @@ impl Publisher {
         Ok(())
     }
 
+    /// Publish a byte slice to a topic in one call.
+    ///
+    /// This is a convenience wrapper around [`loan`](Self::loan) +
+    /// [`set_data`](Loan::set_data) + [`publish`](Loan::publish).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::PoolExhausted`] or [`Error::DataTooLarge`].
+    #[inline]
+    pub fn publish(&mut self, handle: &Topic, data: &[u8]) -> Result<(), Error> {
+        let mut loan = self.loan(handle)?;
+        loan.set_data(data)?;
+        loan.publish();
+        Ok(())
+    }
+
+    /// Publish a typed `T: Pod` value to a topic in one call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::PoolExhausted`].
+    #[inline]
+    pub fn publish_typed<T: crate::Pod>(&mut self, handle: &Topic, value: T) -> Result<(), Error> {
+        self.loan_typed::<T>(handle)?.send(value);
+        Ok(())
+    }
+
     /// Loans a block from the pool for writing. Write your data, then call
     /// [`publish`](Loan::publish) to make it visible to subscribers.
     ///
     /// If the loan is dropped without publishing, the block is returned to
     /// the pool automatically.
+    ///
+    /// For simple cases, use [`publish`](Self::publish) instead.
     ///
     /// # Errors
     ///

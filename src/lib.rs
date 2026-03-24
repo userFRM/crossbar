@@ -23,9 +23,7 @@
 //! let mut pub_ = Publisher::create("prices", Config::default()).unwrap();
 //! let topic = pub_.register("/tick/AAPL").unwrap();
 //!
-//! let mut loan = pub_.loan(&topic).unwrap();
-//! loan.set_data(b"hello").unwrap();
-//! loan.publish(); // O(1) — writes 8 bytes to ring
+//! pub_.publish(&topic, b"hello").unwrap(); // O(1) — writes 8 bytes to ring
 //! ```
 
 #![warn(missing_docs)]
