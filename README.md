@@ -78,7 +78,20 @@ if let Some(sample) = stream.try_recv() {
 
 ## Performance
 
-### vs iceoryx2 -- end-to-end (Intel i7-10700KF, Linux 6.8, rustc 1.87)
+### Cross-process latency (the real IPC number)
+
+Measured with separate publisher and subscriber **processes**, core-pinned, 8B payload,
+paced at 1µs/msg, busy-spin subscriber. 5 runs × 500K samples = 2.5M measurements.
+
+| Metric | crossbar | iceoryx2 | speedup |
+|---|---|---|---|
+| **p50** | **172 ns ± 6** | 240 ns ± 6 | **1.40x** |
+| min | 114 ns | 159 ns | 1.40x |
+| p99 | 205 ns | 325 ns | 1.59x |
+
+Reproduce: `cargo build --release --example cross_process_iceoryx2 && target/release/examples/cross_process_iceoryx2 run`
+
+### Same-process latency (Criterion, cache-hot)
 
 | Payload | crossbar | iceoryx2 | speedup |
 |---|---|---|---|
@@ -96,7 +109,7 @@ if let Some(sample) = stream.try_recv() {
 | 64 KB | **1.10 us** | 1.32 us | **1.2x** |
 | 1 MB | 18.4 us | 18.3 us | ~1x |
 
-### PodBus SPMC (publish throughput vs subscriber count)
+### PodBus SPMC broadcast (publish throughput vs subscriber count)
 
 | Subscribers | publish latency | total fanout throughput |
 |---|---|---|
@@ -104,7 +117,8 @@ if let Some(sample) = stream.try_recv() {
 | 8 | 13 ns | 691M msg/s |
 | 16 | 24 ns | **1.14B msg/s** |
 
-Same-process benchmarks. See [BENCHMARKS.md](BENCHMARKS.md) for methodology and caveats.
+Same-process Criterion benchmarks measure peak throughput. Cross-process latency is the real
+IPC number. See [BENCHMARKS.md](BENCHMARKS.md) for full methodology and caveats.
 
 ---
 
