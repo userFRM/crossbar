@@ -107,7 +107,7 @@ struct RunStats {
     samples: usize,
 }
 
-fn compute_stats(latencies: &mut Vec<u64>) -> RunStats {
+fn compute_stats(latencies: &mut [u64]) -> RunStats {
     latencies.sort();
     let n = latencies.len();
     RunStats {
