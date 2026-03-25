@@ -61,14 +61,14 @@ jobs:
       - run: cargo test
       - run: cargo clippy --all-targets -- -D warnings
 
-  no-std:
-    name: no_std check
+  ffi:
+    name: FFI tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --no-default-features
+      - run: cargo test --features ffi
 
   doc:
     name: Documentation
@@ -83,7 +83,7 @@ jobs:
 
   publish:
     name: Publish to crates.io
-    needs: [fmt, clippy, test, test-macos, test-windows, no-std, doc]
+    needs: [fmt, clippy, test, test-macos, test-windows, ffi, doc]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
