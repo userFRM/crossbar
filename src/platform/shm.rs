@@ -619,6 +619,7 @@ impl Publisher {
         self.register_inner(uri, core::mem::size_of::<T>() as u32)
     }
 
+    #[allow(clippy::needless_pass_by_ref_mut)] // &mut self enforces single-caller semantics
     fn register_inner(&mut self, uri: &str, type_size: u32) -> Result<Topic, Error> {
         if uri.len() > TE_URI_MAX {
             return Err(Error::UriTooLong {

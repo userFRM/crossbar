@@ -554,6 +554,7 @@ impl<T: Pod> PodBus<T> {
     }
 
     /// Write a value into the ring without any backpressure check.
+    #[allow(clippy::needless_pass_by_ref_mut)] // &mut self enforces single-producer
     fn publish_unchecked(&mut self, value: T) {
         let write_seq = self.write_seq().load(Ordering::Relaxed);
 

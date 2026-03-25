@@ -107,7 +107,7 @@ struct RunStats {
     samples: usize,
 }
 
-fn compute_stats(latencies: &mut Vec<u64>) -> RunStats {
+fn compute_stats(latencies: &mut [u64]) -> RunStats {
     latencies.sort();
     let n = latencies.len();
     RunStats {
@@ -429,7 +429,7 @@ fn main() {
             print!("[{system}] run {}/{}...", run + 1, RUNS);
 
             // Spawn subscriber first, then publisher
-            let mut sub = std::process::Command::new(&exe)
+            let sub = std::process::Command::new(&exe)
                 .args([&format!("sub-{system}"), &run.to_string()])
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())
